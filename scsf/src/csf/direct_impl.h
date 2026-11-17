@@ -43,6 +43,21 @@ class DirectHamiltonian {
     std::vector<double> values_;
     std::vector<std::uint64_t> path_down_;
     size_t max_batch_,min_batch_,min_batch_terms_;
+    size_t max_product_scratch_,team_creations_=0;
+    bool gather_,accelerated_,short_spin_;
+    int encoder_;
+    std::vector<int> worker_cpus_;
+    Stats setup_stats_;
+    using Clock = std::chrono::steady_clock;
+    static size_t elapsed_ns(Clock::time_point start) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();
+    }
+    static std::uint64_t sample_hash(size_t a,size_t b) {
+        std::uint64_t x=std::uint64_t(a)*0x9e3779b97f4a7c15ULL+std::uint64_t(b)+0x243f6a8885a308d3ULL;
+        x=(x^(x>>30))*0xbf58476d1ce4e5b9ULL;
+        x=(x^(x>>27))*0x94d049bb133111ebULL;
+        return x^(x>>31);
+    }
     size_t path_bytes_ = 0, graph_bytes_ = 0;
     std::vector<std::unique_ptr<GugaMemo>> memo_;
     std::vector<std::unique_ptr<SymbolicTiles>> symbolic_;
@@ -111,11 +126,13 @@ class DirectHamiltonian {
             else parallel_for(tasks,workers,job);
             return;
         }
-        if (team_workers_!=workers) {
-            product_team_=std::make_unique<ThreadTeam>(workers);team_workers_=workers;
+        if (!product_team_) {
+            team_workers_=threads_;
+            product_team_=std::make_unique<ThreadTeam>(team_workers_,worker_cpus_);
+            ++team_creations_;
         }
         std::atomic<size_t> next{0};
-        product_team_->apply(workers,[&](size_t w) {
+        product_team_->apply_workers(workers,[&](size_t w) {
             if (fixed) { for (size_t t=w;t<tasks;t+=workers) job(t,w); }
             else for (;;) {
                 size_t t=next.fetch_add(1,std::memory_order_relaxed);
@@ -377,7 +394,8 @@ class DirectHamiltonian {
             symbolic_scratch+=s->scratch_peak();
         }
 
-        return {{"basis",basis_->size()},{"configurations",groups_.size()},
+        Stats result=setup_stats_;
+        Stats current={{"basis",basis_->size()},{"configurations",groups_.size()},
             {"shared_basis_bytes_estimate",basis_->bytes_estimate()},
             {"basis_snapshot_id",size_t(basis_->context().snapshot_id)},
             {"basis_generation",basis_->context().generation},{"pair_descriptor_cache_bytes",0},
@@ -391,7 +409,7 @@ class DirectHamiltonian {
             {"construction_index_entries",construction_index_entries_},
             {"graph_ready",compact_ready_},{"graph_bytes",graph_bytes_},
             {"compact_graph",compact_ready_},{"graph_edges",compact_cols_.size()},
-            {"unique_occupation_blocks",true},
+            {"unique_occupation_blocks",!gather_},
             {"graph_setup_queries",setup_queries_},{"packed_key_words",k_<=64 ? 2 : 0},
 
             {"retained_product_workspace_bytes",workspace_bytes()},
@@ -403,7 +421,13 @@ class DirectHamiltonian {
             {"hybrid_small_sector",hybrid_small_sector_},
             {"rank_mask_bytes",rank_masks_.capacity()*sizeof(ConfigMasks)},{"ranked_preparation",compact_mode()},
             {"mask_preparation",compact_mode() && !rank_masks_.empty()},
-            {"exact_specialization",compact_mode()},
+            {"exact_specialization",true},
+            {"max_product_scratch_bytes",max_product_scratch_},
+            {"product_team_creations",team_creations_},{"stable_worker_ids",retained_product()},
+            {"worker_affinity",!worker_cpus_.empty()},
+            {"gather_accumulation",gather_},{"spin_encoder_mode",size_t(encoder_)},
+            {"long_double_bytes",sizeof(long double)},
+            {"short_spin_kernel",short_spin_},
             {"aligned_tiny_cache",[&] { size_t n=0;for (const auto &m:memo_) n+=m->tiny_aligned();return n; }()},
             {"tiny_cache_line_aligned",[&] { return std::all_of(memo_.begin(),memo_.end(),[](const auto &m) { return m->tiny_line_aligned(); }); }()},
             {"paired_spin_encoding",(mode_==CompactCache)},
@@ -417,7 +441,7 @@ class DirectHamiltonian {
             {"hamiltonian_cache_bytes",value_cache_bytes()},{"hamiltonian_cache_rows",cached_rows_},
             {"semi_direct",(mode_==SemiDirect)},{"prepared_guga",true},
             {"profile_couplings",profile_couplings_},{"path_bit_bytes",path_down_.capacity()*sizeof(std::uint64_t)},
-            {"bmi2_available",guga_bmi2_available()},{"bmi2_enabled",(mode_!=SemiDirect) && k_<=64 && guga_bmi2_available()},
+            {"bmi2_available",guga_bmi2_available()},{"bmi2_enabled",(mode_!=SemiDirect) && k_<=64 && accelerated_},
             {"max_batch_elements",max_batch_},{"batch_min_pairs",min_batch_},{"batch_min_terms",min_batch_terms_},
             {"compact_spin_cache",(mode_!=SemiDirect) && k_<=64 && packed_},
             {"spin_cache_ways",(mode_!=SemiDirect) && k_<=64 && packed_ ? 2 : 1},
@@ -426,6 +450,7 @@ class DirectHamiltonian {
             {"generator_screening_available",(mode_!=WideSpin && mode_!=SemiDirect)},
             {"spin_statistics",(mode_==SemiDirect) || collect_spin_},
             {"memo_slots",[&] { size_t n=0; for (const auto &m:memo_) n+=m->info().at("reuse_slots"); return n; }()}};
+        result.insert(current.begin(),current.end());return result;
     }
 public:
     DirectHamiltonian(const Array &one,const Array &two,BasisSnapshot basis,
@@ -433,7 +458,8 @@ public:
                       int matrix_index,size_t max_index,size_t max_graph,size_t max_paths,
                       size_t max_tensor,size_t max_terms,size_t max_bonds,int factors,
                       bool reuse,size_t reuse_bytes,bool packed,size_t max_ordered,
-                      size_t max_hamiltonian,bool profile_couplings,size_t max_batch,size_t min_batch,size_t min_batch_terms,bool collect_spin,bool spin_checkpoints,size_t max_symbolic,size_t max_trie)
+                      size_t max_hamiltonian,bool profile_couplings,size_t max_batch,size_t min_batch,size_t min_batch_terms,bool collect_spin,bool spin_checkpoints,size_t max_symbolic,size_t max_trie,
+                      size_t max_product_scratch,bool gather,int encoder,std::vector<int> worker_cpus,bool short_spin)
         : basis_(checked_basis(std::move(basis))),one_(one),two_(two),
           k_(validate_integrals(one,two)),two_s_(basis_->context().two_s),
           threads_(threads),tensors_(max_tensor),terms_(max_terms),bonds_(max_bonds),
@@ -441,7 +467,15 @@ public:
           tolerance_(tolerance),cutoff_(cutoff),groups_(basis_->groups()),order_(basis_->order()),
           ordinal_(basis_->ordinals()),max_ordered_(max_ordered),
           max_hamiltonian_(max_hamiltonian),profile_couplings_(profile_couplings),collect_spin_(collect_spin),
-          max_batch_(max_batch),min_batch_(min_batch),min_batch_terms_(min_batch_terms) {
+          max_batch_(max_batch),min_batch_(min_batch),min_batch_terms_(min_batch_terms),
+          max_product_scratch_(max_product_scratch),gather_(gather),
+          accelerated_(encoder!=1 && guga_bmi2_available()),short_spin_(short_spin),encoder_(encoder),worker_cpus_(std::move(worker_cpus)) {
+        auto setup_start=Clock::now(),phase_start=setup_start;
+        if (encoder<0 || encoder>2 || (encoder==2 && !guga_bmi2_available()))
+            throw std::invalid_argument("requested spin encoder is unavailable");
+        if (gather_ && !compact_mode()) throw std::invalid_argument("gather requires a compact strategy");
+        if (!worker_cpus_.empty() && (!retained_product() || worker_cpus_.size()!=threads_))
+            throw std::invalid_argument("invalid adaptive worker CPU list");
         validate_workers(threads);
         if (k_!=basis_->context().nbasis) throw std::invalid_argument("Hamiltonian and basis orbital counts differ");
         if (two_s_<0 || mode<0 || mode>8 || matrix_index<0 || matrix_index>3 || factors<0 || factors>2)
@@ -451,6 +485,7 @@ public:
         for (auto a : {&one_, &two_}) for (py::ssize_t p=0;p<a->size();++p)
             if (!std::isfinite(a->data()[p])) throw std::invalid_argument("nonfinite integrals");
 
+        setup_stats_["setup_validation_ns"]=elapsed_ns(phase_start);phase_start=Clock::now();
         py::gil_scoped_release release;
         try {
             if (mode_!=SemiDirect && k_<=64) {
@@ -472,6 +507,7 @@ public:
                 }
             }
 
+            setup_stats_["setup_index_ns"]=elapsed_ns(phase_start);phase_start=Clock::now();
             // A capped path cache has a safe on-the-fly fallback. Charge actual
             // capacities, including Path objects, before publishing the cache.
             if (basis_->size()<=max_paths/std::max(size_t(1),sizeof(Path))) {
@@ -506,16 +542,19 @@ public:
                     spin_tries_[g]=std::move(trie);
                 }
             }
-            for (size_t w=0;w<threads_;++w) {
-                memo_.push_back(std::make_unique<GugaMemo>(reuse_bytes_/threads_,reuse_,packed_,mode_==WideSpin ? GugaMemo::Wide : mode_==SemiDirect ? GugaMemo::Generic : GugaMemo::Tiny,collect_spin_,
-                    mode_==CompactCache,mode_==CompactCache));
-                if (symbolic()) symbolic_.push_back(std::make_unique<SymbolicTiles>(reuse_ ? max_symbolic/threads_ : 0));
-            }
+            setup_stats_["setup_paths_tries_ns"]=elapsed_ns(phase_start);phase_start=Clock::now();
+            memo_.resize(threads_);symbolic_.resize(symbolic() ? threads_ : 0);
+            product_for(threads_,threads_,[&](size_t w,size_t) {
+                memo_[w]=std::make_unique<GugaMemo>(reuse_bytes_/threads_,reuse_,packed_,mode_==WideSpin ? GugaMemo::Wide : mode_==SemiDirect ? GugaMemo::Generic : GugaMemo::Tiny,collect_spin_,
+                    mode_==CompactCache,mode_==CompactCache);
+                if (symbolic()) symbolic_[w]=std::make_unique<SymbolicTiles>(reuse_ ? max_symbolic/threads_ : 0);
+            },true);
+            setup_stats_["setup_memo_team_ns"]=elapsed_ns(phase_start);phase_start=Clock::now();
             diagonal_.resize(basis_->size());
             std::vector<GugaPlan> diagonal_plans(threads_);
             std::vector<GugaBitPlan> diagonal_bits(threads_);
             std::vector<GugaLeanPlan> diagonal_small(threads_);
-            parallel_for(order_.size(),threads_,[&](size_t g,size_t w) {
+            product_for(order_.size(),threads_,[&](size_t g,size_t w) {
                 const auto &a=*order_[g];
                 auto c=connection(PairDescriptor(a.first,a.first,g,g),one_.data(),two_.data(),terms_,true);
                 if ((mode_!=WideSpin && mode_!=SemiDirect) && k_<=64) prepare_guga_lean_connection(a.first,a.first,c,diagonal_small[w],(mode_!=WideSpin && mode_!=SemiDirect));
@@ -525,25 +564,33 @@ public:
                 for (size_t r=0;r<a.second.size();++r) {
                     check_bonds(*p[r],*p[r],bonds_);
                     diagonal_[a.second[r]]=(mode_!=WideSpin && mode_!=SemiDirect) && k_<=64 ?
-                        memo_[w]->small_element(*p[r],*p[r],c,diagonal_small[w],path_down_[a.second[r]],path_down_[a.second[r]],true) :
+                        memo_[w]->small_element(*p[r],*p[r],c,diagonal_small[w],path_down_[a.second[r]],path_down_[a.second[r]],accelerated_) :
                         (mode_!=SemiDirect) && k_<=64 ?
                         memo_[w]->bit_element(*p[r],*p[r],c,diagonal_plans[w],diagonal_bits[w],
-                            path_down_[a.second[r]],path_down_[a.second[r]],true) : memo_[w]->element(*p[r],*p[r],c);
+                            path_down_[a.second[r]],path_down_[a.second[r]],accelerated_) : memo_[w]->element(*p[r],*p[r],c);
                 }
             });
+            setup_stats_["setup_diagonal_ns"]=elapsed_ns(phase_start);phase_start=Clock::now();
             // Graph budget is enforced before each retained list. Partial
             // graphs are discarded, never silently treated as complete.
 
              {
-                build_compact(max_graph);
+                if (!gather_) build_compact(max_graph);
                 // Release the construction index; exact wide-key lookups
                 // remain available for active-source products.
-                if (compact_ready_)
+                if (compact_ready_ && !gather_)
                     index_=std::make_unique<SelectedIndex>(groups_,0,0);
             }
+            setup_stats_["setup_graph_ns"]=elapsed_ns(phase_start);phase_start=Clock::now();
             prepare_rank_masks(max_ordered_);
             prepare_compact_spins(max_ordered_-rank_masks_.capacity()*sizeof(ConfigMasks));
             build_value_cache();
+            setup_stats_["setup_summaries_values_ns"]=elapsed_ns(phase_start);
+            setup_stats_["setup_total_ns"]=elapsed_ns(setup_start);
+            setup_stats_["graph_budget_fallback"]=!compact_ready_ && !gather_;
+            setup_stats_["graph_skipped_gather"]=gather_;
+            setup_stats_["path_budget_fallback"]=!cached_paths_;
+            setup_stats_["index_budget_fallback"]=construction_index_mode_==0;
         } catch (const std::length_error &e) { throw BudgetError(e.what()); }
     }
     BasisSnapshot basis() const { return basis_; }
@@ -573,8 +620,9 @@ public:
         { py::gil_scoped_release release; std::lock_guard<std::mutex> lock(mutex_); result=info_unlocked(); }
         return result;
     }
-    template<bool GeneratorScreening,bool Exact=false>
+    template<bool GeneratorScreening,bool Exact=false,bool Gather=false>
     py::tuple apply_fast(const Array &x,double generator_tol,int generator_screen,bool unscreened) {
+        auto native_start=Clock::now(),phase_start=native_start;
         const double tolerance=unscreened ? 0. : tolerance_,cutoff=unscreened ? 0. : cutoff_;
         size_t n=basis_->size(), ng=order_.size();
         if (x.ndim()!=2 || size_t(x.shape(0))!=n)
@@ -586,25 +634,44 @@ public:
         Array result({py::ssize_t(n),py::ssize_t(cols)}), error_inf(cols),error_l2(cols);
         double *output=result.mutable_data();
         Stats stats;
+        stats["wall_validation_ns"]=elapsed_ns(phase_start);phase_start=Clock::now();
         {
             py::gil_scoped_release release;
             std::lock_guard<std::mutex> lock(mutex_);
+            stats["wall_lock_wait_ns"]=elapsed_ns(phase_start);phase_start=Clock::now();
             try {
+                constexpr bool gather=Gather;
+                if (gather && !Exact) throw std::invalid_argument("gather accumulation requires an exact product");
                 std::vector<double> row_max(n,0.),group_max(ng,0.);
                 std::vector<long double> sums(Exact ? 0 : ng*cols,0.);
                 std::vector<size_t> active;
-                for (size_t g=0;g<ng;++g) {
-                    for (size_t i:order_[g]->second) for (size_t v=0;v<cols;++v) {
-                        double value=std::abs(input[i*cols+v]);
-                        row_max[i]=std::max(row_max[i],value);
-                        group_max[g]=std::max(group_max[g],value);
-                        if constexpr(!Exact) sums[g*cols+v]+=static_cast<long double>(value);
+                // Each configuration owns disjoint CSF rows. Scan coarse
+                // contiguous ranges on the retained team, including when the
+                // later sparse traversal needs only a few scratch owners.
+                // Preserve each group's summation order for error bounds.
+                size_t activity_workers=retained_product() && ng>=4096 ?
+                    std::min(threads_,ng/1024) : 1;
+                auto scan_activity=[&](size_t begin,size_t end) {
+                    for (size_t g=begin;g<end;++g) {
+                        for (size_t i:order_[g]->second) for (size_t v=0;v<cols;++v) {
+                            double value=std::abs(input[i*cols+v]);
+                            row_max[i]=std::max(row_max[i],value);
+                            group_max[g]=std::max(group_max[g],value);
+                            if constexpr(!Exact) sums[g*cols+v]+=static_cast<long double>(value);
+                        }
                     }
-                    if (group_max[g]!=0.) active.push_back(g);
-                }
+                };
+                if (activity_workers>1) product_for(activity_workers,activity_workers,[&](size_t part,size_t) {
+                    size_t base=ng/activity_workers,extra=ng%activity_workers;
+                    size_t begin=part*base+std::min(part,extra);
+                    scan_activity(begin,begin+base+(part<extra));
+                },true);
+                else scan_activity(0,ng);
+                for (size_t g=0;g<ng;++g) if (group_max[g]!=0.) active.push_back(g);
+                stats["activity_workers"]=activity_workers;
                 // Conservative opt-in sparse policy. Enumerate only active
                 // sources; dense and screened inputs retain symmetric blocks.
-                bool sparse_source=Exact && ((mode_==Adaptive)) &&
+                bool sparse_source=Exact && !gather && ((mode_==Adaptive)) &&
                     active.size()<=std::min(size_t(1024),ng/64);
                 bool source=sparse_source;
                 bool blocks=!source;
@@ -612,39 +679,74 @@ public:
                 bool late= (mode_!=SemiDirect) ||
                           (((mode_==SemiDirect)) && !source && max_coefficient>64*tolerance);
                 bool planned=true;
-                bool bit_kernel=(mode_!=SemiDirect), accelerated=true;
+                bool bit_kernel=(mode_!=SemiDirect), accelerated=accelerated_;
 
-                bool compact=!source && compact_ready_;
+                bool compact=!source && !gather && compact_ready_;
                 std::vector<size_t> tasks;
                 if (source) tasks=std::move(active);
                 else { tasks.resize(ng); std::iota(tasks.begin(),tasks.end(),size_t(0)); }
                 size_t workers=std::min(threads_,std::max(size_t(1),tasks.size()));
                 if (sparse_source) workers=std::min(workers,std::max(size_t(1),(tasks.size()+3)/4));
-                if (cols && n>std::numeric_limits<size_t>::max()/cols/workers)
+                if (cols && n>std::numeric_limits<size_t>::max()/cols)
                     throw BudgetError("direct product scratch dimension overflow");
-                size_t count=n*cols;
-                std::vector<double> local_output;
+                size_t count=n*cols,requested_workers=workers;
+                // Account for every replicated output/error array and the
+                // small error-reduction arrays, before any is allocated.
+                constexpr size_t item_bytes=sizeof(double)+(Exact ? 0 : sizeof(long double));
+                auto forecast=[&](size_t owners) -> size_t {
+                    long double bytes=gather ? 0.L : static_cast<long double>(count)*owners*item_bytes+
+                        (Exact ? 0.L : (3.L*owners+1)*cols*sizeof(long double));
+                    if (bytes>std::numeric_limits<size_t>::max()) throw BudgetError("product scratch byte overflow");
+                    return size_t(bytes);
+                };
+                size_t uncapped=forecast(workers);
+                while (workers>1 && forecast(workers)>max_product_scratch_) --workers;
+                size_t forecast_bytes=forecast(workers);
+                if (forecast_bytes>max_product_scratch_)
+                    throw BudgetError("max_product_scratch_bytes cannot fit this RHS width");
+                stats["wall_activity_ns"]=elapsed_ns(phase_start);phase_start=Clock::now();
+                size_t creations_before=team_creations_;
+                if (retained_product() && !product_team_) product_for(0,workers,[](size_t,size_t) {});
+                stats["team_creations"]=team_creations_-creations_before;
+                stats["wall_team_ns"]=elapsed_ns(phase_start);phase_start=Clock::now();
+                std::unique_ptr<double[]> local_output;
                 double *scratch;
-                if (retained_product()) {
+                size_t output_allocations=0;
+                if (gather) {
+                    output_workspace_.reset();output_workspace_size_=0;scratch=output;
+                } else if (retained_product()) {
                     // Uninitialized allocation permits owner first-touch. Keep
                     // one width only so a block probe does not pin its peak RSS.
                     if (output_workspace_size_!=workers*count) {
-                        output_workspace_.reset(new double[workers*count]);
+                        output_workspace_.reset();output_workspace_size_=0;
+                        output_workspace_.reset(new double[workers*count]);++output_allocations;
                         output_workspace_size_=workers*count;
                     }
                     scratch=output_workspace_.get();
-                    product_for(workers,workers,[&](size_t w,size_t) {
-                        std::fill(scratch+w*count,scratch+(w+1)*count,0.);
-                    });
-                } else { local_output.assign(workers*count,0.);scratch=local_output.data(); }
+                } else {
+                    local_output.reset(new double[workers*count]);scratch=local_output.get();output_allocations=1;
+                }
+                stats["wall_allocation_ns"]=elapsed_ns(phase_start);phase_start=Clock::now();
+                if (!gather) product_for(workers,workers,[&](size_t w,size_t) {
+                    std::fill(scratch+w*count,scratch+(w+1)*count,0.);
+                },true);
+                if (gather) product_for(ng,workers,[&](size_t g,size_t) {
+                    for (size_t i:order_[g]->second) for (size_t v=0;v<cols;++v)
+                        output[i*cols+v]=diagonal_[i]*input[i*cols+v];
+                });
+                stats["wall_zeroing_ns"]=elapsed_ns(phase_start);phase_start=Clock::now();
                 std::vector<long double> omitted(Exact ? 0 : workers*count,0.),uniform(Exact ? 0 : workers*cols,0.);
+                stats["wall_error_workspace_ns"]=elapsed_ns(phase_start);phase_start=Clock::now();
                 struct alignas(64) Counts {
                     size_t pairs=0,zero_pairs=0,prepared=0,coarse=0,norm=0,zero_csf=0,
                            coefficient=0,elements=0,kept=0,dropped=0,cache_blocks=0,cache_elements=0,
                            sampled_blocks=0,sampled_prepared=0,sampled_elements=0,
                            preparation_ns=0,contraction_ns=0,batch_blocks=0,batch_pairs=0,
                            batch_terms_rejected=0,generators_considered=0,generators_removed=0,
-                           generator_blocks=0,generator_empty_blocks=0;
+                           generator_blocks=0,generator_empty_blocks=0,
+                           rows=0,worker_ns=0,enumeration_ns=0,cpu_first=std::numeric_limits<size_t>::max(),cpu_last=0,migrations=0,short_elements=0,partner_peak=0;
+                    std::array<size_t,3> rank_samples{},rank_weights{},rank_weighted_preparation{},rank_weighted_contraction{};
+                    std::array<size_t,16> shape_samples{},shape_preparation{},shape_contraction{};
                     std::array<size_t,3> rank_pairs{},rank_terms{},rank_preparation{},rank_contraction{};
                     std::array<size_t,16> shapes{};
                 };
@@ -671,18 +773,32 @@ public:
                     before[w]=memo_[w]->product_counters();
                     if (symbolic()) symbolic_before[w]=symbolic_[w]->counters();
                 }
+                stats["wall_workspace_ns"]=elapsed_ns(phase_start);phase_start=Clock::now();
                 product_for(tasks.size(),workers,[&](size_t task,size_t w) {
+                    auto row_start=profile_couplings_ ? Clock::now() : Clock::time_point{};
                     size_t g=tasks[task];
                     const auto &a=*order_[g];
                     auto &s=counters[w];
-                    double *out=scratch+w*count;
+#ifdef __linux__
+                    if (profile_couplings_) {
+                        size_t cpu=sched_getcpu();
+                        if (s.cpu_first==std::numeric_limits<size_t>::max()) s.cpu_first=cpu;
+                        else s.migrations+=s.cpu_last!=cpu;
+                        s.cpu_last=cpu;
+                    }
+#endif
+                    ++s.rows;
+                    double *out=gather ? output : scratch+w*count;
                     long double *err=Exact ? nullptr : omitted.data()+w*count;
                     std::vector<const Group *> temporary;
                     if (!compact) {
-                         if (blocks) temporary=graph_partners(g,connectivity[w]);
+                        if (gather) temporary=fast_partners(a,std::numeric_limits<size_t>::max(),connectivity[w]);
+                        else if (blocks) temporary=graph_partners(g,connectivity[w]);
                         else temporary=fast_partners(a,source ? std::numeric_limits<size_t>::max() :
                                                                             a.second.back(),connectivity[w]);
                     }
+                    s.partner_peak=std::max(s.partner_peak,temporary.capacity()*sizeof(temporary[0]));
+                    if (profile_couplings_) s.enumeration_ns+=elapsed_ns(row_start);
                     std::vector<Path> local_a;
                     std::vector<const Path *> pa;
                     bool cached_row=!value_offsets_.empty() &&
@@ -694,11 +810,17 @@ public:
                     for (size_t at=begin;at<end;++at) {
                         size_t bg=compact ? size_t(compact_cols_[at]) : ordinal_.at(temporary[at]);
                         const auto &b=*order_[bg];
+                        // A gather owner owns the entire configuration, so
+                        // same-configuration pairs may publish both endpoints.
+                        const bool symmetric=!source && (!gather || g==bg);
                         const double *cached=cached_row ? values_.data()+cache_at : nullptr;
                         if (cached_row) cache_at+=a.second.size()*b.second.size();
                         double maximum=source ? group_max[g] : std::max(group_max[g],group_max[bg]);
                         if (maximum==0.) { ++s.zero_pairs; continue; }
                         ++s.pairs;
+                        auto descriptor=describe_pair(source ? bg : g,source ? g : bg);
+                        const size_t sample_weight=descriptor.transfer_rank==0 ? 16 : 256;
+                        const bool sample=profile_couplings_ && (sample_hash(g,bg)&(sample_weight-1))==0;
                         auto omit_block=[&](long double bound) {
                             if constexpr(!Exact) {
                                 if (source) {
@@ -722,7 +844,6 @@ public:
                         // path-pointer lists during a product. This is a
                         // separate semi-direct path, with identical screening.
                         if (cached) {
-                            bool sample=profile_couplings_ && (at%256)==0;
                             auto begin=sample ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                             ++s.cache_blocks;
                             if (sample) ++s.sampled_blocks;
@@ -760,14 +881,15 @@ public:
                                 std::chrono::steady_clock::now()-begin).count();
                             continue;
                         }
-                        bool sample=profile_couplings_ && (at%256)==0;
                         auto prep_start=sample ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                        auto descriptor=describe_pair(source ? bg : g,source ? g : bg);
                         Connection ordinary;Connection &c=compact_mode() ? rank_scratch[w] : ordinary;
                         if (compact_mode()) ranked_connection(descriptor,one_.data(),two_.data(),terms_,!late,c);
                         else c=connection(descriptor,one_.data(),two_.data(),terms_,true,!late);
+                        auto bin=[](size_t n) { return n<2 ? 0 : n<4 ? 1 : n<16 ? 2 : 3; };
+                        size_t shape=profile_couplings_ ? 4*bin(a.second.size()*b.second.size())+bin(c.generators.size()) : 0;
                         if (profile_couplings_) {
                             ++s.rank_pairs[descriptor.transfer_rank];s.rank_terms[descriptor.transfer_rank]+=c.generators.size();
+                            ++s.shapes[shape];
                         }
                         ++s.prepared;
                         double bound=c.term_bound;
@@ -802,6 +924,10 @@ public:
                             size_t duration=std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now()-prep_start).count();
                             s.preparation_ns+=duration;s.rank_preparation[descriptor.transfer_rank]+=duration;
+                            ++s.rank_samples[descriptor.transfer_rank];
+                            s.rank_weights[descriptor.transfer_rank]+=sample_weight;
+                            s.rank_weighted_preparation[descriptor.transfer_rank]+=sample_weight*duration;
+                            ++s.shape_samples[shape];s.shape_preparation[shape]+=sample_weight*duration;
                         }
                         // Scalars act only on identical CSFs; the diagonal was
                         // constructed without generator screening during setup.
@@ -811,10 +937,6 @@ public:
                         if (!cached_paths_) pb=get_paths(b.second,local_b);
                         auto contraction_start=sample ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                         bool batched=false;
-                        if (mode_!=SemiDirect && profile_couplings_) {
-                            auto bin=[](size_t n) { return n<2 ? 0 : n<4 ? 1 : n<16 ? 2 : 3; };
-                            ++s.shapes[4*bin(a.second.size()*b.second.size())+bin(c.generators.size())];
-                        }
                         bool batch_mode=(mode_!=SemiDirect);
                         bool batch_size=
                             a.second.size()>=min_batch_/b.second.size()+size_t(min_batch_%b.second.size()!=0);
@@ -834,8 +956,12 @@ public:
                                     row_max,g==bg,c,smallplans[w],*memo_[w],accelerated,basis_->context().nelec,max_batch_,
                                     batches[w],hybrid_scratch[w],traversal[w]);
                             if (hybrid_result==2) {
-                                if (sample) s.contraction_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now()-contraction_start).count();
+                                if (sample) {
+                                    size_t duration=elapsed_ns(contraction_start);
+                                    s.contraction_ns+=duration;s.rank_contraction[descriptor.transfer_rank]+=duration;
+                                    s.rank_weighted_contraction[descriptor.transfer_rank]+=sample_weight*duration;
+                                    s.shape_contraction[shape]+=sample_weight*duration;
+                                }
                                 continue;
                             }
                             batched=hybrid_result==1;
@@ -852,11 +978,16 @@ public:
                                 c,plans[w],bitplans[w],accelerated,max_batch_,batches[w]);
                             if (batched) { ++s.batch_blocks; s.batch_pairs+=a.second.size()*b.second.size(); }
                         }
+                        const bool short_block=short_spin_ && descriptor.transfer_rank==2 && c.generators.size()<=2;
                         auto backend=entry_backend([&](size_t r,size_t t,size_t i,size_t j) {
                             const Path &p=cached_paths_ ? paths_[i] : (source ? *pb[t] : *pa[r]);
                             const Path &q=cached_paths_ ? paths_[j] : (source ? *pa[r] : *pb[t]);
                             if (!compact_spins_.empty()) {
                                 if (bonds_<2 && k_) throw BudgetError("GUGA segment scratch exceeds max_bond_elements");
+                                if (!batched && short_block) {
+                                    ++s.short_elements;
+                                    return memo_[w]->compact_short_element(p,q,compact_spins_[i],compact_spins_[j],c,smallplans[w],path_down_[i],path_down_[j],accelerated);
+                                }
                                 return batched ? batches[w].values[r*b.second.size()+t] :
                                     memo_[w]->compact_element(p,q,compact_spins_[i],compact_spins_[j],c,smallplans[w],path_down_[i],path_down_[j],accelerated);
                             }
@@ -870,7 +1001,7 @@ public:
                                 memo_[w]->element(p,q,c);
                         });
                         auto accept=[&](size_t,size_t,size_t i,size_t j) {
-                            double weight=source ? row_max[j] : std::max(row_max[i],row_max[j]);
+                            double weight=symmetric ? std::max(row_max[i],row_max[j]) : row_max[j];
                             if (weight==0.) { ++s.zero_csf; return false; }
                             if constexpr(!Exact) if (!late && tolerance>0. && screen_bound(bound,weight,tolerance,k_)) {
                                 ++s.coefficient;
@@ -886,13 +1017,13 @@ public:
                             ++s.elements;
                             if (sample) ++s.sampled_elements;
                             if constexpr(Exact) {
-                                if (value==0.) s.dropped+=(source ? 1 : 2)*cols;
+                                if (value==0.) s.dropped+=(symmetric ? 2 : 1)*cols;
                                 else {
                                     for (size_t v=0;v<cols;++v) {
                                         out[i*cols+v]+=value*input[j*cols+v];
-                                        if (!source) out[j*cols+v]+=value*input[i*cols+v];
+                                        if (symmetric) out[j*cols+v]+=value*input[i*cols+v];
                                     }
-                                    s.kept+=(source ? 1 : 2)*cols;
+                                    s.kept+=(symmetric ? 2 : 1)*cols;
                                 }
                             } else {
                                 auto publish=[&](size_t to,size_t from) {
@@ -908,16 +1039,35 @@ public:
                             }
                         };
                         apply_selected_block(backend,g==bg,
-                            {a.second,b.second,source,!source && (!blocks || g==bg),false},accept,publish_entry);
+                            {a.second,b.second,source,symmetric && (!blocks || g==bg),false},accept,publish_entry);
                         if (sample) {
                             size_t duration=std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now()-contraction_start).count();
                             s.contraction_ns+=duration;s.rank_contraction[descriptor.transfer_rank]+=duration;
+                            s.rank_weighted_contraction[descriptor.transfer_rank]+=sample_weight*duration;
+                            s.shape_contraction[shape]+=sample_weight*duration;
                         }
                     }
+                    if (profile_couplings_) s.worker_ns+=elapsed_ns(row_start);
                 },sparse_source);
+                stats["wall_traversal_ns"]=elapsed_ns(phase_start);phase_start=Clock::now();
+                std::vector<size_t> worker_elapsed,worker_rows,worker_pairs;
                 for (size_t w=0;w<workers;++w) {
                     const auto &s=counters[w];
+                    worker_elapsed.push_back(s.worker_ns);worker_rows.push_back(s.rows);worker_pairs.push_back(s.pairs);
+                    if (profile_couplings_) {
+                        stats["worker_"+std::to_string(w)+"_elapsed_ns"]=s.worker_ns;
+                        stats["worker_"+std::to_string(w)+"_rows"]=s.rows;
+                        stats["worker_"+std::to_string(w)+"_pairs"]=s.pairs;
+                        if (s.rows) {
+                            stats["worker_"+std::to_string(w)+"_cpu_first"]=s.cpu_first;
+                            stats["worker_"+std::to_string(w)+"_cpu_last"]=s.cpu_last;
+                        }
+                        stats["worker_cpu_migrations"]+=s.migrations;
+                    }
+                    stats["worker_enumeration_ns"]+=s.enumeration_ns;
+                    stats["short_spin_entries"]+=s.short_elements;
+                    stats["partner_workspace_peak_bytes"]+=s.partner_peak;
                     stats["configuration_pairs"]+=s.pairs; stats["zero_pairs"]+=s.zero_pairs;
                     stats["prepared_pairs"]+=s.prepared; stats["coarse_pruned_blocks"]+=s.coarse;
                     stats["norm_pruned_blocks"]+=s.norm; stats["zero_csf_pairs"]+=s.zero_csf;
@@ -934,8 +1084,13 @@ public:
                     stats["generators_removed"]+=s.generators_removed;
                     stats["generator_screened_blocks"]+=s.generator_blocks;
                     stats["generator_empty_blocks"]+=s.generator_empty_blocks;
-                    if (mode_!=SemiDirect && profile_couplings_) for (size_t b=0;b<16;++b)
-                        stats["block_shape_"+std::to_string(b/4)+"_"+std::to_string(b%4)]+=s.shapes[b];
+                    if (profile_couplings_) for (size_t b=0;b<16;++b) {
+                        auto prefix="block_shape_"+std::to_string(b/4)+"_"+std::to_string(b%4);
+                        stats[prefix]+=s.shapes[b];
+                        stats[prefix+"_sampled_blocks"]+=s.shape_samples[b];
+                        stats[prefix+"_estimated_preparation_worker_ns"]+=s.shape_preparation[b];
+                        stats[prefix+"_estimated_contraction_worker_ns"]+=s.shape_contraction[b];
+                    }
                     stats["batch_scratch_bytes"]+=batches[w].bytes();
                     const auto &t=traversal[w];
                     stats["selected_guga_blocks"]+=t.blocks;stats["selected_guga_nodes"]+=t.nodes;
@@ -953,6 +1108,11 @@ public:
                     for (size_t rank=0;rank<3;++rank) {
                         auto prefix="rank_"+std::to_string(rank)+"_";
                         stats[prefix+"pairs"]+=s.rank_pairs[rank];stats[prefix+"generators"]+=s.rank_terms[rank];
+                        stats[prefix+"sampled_blocks"]+=s.rank_samples[rank];
+                        stats[prefix+"sampled_population_weight"]+=s.rank_weights[rank];
+                        stats[prefix+"estimated_preparation_worker_ns"]+=s.rank_weighted_preparation[rank];
+                        stats[prefix+"estimated_contraction_worker_ns"]+=s.rank_weighted_contraction[rank];
+                        stats[prefix+"sampling_denominator"]=rank==0 ? 16 : 256;
                         stats[prefix+"sampled_preparation_ns"]+=s.rank_preparation[rank];
                         stats[prefix+"sampled_contraction_ns"]+=s.rank_contraction[rank];
                     }
@@ -971,6 +1131,14 @@ public:
                         for (size_t p=0;p<names.size();++p) stats[names[p]]+=values[p]-symbolic_before[w][p];
                     }
                 }
+                auto distribution=[&](const char *name,std::vector<size_t> values) {
+                    std::sort(values.begin(),values.end());
+                    stats[std::string(name)+"_min"]=values.front();
+                    stats[std::string(name)+"_median"]=values[values.size()/2];
+                    stats[std::string(name)+"_max"]=values.back();
+                };
+                distribution("worker_elapsed_ns",worker_elapsed);distribution("worker_rows",worker_rows);distribution("worker_pairs",worker_pairs);
+                stats["wall_stats_ns"]=elapsed_ns(phase_start);phase_start=Clock::now();
                 std::vector<long double> uniform_sum(Exact ? 0 : cols,0.);
                 if constexpr(!Exact) {
                     for (size_t w=0;w<workers;++w) for (size_t v=0;v<cols;++v)
@@ -1000,7 +1168,7 @@ public:
                     stats["screening_error_scratch_bytes"]=(omitted.capacity()+uniform.capacity()+
                         uniform_sum.capacity()+largest.capacity()+squared.capacity())*sizeof(long double);
                 } else {
-                    product_for((n+1023)/1024,workers,[&](size_t tile,size_t) {
+                    if (!gather) product_for((n+1023)/1024,workers,[&](size_t tile,size_t) {
                         for (size_t i=tile*1024;i<std::min(n,(tile+1)*1024);++i) for (size_t v=0;v<cols;++v) {
                             size_t at=i*cols+v;double value=diagonal_[i]*input[at];
                             for (size_t w=0;w<workers;++w) value+=scratch[w*count+at];
@@ -1010,6 +1178,7 @@ public:
                     for (size_t v=0;v<cols;++v) error_inf.mutable_data()[v]=error_l2.mutable_data()[v]=std::nextafter(0.,INFINITY);
                     stats["screening_error_scratch_bytes"]=0;
                 }
+                stats["wall_reduction_ns"]=elapsed_ns(phase_start);phase_start=Clock::now();
                 stats["exact_product_kernel"]=Exact;
                 stats["workers"]=workers; stats["optimized"]=1;
                 stats["active_source_groups"]=source ? tasks.size() : active.size();
@@ -1018,12 +1187,22 @@ public:
                 stats["late_screening"]=late;
                 stats["prepared_guga"]=planned;
 
-                stats["output_scratch_bytes"]=workers*count*sizeof(double);
+                stats["gather_accumulation"]=gather;
+                stats["requested_workers"]=requested_workers;stats["team_workers"]=team_workers_;
+                stats["worker_affinity"]=!worker_cpus_.empty();
+                stats["scratch_workers_limited"]=workers<requested_workers;
+                stats["uncapped_product_scratch_bytes"]=uncapped;
+                stats["forecast_product_scratch_bytes"]=forecast_bytes;
+                stats["max_product_scratch_bytes"]=max_product_scratch_;
+                stats["output_allocations"]=output_allocations;
+                stats["output_scratch_bytes"]=gather ? 0 : workers*count*sizeof(double);
                 stats["retained_product_workspace_bytes"]=workspace_bytes();
                 stats["sparse_source_policy"]=sparse_source;
                 stats["coefficient_metadata_bytes"]=row_max.capacity()*sizeof(double)+
                     group_max.capacity()*sizeof(double)+sums.capacity()*sizeof(long double)+
                     tasks.capacity()*sizeof(size_t)+active.capacity()*sizeof(size_t);
+                stats["wall_finalize_ns"]=elapsed_ns(phase_start);
+                stats["wall_native_ns"]=elapsed_ns(native_start);
                 last_=stats;
             } catch (const std::length_error &e) { throw BudgetError(e.what()); }
         }
@@ -1035,8 +1214,12 @@ public:
         if ((generator_tol>0. || unscreened) && (mode_==WideSpin || mode_==SemiDirect))
             throw std::invalid_argument("generator screening and unscreened overrides require a prepared lean/tiny strategy");
         if (unscreened) generator_tol=0.;
-        if (compact_mode() && generator_tol==0. && (unscreened || (tolerance_==0. && cutoff_==0.)))
-            return apply_fast<false,true>(x,0.,generator_screen,unscreened);
+        const bool exact=generator_tol==0. && (unscreened || (tolerance_==0. && cutoff_==0.));
+        if (gather_) {
+            if (!exact) throw std::invalid_argument("gather accumulation requires an exact product");
+            return apply_fast<false,true,true>(x,0.,generator_screen,unscreened);
+        }
+        if (exact) return apply_fast<false,true>(x,0.,generator_screen,unscreened);
         return generator_tol>0. ? apply_fast<true>(x,generator_tol,generator_screen,unscreened) :
                                  apply_fast<false>(x,0.,generator_screen,unscreened);
     }

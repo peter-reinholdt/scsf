@@ -116,6 +116,13 @@ def build_parser():
     parser.add_argument('--direct', action='store_true', help='apply Hamiltonian products directly (requires spin backend and GUGA)')
     parser.add_argument('--direct-strategy', choices=_DIRECT_STRATEGIES, default='compact-spin-guga', help='strategy with --direct (default: compact-spin-guga)')
     parser.add_argument('--product-tol', type=float, default=0.0, help='direct product screening tolerance (default: 0, unscreened)')
+    parser.add_argument('--max-product-scratch-bytes', type=int, default=256*1024**2,
+                        help='direct output/omission scratch ceiling; may reduce workers or tile RHS columns')
+    parser.add_argument('--product-accumulation', choices=('private','gather'), default='private',
+                        help='experimental exact compact gather owns disjoint output rows')
+    parser.add_argument('--spin-encoder', choices=('auto','portable','bmi2'), default='auto')
+    parser.add_argument('--compact-spin-kernel', choices=('general','short'), default='general')
+    parser.add_argument('--worker-cpus', type=int, nargs='+', help='one allowed Linux CPU per adaptive product worker')
     parser.add_argument('--product-engine', choices=('native', 'scipy'), default='native', help='stored CSR product engine (default: native)')
     parser.add_argument('--matrix-cutoff', type=float, help='off-diagonal cutoff (default: 0 for direct, 1e-10 for stored CSR)')
     parser.add_argument('--storage-engine', choices=('auto', 'native', 'snapshot'), default='auto', help='native append storage for symmetric native products; snapshot keeps the reference')
@@ -137,6 +144,8 @@ def main(argv=None):
         parser.error('--direct requires --backend spin and --coupling-engine guga')
     if not np.isfinite(args.product_tol) or args.product_tol < 0:
         parser.error('product-tol must be finite and nonnegative')
+    if args.max_product_scratch_bytes < 0:
+        parser.error('max-product-scratch-bytes must be nonnegative')
     if args.matrix_cutoff is None:
         args.matrix_cutoff = 0.0 if args.direct else 1e-10
     if args.matrix_index is None:
@@ -168,7 +177,13 @@ def main(argv=None):
     else:
         backend = scsf.CSFSpinBackend(ham, max_block_elements=args.max_block_elements, max_bond_elements=None, max_tensor_entries=None, max_connection_terms=None, nthreads=args.nthreads, cache_bytes=args.cache_mib * 1024 ** 2, prescreen=not args.no_prescreen, coupling_engine=args.coupling_engine, max_transfer_bounds=args.max_transfer_bounds, selection_engine=args.selection_engine, matrix_index=args.matrix_index, guga_factors=args.guga_factors, coupling_reuse=args.coupling_reuse, collect_reuse=args.collect_reuse, max_ordered_bytes=args.max_ordered_bytes, max_index_bytes=args.max_index_bytes, max_reuse_bytes=args.max_reuse_bytes, reuse_strategy=args.reuse_strategy, walk_engine=args.walk_engine, max_walk_bytes=args.max_walk_bytes, parallel_engine=args.parallel_engine, matrix_parallel_engine=args.matrix_parallel_engine, matrix_kernel=args.matrix_kernel, max_reuse_bytes_per_worker=args.max_reuse_bytes_per_worker)
     if args.direct:
-        op = scsf.csf_direct_op(ham, wfn, backend=backend, strategy=args.direct_strategy, product_tol=args.product_tol, matrix_cutoff=args.matrix_cutoff, nthreads=args.product_nthreads, max_ordered_bytes=args.max_ordered_bytes, collect_spin_stats=args.sci_stats or args.direct_strategy == 'semi-direct')
+        op = scsf.csf_direct_op(ham, wfn, backend=backend, strategy=args.direct_strategy,
+            product_tol=args.product_tol, matrix_cutoff=args.matrix_cutoff, nthreads=args.product_nthreads,
+            max_ordered_bytes=args.max_ordered_bytes,
+            max_product_scratch_bytes=args.max_product_scratch_bytes,
+            product_accumulation=args.product_accumulation, spin_encoder=args.spin_encoder,
+            compact_spin_kernel=args.compact_spin_kernel, worker_cpus=args.worker_cpus,
+            collect_spin_stats=args.sci_stats or args.direct_strategy == 'semi-direct')
     else:
         op = scsf.csf_op(ham, wfn, backend=backend, product_engine=args.product_engine, matrix_cutoff=args.matrix_cutoff, storage_engine=args.storage_engine, product_nthreads=args.product_nthreads, product_mode=args.product_mode, max_matrix_entries=args.max_matrix_entries)
     solver_options = dict(tol=args.davidson_tol, maxiter=args.davidson_maxiter, trial_vector_tol=args.davidson_trial_vector_tol, trial_vector_decay=args.davidson_trial_vector_decay, trial_vector_source=args.davidson_trial_vector_source)

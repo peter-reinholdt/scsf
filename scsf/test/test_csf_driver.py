@@ -30,6 +30,8 @@ def test_direct_driver_full_and_selected_products(full, strategy, product_thread
             '--direct-strategy', strategy, '--nthreads', '2', '--nroots', '2']
     if full:
         argv.append('--full')
+        argv += ['--max-product-scratch-bytes','0','--product-accumulation','gather',
+                 '--spin-encoder','portable','--compact-spin-kernel','short']
     if product_threads is not None:
         argv += ['--product-nthreads', str(product_threads)]
     csf_driver.main(argv)
@@ -44,6 +46,9 @@ def test_direct_driver_full_and_selected_products(full, strategy, product_thread
     assert op.matrix_cutoff == 0.
     assert op.product_tol == 0.
     assert op.backend.matrix_index == 'zobrist'
+    if full:
+        assert op.max_product_scratch_bytes == 0 and op.product_accumulation == 'gather'
+        assert op.spin_encoder == 'portable' and op.compact_spin_kernel == 'short'
     if not full:
         assert 'iteration=1 added=' in output
 
@@ -54,6 +59,7 @@ def test_direct_driver_full_and_selected_products(full, strategy, product_thread
     (['--coupling-engine', 'python'], '--direct requires'),
     (['--product-tol', '-1'], 'product-tol must be'),
     (['--product-tol', 'nan'], 'product-tol must be'),
+    (['--max-product-scratch-bytes', '-1'], 'max-product-scratch-bytes must be'),
 ])
 def test_direct_driver_invalid_options_fail_before_integrals(options, message, capsys):
     with pytest.raises(SystemExit) as error:

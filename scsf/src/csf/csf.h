@@ -256,10 +256,13 @@ private:
     size_t tiny_count() const { return tiny_count_; }
     Format format_;
     bool collect_spin_;
-    template<bool Track,bool Checkpoint,bool Compact=false> double lean_lookup(const Path &,const Path &,const GugaTerm &,
+    template<bool Track,bool Checkpoint,bool Compact=false,bool TinyOnly=false> double lean_lookup(const Path &,const Path &,const GugaTerm &,
         int,int,int,std::uint64_t,std::uint32_t,std::uint32_t tiny_meta=0,
         int bra_begin=0,int ket_begin=0,int phase=1);
     template<bool Track,bool Checkpoint> double compact_element_impl(const Path &,const Path &,
+        const CompactSpinPath &,const CompactSpinPath &,const Connection &,const GugaLeanPlan &,
+        std::uint64_t,std::uint64_t,bool);
+    template<bool Track,bool Checkpoint,bool Paired> double compact_short_impl(const Path &,const Path &,
         const CompactSpinPath &,const CompactSpinPath &,const Connection &,const GugaLeanPlan &,
         std::uint64_t,std::uint64_t,bool);
     template<bool Track,bool Checkpoint> bool compact_batch_impl(const std::vector<Path> &,
@@ -287,6 +290,8 @@ private:
                         const GugaPlan &,const GugaBitPlan &,bool,size_t,GugaBatchScratch &);
     template<bool Checkpoint> double element_impl(const Path &bra, const Path &ket, const Connection &connection);
 public:
+    double compact_short_element(const Path &,const Path &,const CompactSpinPath &,const CompactSpinPath &,
+        const Connection &,const GugaLeanPlan &,std::uint64_t,std::uint64_t,bool);
     GugaMemo(size_t maximum, bool reuse, bool packed=false,Format format=Generic,
              bool collect_spin=true,bool align_tiny=false,bool pair_encode=false);
     bool tiny_enabled() const { return reuse_ && packed_ && format_==Tiny && tiny_count()!=0; }

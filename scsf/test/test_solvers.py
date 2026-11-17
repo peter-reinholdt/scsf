@@ -202,3 +202,25 @@ def test_zero_trial_vector_threshold_preserves_reference_calls():
         npt.assert_array_equal(a, b)
     npt.assert_array_equal(first[0], second[0])
     npt.assert_array_equal(first[1], second[1])
+
+
+def test_davidson_phase_stats_preserve_solution_and_count_work():
+    rng = np.random.default_rng(781)
+    matrix = rng.normal(size=(25,25)); matrix = (matrix + matrix.T)/2
+    stats, calls = {}, []
+    def product(x):
+        calls.append(x.shape[1])
+        return matrix @ x
+    measured = solve_ci(product, np.diag(matrix), 2, tol=1e-9, maxiter=250,
+                        max_subspace=12, stats=stats)
+    control = solve_ci(lambda x:matrix @ x, np.diag(matrix), 2, tol=1e-9,
+                       maxiter=250, max_subspace=12)
+    npt.assert_allclose(measured[0], control[0], atol=1e-12)
+    assert measured[2] == control[2]
+    assert stats['product_calls'] == len(calls)
+    assert stats['product_columns'] == sum(calls)
+    assert stats['call_widths'] == calls
+    assert stats['iterations'] > 1 and stats['restarts'] > 0
+    phases = [stats[key] for key in ('product_ns','orthogonalization_ns','ritz_ns','restart_ns','other_ns')]
+    assert all(v >= 0 for v in phases)
+    assert sum(phases) == stats['total_ns']

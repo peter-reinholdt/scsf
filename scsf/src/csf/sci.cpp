@@ -1368,7 +1368,7 @@ py::tuple build_csr(const Array &one, const Array &two,
 void bind_sci(py::module_ &m) {
     py::class_<DirectHamiltonian>(m,"_DirectHamiltonian")
         .def(py::init<const Array &,const Array &,BasisSnapshot,
-             size_t,int,double,double,int,size_t,size_t,size_t,size_t,size_t,size_t,int,bool,size_t,bool,size_t,size_t,bool,size_t,size_t,size_t,bool,bool,size_t,size_t>())
+             size_t,int,double,double,int,size_t,size_t,size_t,size_t,size_t,size_t,int,bool,size_t,bool,size_t,size_t,bool,size_t,size_t,size_t,bool,bool,size_t,size_t,size_t,bool,int,std::vector<int>,bool>())
         .def("apply",&DirectHamiltonian::apply,py::arg("coefficients"),py::arg("generator_tol")=0.,
              py::arg("generator_screen")=0,py::arg("unscreened")=false)
         .def("diagonal",&DirectHamiltonian::diagonal)

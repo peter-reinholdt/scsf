@@ -622,7 +622,7 @@ size_t hash_range(std::uint64_t h,size_t count) {
 // reused within one generator's temporary batch. No selected-space projector.
 
 
-template<bool Track,bool Checkpoint,bool Compact>
+template<bool Track,bool Checkpoint,bool Compact,bool TinyOnly>
 double GugaMemo::lean_lookup(const Path &bra,const Path &ket,const GugaTerm &term,
                              int begin,int parity,int kept,std::uint64_t steps,std::uint32_t meta,std::uint32_t tiny_meta,
                              int bra_begin,int ket_begin,int phase) {
@@ -633,7 +633,7 @@ double GugaMemo::lean_lookup(const Path &bra,const Path &ket,const GugaTerm &ter
     phase*=parity;
     auto evaluate=[&] { return term.two_body ? guga_two_body_impl<Checkpoint>(bra,ket,term.p,term.q,term.r,term.s) : guga_generator_impl<Checkpoint>(bra,ket,term.p,term.q); };
     meta|=(std::uint32_t(bra_begin)<<1)|(std::uint32_t(ket_begin)<<5);
-    if (format_==Tiny) {
+    if (TinyOnly || format_==Tiny) {
         constexpr std::uint64_t valid=1ULL<<62,recent=1ULL<<63,keymask=valid-1;
         // Fixed low count nibble separates the variable-width exact formats.
         auto key=wide_tiny_key(steps,kept,tiny_meta,bra_begin,ket_begin);
@@ -830,6 +830,57 @@ double GugaMemo::compact_element(const Path &bra,const Path &ket,
             compact_element_impl<false,true>(bra,ket,a,b,c,plan,a_down,b_down,accelerated);
     return collect_spin_ ? compact_element_impl<true,false>(bra,ket,a,b,c,plan,a_down,b_down,accelerated) :
         compact_element_impl<false,false>(bra,ket,a,b,c,plan,a_down,b_down,accelerated);
+}
+
+// Short rank-two plans dominate many molecular selected blocks. Resolve the
+// paired encoder and tiny-cache format once, and expose both generator slots
+// to the optimizer. Keys, replacement policy, phases and recurrence fallbacks
+// are exactly the general compact kernel's; no coefficient cache is added.
+template<bool Track,bool Checkpoint,bool Paired>
+double GugaMemo::compact_short_impl(const Path &bra,const Path &ket,
+    const CompactSpinPath &a,const CompactSpinPath &b,const Connection &c,
+    const GugaLeanPlan &plan,std::uint64_t a_down,std::uint64_t b_down,bool accelerated) {
+    auto encode=Paired ? nullptr : lean_encoder(accelerated);
+    auto pair=Paired ? lean_pair_encoder(accelerated) : nullptr;
+    auto term_value=[&](size_t t) {
+        const auto &term=c.generators[t];const auto &p=plan[t];
+        if (!p.compatible || ((a_down^b_down)&p.outside) || a.spin(p.end+1)!=b.spin(p.end+1)) {
+            if constexpr(Track) ++orthogonal_;
+            return 0.;
+        }
+        int ab=a.spin(p.begin),bb=b.spin(p.begin),boundary=p.kept==10 ? 4 : 16;
+        if (!p.fits || p.kept>10 || ab>=boundary || bb>=boundary) {
+            if constexpr(Track) { ++misses_;++bypass_; }
+            return term.coefficient*(term.two_body ? guga_two_body_impl<Checkpoint>(bra,ket,term.p,term.q,term.r,term.s) :
+                guga_generator_impl<Checkpoint>(bra,ket,term.p,term.q));
+        }
+        std::uint64_t steps;
+        if constexpr(Paired) steps=pair(a_down,b_down,p);
+        else steps=encode(a_down,p,true)|encode(b_down,p,false);
+        return term.coefficient*lean_lookup<Track,Checkpoint,true,true>(bra,ket,term,p.begin,p.parity,p.kept,
+            steps,p.meta,p.tiny_meta,ab,bb,a.phase*b.phase);
+    };
+    double value=term_value(0);
+    if (c.generators.size()==2) value+=term_value(1);
+    return value;
+}
+
+double GugaMemo::compact_short_element(const Path &bra,const Path &ket,
+    const CompactSpinPath &a,const CompactSpinPath &b,const Connection &c,
+    const GugaLeanPlan &plan,std::uint64_t a_down,std::uint64_t b_down,bool accelerated) {
+    if (!packed_ || format_!=Tiny || !a.fits || !b.fits || &bra==&ket ||
+        c.generators.empty() || c.generators.size()>2)
+        return compact_element(bra,ket,a,b,c,plan,a_down,b_down,accelerated);
+    if (a.checkpoint || b.checkpoint) {
+        if (pair_encode_) return collect_spin_ ? compact_short_impl<true,true,true>(bra,ket,a,b,c,plan,a_down,b_down,accelerated) :
+            compact_short_impl<false,true,true>(bra,ket,a,b,c,plan,a_down,b_down,accelerated);
+        return collect_spin_ ? compact_short_impl<true,true,false>(bra,ket,a,b,c,plan,a_down,b_down,accelerated) :
+            compact_short_impl<false,true,false>(bra,ket,a,b,c,plan,a_down,b_down,accelerated);
+    }
+    if (pair_encode_) return collect_spin_ ? compact_short_impl<true,false,true>(bra,ket,a,b,c,plan,a_down,b_down,accelerated) :
+        compact_short_impl<false,false,true>(bra,ket,a,b,c,plan,a_down,b_down,accelerated);
+    return collect_spin_ ? compact_short_impl<true,false,false>(bra,ket,a,b,c,plan,a_down,b_down,accelerated) :
+        compact_short_impl<false,false,false>(bra,ket,a,b,c,plan,a_down,b_down,accelerated);
 }
 
 template<bool Track,bool Checkpoint>

@@ -43,8 +43,12 @@ def davidson_response(A, b, hdiag, tol=1e-4, maxiter=100, verbose=False, guess=N
 
 def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
              reference_state=None, max_subspace=None, trial_vector_tol=0.0,
-             trial_vector_decay=0.0, trial_vector_source='orthogonal'):
+             trial_vector_decay=0.0, trial_vector_source='orthogonal', stats=None):
     """Block Davidson for a real symmetric electronic Hamiltonian.
+
+    Optional ``stats`` is filled with nonoverlapping wall timings, product
+    widths, iteration and restart counts. Product validation is included in
+    product time; remaining bookkeeping is reported as ``other_ns``.
 
     ``hvp`` accepts a matrix of trial vectors as columns. Returns electronic
     eigenvalues, column-oriented eigenvectors, and a convergence flag. ``c0``
@@ -72,6 +76,31 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
     direction. Both recover consistent images through cached projections.
     """
     from operator import index
+    from time import perf_counter_ns
+    started = perf_counter_ns()
+    if stats is not None:
+        stats.clear()
+        stats.update(product_ns=0, orthogonalization_ns=0, ritz_ns=0, restart_ns=0,
+                     product_calls=0, product_columns=0, iterations=0, restarts=0, call_widths=[])
+    def timed(name):
+        def decorate(function):
+            if stats is None:
+                return function
+            def measured(*args, **kwargs):
+                before = perf_counter_ns()
+                try:
+                    return function(*args, **kwargs)
+                finally:
+                    stats[name] += perf_counter_ns() - before
+            return measured
+        return decorate
+    def finish(values, vectors, converged):
+        if stats is not None:
+            stats['total_ns'] = perf_counter_ns() - started
+            stats['other_ns'] = stats['total_ns'] - sum(stats[k] for k in
+                ('product_ns', 'orthogonalization_ns', 'ritz_ns', 'restart_ns'))
+            stats['converged'] = converged
+        return values, vectors, converged
 
     hdiag = np.asarray(hdiag)
     if np.iscomplexobj(hdiag) or hdiag.ndim != 1 or not np.all(np.isfinite(hdiag)):
@@ -101,6 +130,7 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
             raise ValueError('reference_state must be a finite nonzero real prefix vector')
         reference_state = reference_state / np.linalg.norm(reference_state)
 
+    @timed('orthogonalization_ns')
     def orthogonalize(vectors, against):
         accepted = []
         for vector in vectors.T:
@@ -120,13 +150,19 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
                 accepted.append(vector/norm)
         return np.column_stack(accepted) if accepted else np.empty((dim, 0))
 
+    @timed('product_ns')
     def apply(vectors):
+        if stats is not None:
+            stats['product_calls'] += 1
+            stats['product_columns'] += vectors.shape[1]
+            stats['call_widths'].append(vectors.shape[1])
         result = np.asarray(hvp(vectors))
         if (result.shape != vectors.shape or np.iscomplexobj(result) or
                 not np.all(np.isfinite(result))):
             raise ValueError('hvp must return a finite real block with the input shape')
         return result
 
+    @timed('orthogonalization_ns')
     def orthogonalize_transform(vectors, against, min_norm=1e-12):
         # Return D = vectors @ T + against @ P, using the same two-pass
         # orthogonalization on all three factors. Carrying the transformation
@@ -217,6 +253,8 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
     AV = apply(V)
     initial_residual = None
     for iteration in range(maxiter):
+        ritz_start = perf_counter_ns() if stats is not None else 0
+        if stats is not None: stats['iterations'] = iteration + 1
         projected = V.T @ AV
         values, rotations = np.linalg.eigh((projected+projected.T)/2)
         nkeep, found_reference = roots, reference_state is None
@@ -229,15 +267,16 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
         X, AX = V @ Z, AV @ Z
         residual = AX-X*L[None, :]
         norms = np.linalg.norm(residual, axis=0)
+        if stats is not None: stats['ritz_ns'] += perf_counter_ns() - ritz_start
         if initial_residual is None:
             initial_residual = max(float(np.max(norms)), np.finfo(float).tiny)
         if verbose:
             for k in range(len(L)):
                 print(f'{iteration+1}       {k+1}   {L[k]:.12e}    {norms[k]:.6e}')
         if np.all(norms < tol) and found_reference:
-            return L, X, True
+            return finish(L, X, True)
         if iteration+1 == maxiter:
-            return L, X, False
+            return finish(L, X, False)
         unconverged = np.flatnonzero(norms >= tol)
         denom = L[unconverged][None, :]-hdiag[:, None]
         small = np.abs(denom) < 1e-3
@@ -265,12 +304,15 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
         if not corrections.shape[1] and V.shape[1] < dim:
             corrections = supplement(V, max(1, roots))
         if not corrections.shape[1]:
-            return L, X, False
+            return finish(L, X, False)
         if V.shape[1]+corrections.shape[1] > max_subspace:
             # Thick restart retains the current Ritz vectors, without applying
             # H a second time to the retained columns.
             if X.shape[1] >= max_subspace:
-                return L, X, False
+                return finish(L, X, False)
+            if stats is not None:
+                stats['restarts'] += 1
+                restart_start, orthogonal_before = perf_counter_ns(), stats['orthogonalization_ns']
             V, AV = X, AX
             if correction_images is None:
                 corrections = orthogonalize(corrections, V)
@@ -278,13 +320,15 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
                 corrections, transform, projection = orthogonalize_transform(corrections, V)
                 if corrections.shape[1]:
                     correction_images = correction_images @ transform + AV @ projection
+            if stats is not None:
+                stats['restart_ns'] += perf_counter_ns() - restart_start - (stats['orthogonalization_ns'] - orthogonal_before)
         corrections = corrections[:, :max_subspace-V.shape[1]]
         if not corrections.shape[1]:
-            return L, X, False
+            return finish(L, X, False)
         if correction_images is None:
             correction_images = apply(corrections)
         else:
             correction_images = correction_images[:, :corrections.shape[1]]
         V = np.column_stack((V, corrections))
         AV = np.column_stack((AV, correction_images))
-    return L, X, False
+    return finish(L, X, False)
