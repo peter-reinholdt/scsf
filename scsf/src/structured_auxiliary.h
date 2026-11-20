@@ -15,9 +15,13 @@ class Auxiliary {
     struct Topology {
         RemovalBank bank;
         std::unique_ptr<RemovalLinks> one,two;
-        std::unique_ptr<Residues> auxiliary_queries;
+        std::unique_ptr<RemovalQueries> auxiliary_queries;
         std::map<int,std::unique_ptr<OneBank>> one_banks;
         std::vector<const OneBank *> family_banks;
+        std::vector<Occupation::Limb> auxiliary_masks;
+        std::vector<double> auxiliary_integrals;
+        std::vector<size_t> local_offsets;
+        std::vector<double> local_integrals;
         std::vector<std::pair<int,int>> orbital_pairs;
         std::vector<double> pair_integrals;
         std::vector<size_t> pair_rows,pair_columns;
@@ -122,8 +126,10 @@ class Auxiliary {
             offset+=width*width;
         }
     }
+    template<size_t Columns=0>
     void forward_block(const RemovalLinks &links,const RemovalLinks::Block &block,
                        const double *input,size_t cols,double *t) const {
+        if constexpr(Columns)cols=Columns;
         std::fill_n(t,(block.end-block.begin)*block.dim*cols,0.);
         for(size_t j=block.begin;j<block.end;++j) {
             const auto &parent=links.parents[j];const auto &c=topology_->bank.matrices[parent.matrix];const auto &g=p_.groups[parent.group];
@@ -152,11 +158,12 @@ class Auxiliary {
                 if(parent_id>=last)break;
                 const auto &parent=links.parents[parent_id];const auto &c=topology_->bank.matrices[parent.matrix];
                 const double *source=u+(links.offsets[parent_id]-base)*cols;
+                const unsigned weight=topology_->bank.weights[parent.matrix];
                 // For a singlet primary space, rotational invariance makes
                 // every magnetic component of a scalar contraction equal.
                 // Retain M=S only and sum the 2S+1 equal components here.
                 for(size_t i=0;i<g.size();++i)for(size_t a=0;a<c.rows;++a) {
-                    double value=parent.weight*c.at(a,g.rank(i));if(value==0.)continue;
+                    double value=weight*c.at(a,g.rank(i));if(value==0.)continue;
                     for(size_t v=0;v<cols;++v)output[g.row(i)*cols+v]+=value*source[a*cols+v];
                 }
             }
@@ -165,78 +172,185 @@ class Auxiliary {
     void one_body_middle(const double *t,size_t cols,double *u) {
         workers_.run(topology_->one->blocks.size(),[&](size_t b,size_t) {
             const auto &block=topology_->one->blocks[b];
-            std::fill_n(u+block.offset*cols,(block.end-block.begin)*block.dim*cols,0.);
+            std::fill_n(u+topology_->one->offset(block)*cols,(block.end-block.begin)*block.dim*cols,0.);
             for(size_t a=block.begin;a<block.end;++a)for(size_t r=block.begin;r<block.end;++r) {
                 const auto &pa=topology_->one->parents[a],&pr=topology_->one->parents[r];
-                double value=h_[(pa.channel%p_.k)*p_.k+pr.channel%p_.k];
+                double value=h_[pa.channel*p_.k+pr.channel];
                 double *target=u+topology_->one->offsets[a]*cols;
                 const double *source=t+topology_->one->offsets[r]*cols;
                 for(size_t i=0;i<block.dim*cols;++i)target[i]+=value*source[i];
             }
         },16);
     }
+    double local_integral(size_t config,int p,int r) const {
+        const size_t k=p_.k,kk=k*k,pr=p*k+r;
+        const auto *integrals=topology_->auxiliary_integrals.empty()
+            ? nullptr : topology_->auxiliary_integrals.data();
+        const auto &occupations=topology_->one->residues->configs[config];
+        const auto &queries=*topology_->auxiliary_queries;
+        double value=h_[pr];
+        for(size_t i=queries.reverse_ptr[config];i<queries.reverse_ptr[config+1];++i) {
+            const size_t q=queries.queries[i].orbital;
+            const double g=integrals ? integrals[(q*k+q)*kk+pr] : eri(p,q,r,q);
+            value+=.5*occupations[q]*g;
+        }
+        return value;
+    }
+    void prepare_local_integrals(size_t allowance) {
+        const auto &links=*topology_->one;
+        const size_t offsets_bytes=links.blocks.size()*sizeof(size_t);
+        if(links.blocks.empty() || allowance<offsets_bytes)return;
+        const size_t capacity=(allowance-offsets_bytes)/sizeof(double);
+        size_t entries=0;
+        for(const auto &block:links.blocks) {
+            const size_t count=block.end-block.begin;
+            if(count>(capacity-entries)/count)return;
+            entries+=count*count;
+        }
+        auto &offsets=topology_->local_offsets;
+        auto &values=topology_->local_integrals;
+        offsets.resize(links.blocks.size());
+        size_t start=0;
+        for(size_t i=0;i<links.blocks.size();++i) {
+            offsets[i]=start;
+            const auto &block=links.blocks[i];
+            const size_t count=block.end-block.begin;
+            start+=count*count;
+        }
+        values.resize(entries);
+        workers_.run(links.blocks.size(),[&](size_t b,size_t) {
+            const auto &block=links.blocks[b];
+            const size_t count=block.end-block.begin;
+            const auto *parents=links.parents.data()+block.begin;
+            double *block_values=values.data()+offsets[b];
+            for(size_t i=0;i<count;++i)for(size_t j=0;j<count;++j)
+                block_values[i*count+j]=local_integral(block.config,parents[i].channel,parents[j].channel);
+        },32);
+        topology_->metadata_bytes+=offsets.capacity()*sizeof(size_t)+values.capacity()*sizeof(double);
+    }
     // Contract one destination residue family. Source blocks are either
     // borrowed from the global forward array or regenerated on demand.
-    template<class Read>
+    template<size_t Columns,class Read>
     void nminus1_destination(size_t a,size_t f,const RemovalLinks::Block &left,
                              size_t cols,Read read,double *result,std::vector<double> &transformed) {
-        const auto &ca=topology_->one->residues->configs[a];
-        const size_t width=left.dim*cols;
-        std::fill_n(result,(left.end-left.begin)*width,0.);
+        if constexpr(Columns)cols=Columns;
+        const auto &links=*topology_->one;
+        const auto &queries=*topology_->auxiliary_queries;
+        const size_t k=p_.k,kk=k*k;
+        const auto *table=topology_->auxiliary_integrals.empty() ? nullptr : topology_->auxiliary_integrals.data();
+        const auto *left_parents=links.parents.data()+left.begin;
+        const auto &bank=*topology_->family_banks[f];
+        const size_t width=left.dim*cols,left_count=left.end-left.begin;
+        std::fill_n(result,left_count*width,0.);
         const double *local=read(left);
-        for(size_t i=left.begin;i<left.end;++i) {
-            int p=topology_->one->parents[i].channel%p_.k;
-            double *target=result+(i-left.begin)*width;
-            for(size_t j=left.begin;j<left.end;++j) {
-                int r=topology_->one->parents[j].channel%p_.k;
-                double value=h_[p*p_.k+r];
-                for(size_t query=topology_->auxiliary_queries->reverse_ptr[a];query<topology_->auxiliary_queries->reverse_ptr[a+1];++query) {
-                    int q=topology_->auxiliary_queries->queries[query].orbital;
-                    value+=.5*ca[q]*eri(p,q,r,q);
-                }
-                const double *source=local+(j-left.begin)*width;
-                for(size_t k=0;k<width;++k)target[k]+=value*source[k];
+        const double *local_values=topology_->local_offsets.empty() ? nullptr :
+            topology_->local_integrals.data()+topology_->local_offsets[&left-links.blocks.data()];
+        for(size_t i=0;i<left_count;++i) {
+            double *target=result+i*width;
+            for(size_t j=0;j<left_count;++j) {
+                const double value=local_values ? local_values[i*left_count+j] :
+                    local_integral(a,left_parents[i].channel,left_parents[j].channel);
+                const double *source=local+j*width;
+                for(size_t v=0;v<width;++v)target[v]+=value*source[v];
             }
         }
-        for(size_t query=topology_->auxiliary_queries->reverse_ptr[a];query<topology_->auxiliary_queries->reverse_ptr[a+1];++query) {
-            const auto location=topology_->auxiliary_queries->queries[query];
+        const bool identity_directory=links.block_ids.empty();
+        for(size_t query=queries.reverse_ptr[a];query<queries.reverse_ptr[a+1];++query) {
+            const auto location=queries.queries[query];
             const int q=location.orbital;
-            for(size_t record=topology_->auxiliary_queries->ptr[location.residue];record<topology_->auxiliary_queries->ptr[location.residue+1];++record) {
-                const auto &connection=topology_->auxiliary_queries->records[record];
-                const size_t b=connection.parent;
-                const int s=connection.p;
+            for(size_t record=queries.ptr[location.config];record<queries.ptr[location.config+1];++record) {
+                const auto &connection=queries.parents[record];
+                const size_t b=connection.config;
+                const int s=connection.orbital;
                 if(q==s)continue;
-                const size_t bi=topology_->one->block_ids[b*topology_->one->families.size()+f];
+                const size_t bi=identity_directory ? b : links.block_ids[b*links.families.size()+f];
                 if(bi==none)continue;
-                const auto &right=topology_->one->blocks[bi];
-                const auto &cb=topology_->one->residues->configs[b];
-                const Matrix &matrix=topology_->family_banks[f]->get(cb,q,s);
+                const auto &right=links.blocks[bi];
+                const auto &matrix=topology_->auxiliary_masks.empty()
+                    ? bank.get(links.residues->configs[b],q,s)
+                    : bank.at(bank.index(topology_->auxiliary_masks[b][0],topology_->auxiliary_masks[b][1],q,s));
                 const double *source=read(right);
-                transformed.assign((right.end-right.begin)*width,0.);
-                for(size_t j=right.begin;j<right.end;++j) {
-                    const double *channel=source+(j-right.begin)*right.dim*cols;
-                    double *target=transformed.data()+(j-right.begin)*width;
+                const size_t count=right.end-right.begin;
+                const auto *right_parents=links.parents.data()+right.begin;
+                const double *integrals=table ? table+(q*k+s)*kk : nullptr;
+                // With one destination channel the spin transform is consumed
+                // once. Accumulate it directly into the output residue.
+                if constexpr(Columns==1)if(left_count==1) {
+                    const int p=left_parents[0].channel;
+                    if(left.dim==1 && right.dim==1) {
+                        double value=0.;
+                        for(size_t j=0;j<count;++j) {
+                            const int r=right_parents[j].channel;
+                            const double scale=.5*(integrals ? integrals[p*k+r] : eri(p,q,r,s));
+                            value+=scale*source[j];
+                        }
+                        result[0]+=matrix.values[0]*value;
+                        continue;
+                    }
+                    // For an expensive spin transform, combine the orbital
+                    // channels first and apply the shared matrix just once.
+                    if(count>1 && matrix.data.size()+left.dim>2*right.dim) {
+                        transformed.assign(right.dim,0.);
+                        for(size_t j=0;j<count;++j) {
+                            const int r=right_parents[j].channel;
+                            const double scale=.5*(integrals ? integrals[p*k+r] : eri(p,q,r,s));
+                            if(scale==0.)continue;
+                            const double *channel=source+j*right.dim;
+                            for(size_t i=0;i<right.dim;++i)transformed[i]+=scale*channel[i];
+                        }
+                        for(size_t row=0;row<left.dim;++row) {
+                            double value=0.;
+                            for(size_t m=matrix.ptr[row];m<matrix.ptr[row+1];++m)
+                                value+=matrix.data[m]*transformed[matrix.indices[m]];
+                            result[row]+=value;
+                        }
+                        continue;
+                    }
+                    for(size_t j=0;j<count;++j) {
+                        const int r=right_parents[j].channel;
+                        const double scale=.5*(integrals ? integrals[p*k+r] : eri(p,q,r,s));
+                        if(scale==0.)continue;
+                        const double *channel=source+j*right.dim;
+                        for(size_t row=0;row<left.dim;++row) {
+                            double value=0.;
+                            for(size_t m=matrix.ptr[row];m<matrix.ptr[row+1];++m)
+                                value+=matrix.data[m]*channel[matrix.indices[m]];
+                            result[row]+=scale*value;
+                        }
+                    }
+                    continue;
+                }
+                transformed.assign(count*width,0.);
+                for(size_t j=0;j<count;++j) {
+                    const double *channel=source+j*right.dim*cols;
+                    double *target=transformed.data()+j*width;
                     for(size_t row=0;row<left.dim;++row)
                         for(size_t k=matrix.ptr[row];k<matrix.ptr[row+1];++k)for(size_t v=0;v<cols;++v)
                             target[row*cols+v]+=matrix.data[k]*channel[matrix.indices[k]*cols+v];
                 }
-                for(size_t i=left.begin;i<left.end;++i)for(size_t j=right.begin;j<right.end;++j) {
-                    const auto &destination=topology_->one->parents[i],&parent=topology_->one->parents[j];
-                    double value=.5*eri(destination.channel%p_.k,q,parent.channel%p_.k,s);
-                    if(value==0.)continue;
-                    const double *channel=transformed.data()+(j-right.begin)*width;
-                    double *target=result+(i-left.begin)*width;
-                    for(size_t k=0;k<width;++k)target[k]+=value*channel[k];
+                for(size_t i=0;i<left_count;++i) {
+                    const int p=left_parents[i].channel;
+                    double *target=result+i*width;
+                    for(size_t j=0;j<count;++j) {
+                        const int r=right_parents[j].channel;
+                        const double value=.5*(integrals ? integrals[p*k+r] : eri(p,q,r,s));
+                        if(value==0.)continue;
+                        const double *channel=transformed.data()+j*width;
+                        for(size_t v=0;v<width;++v)target[v]+=value*channel[v];
+                    }
                 }
             }
         }
     }
     void nminus1_middle(const double *t,size_t cols,double *u) {
-        workers_.run(topology_->one->blocks.size(),[&](size_t b,size_t worker) {
-            const auto &block=topology_->one->blocks[b];
-            auto read=[&](const RemovalLinks::Block &source) {return t+source.offset*cols;};
-            nminus1_destination(block.config,block.family,block,cols,read,u+block.offset*cols,temporary_[worker]);
-        },8);
+        const auto &links=*topology_->one;
+        workers_.run(links.blocks.size(),[&](size_t b,size_t worker) {
+            const auto &block=links.blocks[b];
+            auto read=[&](const RemovalLinks::Block &source) {return t+links.offset(source)*cols;};
+            double *out=u+links.offset(block)*cols;
+            if(cols==1)nminus1_destination<1>(block.config,block.family,block,cols,read,out,temporary_[worker]);
+            else nminus1_destination<0>(block.config,block.family,block,cols,read,out,temporary_[worker]);
+        },32);
     }
     void nminus1_stream(const double *input,size_t cols,double *output,Stats &stats) {
         auto start=Clock::now();
@@ -249,15 +363,41 @@ class Auxiliary {
                 return forward.data();
             };
             destination.resize((block.end-block.begin)*block.dim*cols);
-            nminus1_destination(block.config,block.family,block,cols,read,destination.data(),transformed);
+            nminus1_destination<0>(block.config,block.family,block,cols,read,destination.data(),transformed);
             block_adjoint(*topology_->one,block,cols,destination.data(),output);
         }
         stats["streaming_ns"]+=ns(start);
+    }
+    template<size_t Width>
+    void pair_contract(const RemovalLinks::Block &block,size_t width,const double *t,double *target) const {
+        if constexpr(Width)width=Width;
+        const size_t count=block.end-block.begin;
+        const auto *parents=topology_->two->parents.data()+block.begin;
+        const auto *table=topology_->pair_integrals.data();
+        for(size_t a=0;a<count;++a) {
+            const size_t ap=parents[a].channel;
+            const double *row=table+topology_->pair_rows[ap];
+            for(size_t c=0;c<count;++c) {
+                const double value=row[topology_->pair_columns[parents[c].channel]];
+                if(value==0.)continue;
+                for(size_t i=0;i<width;++i)target[a*width+i]+=value*t[c*width+i];
+            }
+        }
     }
     void pair_middle(const RemovalLinks::Block &block,size_t width,const double *t,
                      double *target,size_t worker) {
         const size_t count=block.end-block.begin;
         std::fill_n(target,count*width,0.);
+        if(!topology_->pair_integrals.empty()) {
+            switch(width) {
+                case 1: return pair_contract<1>(block,width,t,target);
+                case 2: return pair_contract<2>(block,width,t,target);
+                case 3: return pair_contract<3>(block,width,t,target);
+                case 5: return pair_contract<5>(block,width,t,target);
+                case 9: return pair_contract<9>(block,width,t,target);
+                default: return pair_contract<0>(block,width,t,target);
+            }
+        }
         if(topology_->feature_count) {
             auto &projected=projected_[worker];
             projected.assign(topology_->feature_count*width,0.);
@@ -280,10 +420,9 @@ class Auxiliary {
         }
         for(size_t a=0;a<count;++a) {
             size_t ap=topology_->two->parents[block.begin+a].channel;
-            const double *row=topology_->pair_integrals.empty() ? nullptr : topology_->pair_integrals.data()+topology_->pair_rows[ap];
             for(size_t c=0;c<count;++c) {
                 size_t cp=topology_->two->parents[block.begin+c].channel;
-                double value=row ? row[topology_->pair_columns[cp]] : pair_value(ap,cp,integrals_);
+                double value=pair_value(ap,cp,integrals_);
                 if(value==0.)continue;
                 for(size_t i=0;i<width;++i)target[a*width+i]+=value*t[c*width+i];
             }
@@ -296,11 +435,14 @@ class Auxiliary {
             auto &t=temporary_[worker];
             if(t.size()<block_size)t.resize(block_size);
             forward_block(*topology_->two,block,input,cols,t.data());
-            pair_middle(block,width,t.data(),u+block.offset*cols,worker);
+            pair_middle(block,width,t.data(),u+topology_->two->offset(block)*cols,worker);
         },4);
     }
+    template<size_t Columns=0>
     void block_adjoint(const RemovalLinks &links,const RemovalLinks::Block &block,
                        size_t cols,const double *mixed,double *output) {
+        if constexpr(Columns)cols=Columns;
+        const unsigned weight=links.families[block.family].weight;
         for(size_t j=block.begin;j<block.end;++j) {
             const auto &parent=links.parents[j];
             const auto &g=p_.groups[parent.group];
@@ -310,52 +452,83 @@ class Auxiliary {
                 double *target=output+g.block->offset*cols;
                 for(size_t a=0;a<c.rows;++a)for(size_t j=c.ptr[a];j<c.ptr[a+1];++j) {
                     double *row=target+c.indices[j]*cols;
-                    const double value=parent.weight*c.data[j];
+                    const double value=weight*c.data[j];
                     for(size_t v=0;v<cols;++v)row[v]+=value*source[a*cols+v];
                 }
                 continue;
             }
             for(size_t i=0;i<g.size();++i)for(size_t a=0;a<c.rows;++a) {
-                double value=parent.weight*c.at(a,g.rank(i));
+                double value=weight*c.at(a,g.rank(i));
                 if(value==0.)continue;
                 for(size_t v=0;v<cols;++v)output[g.row(i)*cols+v]+=value*source[a*cols+v];
             }
         }
     }
+    bool apply_single_pair(const RemovalLinks &links,const RemovalLinks::Block &block,
+                           const double *input,double *output) const {
+        const auto &parent=links.parents[block.begin];
+        const auto &group=p_.groups[parent.group];
+        if(!group.canonical_full())return false;
+        const auto &matrix=topology_->bank.matrices[parent.matrix];
+        const auto channel=parent.channel;
+        const double scale=topology_->pair_integrals[topology_->pair_rows[channel]+topology_->pair_columns[channel]];
+        if(scale==0.)return true;
+        const unsigned weight=links.families[block.family].weight;
+        const double *x=input+group.block->offset;
+        double *y=output+group.block->offset;
+        for(size_t row=0;row<matrix.rows;++row) {
+            const size_t begin=matrix.ptr[row],end=matrix.ptr[row+1];
+            double projected=0.;
+            for(size_t j=begin;j<end;++j)projected+=matrix.data[j]*x[matrix.indices[j]];
+            const double mixed=scale*projected;
+            for(size_t j=begin;j<end;++j)y[matrix.indices[j]]+=(weight*matrix.data[j])*mixed;
+        }
+        return true;
+    }
+    template<size_t Columns>
     void apply_private(const double *input,size_t cols,double *output,Stats &stats,bool serial) {
+        if constexpr(Columns)cols=Columns;
         const size_t workers=serial ? 1 : workers_.count(), output_size=p_.size()*cols;
         const bool reduce=workers>1;
         auto start=Clock::now();
         std::unique_ptr<double[]> partial(reduce ? new double[workers*output_size] : nullptr);
+        std::atomic<size_t> next_one{0},next_two{0};
         auto run_worker=[&](size_t worker) {
             double *local=reduce ? partial.get()+worker*output_size : output;
             if(reduce)std::fill_n(local,output_size,0.);
             auto &t=temporary_[worker],&u=mixed_[worker];
-            auto process=[&](const RemovalLinks &links,bool pair) {
-                constexpr size_t chunk=16;
-                for(size_t first=worker*chunk;first<links.blocks.size();first+=workers*chunk) {
+            auto process=[&](const RemovalLinks &links,bool pair,std::atomic<size_t> &next) {
+                // Claim contiguous chunks so faster workers can take more
+                // blocks while keeping the schedule reads sequential.
+                constexpr size_t chunk=128;
+                auto claim=[&] {return next.fetch_add(chunk,std::memory_order_relaxed);};
+                for(size_t first=reduce ? claim() : 0;first<links.blocks.size();
+                    first=reduce ? claim() : first+chunk) {
                     for(size_t b=first;b<std::min(first+chunk,links.blocks.size());++b) {
                         const auto &block=links.blocks[b];
                         size_t width=block.dim*cols,count=block.end-block.begin;
+                        if constexpr(Columns==1)
+                            if(pair && count==1 && !topology_->pair_integrals.empty() &&
+                                apply_single_pair(links,block,input,local))continue;
                         if(t.size()<count*width)t.resize(count*width);
                         if(u.size()<count*width)u.resize(count*width);
-                        forward_block(links,block,input,cols,t.data());
+                        forward_block<Columns>(links,block,input,cols,t.data());
                         if(pair)pair_middle(block,width,t.data(),u.data(),worker);
                         else {
                             std::fill_n(u.data(),count*width,0.);
                             for(size_t a=0;a<count;++a)for(size_t r=0;r<count;++r) {
-                                int p=links.parents[block.begin+a].channel%p_.k;
-                                int q=links.parents[block.begin+r].channel%p_.k;
+                                int p=links.parents[block.begin+a].channel;
+                                int q=links.parents[block.begin+r].channel;
                                 double value=h_[p*p_.k+q];
                                 for(size_t i=0;i<width;++i)u[a*width+i]+=value*t[r*width+i];
                             }
                         }
-                        block_adjoint(links,block,cols,u.data(),local);
+                        block_adjoint<Columns>(links,block,cols,u.data(),local);
                     }
                 }
             };
-            process(*topology_->one,false);
-            process(*topology_->two,true);
+            process(*topology_->one,false,next_one);
+            process(*topology_->two,true,next_two);
         };
         if(serial)run_worker(0);else workers_.each_worker(run_worker);
         stats["private_block_ns"]+=ns(start);
@@ -386,7 +559,7 @@ public:
         const size_t added=p.groups.size()-before;
         // Deltas reduce enumeration for small appends. A fresh build also
         // avoids reserving space for two schedules when the suffix is large.
-        const bool incremental=before && p.k<=32 && added<=before/2;
+        const bool incremental=before && p.k<=64 && added<=before/2;
         auto construct=[&](bool use_delta) {
             topology_=std::make_shared<Topology>(p,coefficients);
             if(use_delta)topology_->bank=previous->topology_->bank;
@@ -406,19 +579,47 @@ public:
             topology_->build_bytes=topology_->metadata_bytes+topology_->one->compact_builder_bytes;
             topology_->one_configs=topology_->one->residue_count;
             if(mode_==0) {
-                topology_->auxiliary_queries=std::make_unique<Residues>(topology_->one->residues->configs.size(),p_.k,1,metadata-topology_->metadata_bytes,
-                    [&](size_t a)->const Config &{return topology_->one->residues->configs[a];});
-                topology_->metadata_bytes+=topology_->auxiliary_queries->bytes();
-                topology_->build_bytes=topology_->metadata_bytes;
-                std::set<int> sectors;for(auto f:topology_->one->families)sectors.insert(f.spin);
-                size_t allowance=(coefficients-topology_->bank.bytes())/std::max(size_t(1),sectors.size());
-                for(int s:sectors)topology_->one_banks.emplace(s,std::make_unique<OneBank>(std::max(0,p_.n-1),s,allowance));
-                for(auto f:topology_->one->families)topology_->family_banks.push_back(topology_->one_banks.at(f.spin).get());
                 std::vector<Residues::Record>().swap(topology_->one->residues->records);
                 std::vector<size_t>().swap(topology_->one->residues->ptr);
-                std::vector<size_t>().swap(topology_->one->residues->reverse_ptr);
-                std::vector<Residues::Query>().swap(topology_->one->residues->queries);
-                topology_->metadata_bytes=topology_->one->bytes()+topology_->auxiliary_queries->bytes();
+                if(topology_->one->families.size()==1 && topology_->one->blocks.size()==topology_->one_configs)
+                    std::vector<size_t>().swap(topology_->one->block_ids);
+                topology_->metadata_bytes=topology_->one->bytes();
+                const auto &configs=topology_->one->residues->configs;
+                topology_->auxiliary_queries=std::make_unique<RemovalQueries>(configs,p_.k,metadata-topology_->metadata_bytes);
+                topology_->build_bytes=std::max(topology_->build_bytes,
+                    topology_->metadata_bytes+topology_->auxiliary_queries->build_bytes);
+                topology_->metadata_bytes+=topology_->auxiliary_queries->bytes();
+                std::set<int> sectors;for(auto f:topology_->one->families)sectors.insert(f.spin);
+                size_t allowance=(coefficients-topology_->bank.bytes())/std::max(size_t(1),sectors.size());
+                // Removing one electron can open one shell. Keep room for
+                // the doubly occupied transfer site in same-open-shell moves.
+                const int template_electrons=std::min(p_.n-1,p_.maximum_selected_open()+3);
+                for(int s:sectors)
+                    topology_->one_banks.emplace(s,std::make_unique<OneBank>(template_electrons,s,allowance));
+                for(auto f:topology_->one->families)topology_->family_banks.push_back(topology_->one_banks.at(f.spin).get());
+                if(p_.k<=64 && configs.size()<=(metadata-topology_->metadata_bytes)/sizeof(Occupation::Limb)) {
+                    auto &masks=topology_->auxiliary_masks;
+                    masks.reserve(configs.size());
+                    for(const auto &cfg:configs)masks.push_back(Occupation(cfg).first);
+                    topology_->metadata_bytes+=masks.capacity()*sizeof(masks[0]);
+                }
+                if(integrals_.format==ERIFormat::dense && p_.k) {
+                    const size_t k=p_.k,kk=k*k;
+                    if(kk<=std::min(pair_limit,metadata-topology_->metadata_bytes)/sizeof(double)/kk) {
+                        auto &table=topology_->auxiliary_integrals;
+                        table.resize(kk*kk);
+                        workers_.run(kk,[&](size_t qs,size_t) {
+                            const size_t q=qs/k,s=qs%k;
+                            for(size_t p=0;p<k;++p)for(size_t r=0;r<k;++r)
+                                table[qs*kk+p*k+r]=integrals_.data[((p*k+q)*k+r)*k+s];
+                        },8);
+                        topology_->metadata_bytes+=table.capacity()*sizeof(double);
+                    }
+                }
+                const size_t eri_bytes=topology_->auxiliary_integrals.capacity()*sizeof(double);
+                if(pair_limit>eri_bytes)
+                    prepare_local_integrals(std::min(pair_limit-eri_bytes,metadata-topology_->metadata_bytes));
+                topology_->build_bytes=std::max(topology_->build_bytes,topology_->metadata_bytes);
             } else {
                 topology_->one->residues.reset();
                 topology_->metadata_bytes=topology_->one->bytes();
@@ -481,7 +682,7 @@ public:
             const bool pair=links==topology_->two.get();
             const size_t capacity=bytes/sizeof(double)/(pair ? 1 : 2);
             auto after=[&](size_t b) {
-                return b==links->blocks.size() ? links->entries : links->blocks[b].offset;
+                return b==links->blocks.size() ? links->entries : links->offset(links->blocks[b]);
             };
             for(size_t first=0;first<links->blocks.size();) {
                 const size_t base=after(first);
@@ -492,7 +693,8 @@ public:
                 std::unique_ptr<double[]> t(pair ? nullptr : new double[entries]);
                 workers_.run(last-first,[&](size_t b,size_t worker) {
                     const auto &block=links->blocks[first+b];
-                    double *target=u.get()+(block.offset-base);
+                    const size_t offset=links->offset(block)-base;
+                    double *target=u.get()+offset;
                     const size_t n=block.end-block.begin;
                     if(pair) {
                         auto &forward=temporary_[worker];
@@ -500,12 +702,12 @@ public:
                         forward_block(*links,block,input,1,forward.data());
                         pair_middle(block,block.dim,forward.data(),target,worker);
                     } else {
-                        double *forward=t.get()+(block.offset-base);
+                        double *forward=t.get()+offset;
                         forward_block(*links,block,input,1,forward);
                         std::fill_n(target,n*block.dim,0.);
                         for(size_t i=0;i<n;++i)for(size_t j=0;j<n;++j) {
-                            const int p=links->parents[block.begin+i].channel%p_.k;
-                            const int r=links->parents[block.begin+j].channel%p_.k;
+                            const int p=links->parents[block.begin+i].channel;
+                            const int r=links->parents[block.begin+j].channel;
                             const double scale=h_[p*p_.k+r];
                             for(size_t k=0;k<block.dim;++k)target[i*block.dim+k]+=scale*forward[j*block.dim+k];
                         }
@@ -525,7 +727,10 @@ public:
     }
     void apply(const double *input,size_t cols,double *output,Stats &stats,bool serial=false) {
         if(serial && mode_==0)nminus1_stream(input,cols,output,stats);
-        else if(private_output_ || serial)apply_private(input,cols,output,stats,serial);
+        else if(private_output_ || serial) {
+            if(cols==1)apply_private<1>(input,cols,output,stats,serial);
+            else apply_private<0>(input,cols,output,stats,serial);
+        }
         else apply_gather(input,cols,output,stats);
         size_t scratch=0;
         for(auto *bank:{&temporary_,&mixed_,&projected_})for(auto &a:*bank)scratch+=a.capacity()*8;
@@ -536,7 +741,7 @@ public:
         std::unique_ptr<double[]> t(new double[topology_->one->entries*cols]),u(new double[topology_->one->entries*cols]);
         workers_.run(topology_->one->blocks.size(),[&](size_t b,size_t) {
             const auto &block=topology_->one->blocks[b];
-            forward_block(*topology_->one,block,input,cols,t.get()+block.offset*cols);
+            forward_block(*topology_->one,block,input,cols,t.get()+topology_->one->offset(block)*cols);
         },16);
         stats["forward_ns"]+=ns(start);start=Clock::now();
         if(mode_==0)nminus1_middle(t.get(),cols,u.get());else one_body_middle(t.get(),cols,u.get());
@@ -559,6 +764,11 @@ public:
             {"pair_factor_bytes",topology_->pair_features.capacity()*8},{"pair_factor_columns",topology_->feature_count},
             {"private_residue_output",private_output_}};
         for(auto &entry:topology_->one_banks)s["coefficient_bytes"]+=entry.second->bytes();
+        if(mode_==0) {
+            s["auxiliary_integral_bytes"]=topology_->auxiliary_integrals.capacity()*sizeof(double);
+            s["auxiliary_local_integral_bytes"]=topology_->local_integrals.capacity()*sizeof(double)+
+                topology_->local_offsets.capacity()*sizeof(size_t);
+        }
         if(topology_->two) {
             s["two_auxiliary_configurations"]=topology_->two_configs;s["two_auxiliary_blocks"]=topology_->two->blocks.size();
             s["two_parent_channels"]=topology_->two->parents.size();s["two_weighted_links"]=topology_->two->weighted_links;s["two_intermediate_entries"]=topology_->two->entries;

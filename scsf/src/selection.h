@@ -52,6 +52,8 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
         auto &stats=counts[worker];
         const auto &ket=*p.groups[id].cfg;
         const auto &block=basis.blocks()[id];
+        // A complete source has no missing ranks at transfer distance zero.
+        const auto [occupied,doubled]=block.key.first;
         std::vector<std::pair<double,Path>> parents;
         parents.reserve(block.size());
         for (size_t i=0;i<block.size();++i) {
@@ -63,8 +65,11 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
         Connection terms;
         auto visit=[&](const std::array<int,2> &holes,const std::array<int,2> &particles,int order) {
             ++stats.visits;
+            if(order==0 && block.complete())return;
             if (bounds && !(ordered && order==2)) {
-                const double bound=bounds->selection_bound(ket,holes,particles,order,p.k);
+                const double bound=order==1 && p.k<=64
+                    ? bounds->single_bound(ket,particles[0],holes[0],p.k,occupied,doubled)
+                    : bounds->selection_bound(ket,holes,particles,order,p.k);
                 if (screened(bound,maximum,eps,p.k)) {++stats.screened;return;}
             }
             Occupation key=block.key;

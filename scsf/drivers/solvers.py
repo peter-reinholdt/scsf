@@ -190,6 +190,19 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
             raise ValueError('hvp must return a finite real block with the input shape')
         return result
 
+    @timed('ritz_ns')
+    def project_basis(vectors, images):
+        return vectors.T @ images
+
+    @timed('ritz_ns')
+    def expand_projection(projected, vectors, images, additions, addition_images):
+        # The previous basis columns and images are unchanged on an append.
+        # Calculate both cross blocks before symmetrizing the Ritz matrix.
+        return np.block([
+            [projected, vectors.T @ addition_images],
+            [additions.T @ images, additions.T @ addition_images],
+        ])
+
     def jd_correction(v, shift, residual):
         def project(x):
             return x-v*np.dot(v, x)
@@ -248,10 +261,10 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
     if nseed:
         V = np.column_stack((V, supplement(V, nseed)))
     AV = apply(V)
+    projected = project_basis(V, AV)
     for iteration in range(maxiter):
         ritz_start = perf_counter_ns() if stats is not None else 0
         if stats is not None: stats['iterations'] = iteration + 1
-        projected = V.T @ AV
         values, rotations = np.linalg.eigh((projected+projected.T)/2)
         nkeep, found_reference = roots, reference_state is None
         if reference_state is not None:
@@ -298,10 +311,12 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
             corrections = orthogonalize(corrections, V)
             if stats is not None:
                 stats['restart_ns'] += perf_counter_ns() - restart_start - (stats['orthogonalization_ns'] - orthogonal_before)
+            projected = project_basis(V, AV)
         corrections = corrections[:, :max_subspace-V.shape[1]]
         if not corrections.shape[1]:
             return finish(L, X, False)
         correction_images = apply(corrections)
+        projected = expand_projection(projected, V, AV, corrections, correction_images)
         V = np.column_stack((V, corrections))
         AV = np.column_stack((AV, correction_images))
     return finish(L, X, False)

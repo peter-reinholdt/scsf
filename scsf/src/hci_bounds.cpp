@@ -17,6 +17,7 @@ void HCITransferBounds::prepare_transfer_bounds(int k) {
     std::call_once(bound_once_,[&] {
         constexpr size_t max_entries = 1000000;
         if (k < 2) return;
+        if (k<=64) prepare_single_bounds(k);
         size_t count = 1;
         for (int i = 0; i < 4; ++i) {
             if (count > max_entries/static_cast<size_t>(k)) return;

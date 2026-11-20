@@ -28,13 +28,13 @@ class GroupedUGA {
     };
     struct Slot {Occupations key; unsigned first=0,count=0;};
     struct Parent {unsigned group,orbital;};
-    struct Group {Occupations occ;size_t first;bool complete;};
+    struct Group {Occupations occ;size_t first;unsigned count;bool complete;};
     struct Plan {
         double constant=0.;
         size_t singles_end=0;
         std::vector<Word> words;
     };
-    struct Probe {Occupations key;size_t bucket,index;};
+    struct Probe {Occupations key;Word hash;size_t index;};
     struct Scratch {
         Plan plan;
         std::vector<double> forward,backward;
@@ -53,10 +53,11 @@ class GroupedUGA {
     std::vector<double> one_,eri_;
     std::vector<Group> groups_;
     std::vector<Slot> slots_;
+    std::vector<unsigned char> fingerprints_;
     std::vector<Parent> parents_;
-    std::vector<std::unique_ptr<Plan>> cache_;
+    std::vector<std::shared_ptr<const Plan>> cache_;
     std::vector<Scratch> scratch_;
-    size_t fixed_bytes_=0,cache_limit_=0,complete_=0;
+    size_t fixed_bytes_=0,cache_limit_=0,complete_=0,reused_plans_=0;
     std::atomic<size_t> cache_bytes_{0},cached_plans_{0};
 
     static Word bit(unsigned i) {return Word(1)<<i;}
@@ -78,6 +79,25 @@ class GroupedUGA {
     }
     static size_t slot_index(const std::vector<Slot> &table,const Occupations &key) {
         return probe_slot(table,key,hash(key)&(table.size()-1));
+    }
+    static unsigned char fingerprint(Word value) {
+        return 1+(value>>57);
+    }
+    size_t find_slot(const Occupations &key,Word value) const {
+        const size_t mask=slots_.size()-1;
+        size_t i=value&mask;
+        if(fingerprints_.empty()) {
+            i=probe_slot(slots_,key,i);
+            return slots_[i].count ? i : none;
+        }
+        // Most generator probes miss. Scan compact control bytes and load
+        // the full occupation only after a fingerprint match.
+        const auto tag=fingerprint(value);
+        while(fingerprints_[i]) {
+            if(fingerprints_[i]==tag && slots_[i].key==key)return i;
+            i=(i+1)&mask;
+        }
+        return none;
     }
     template<class F>void removals(F visit) {
         for(unsigned g=0;g<groups_.size();++g) {
@@ -106,10 +126,8 @@ class GroupedUGA {
         std::memcpy(&value,&word,sizeof(value));
         return value;
     }
-    size_t first(unsigned group) const {
-        return group==groups_.size() ? primary_.size() : groups_[group].first;
-    }
-    size_t count(unsigned group) const {return first(group+1)-first(group);}
+    size_t first(unsigned group) const {return groups_[group].first;}
+    size_t count(unsigned group) const {return groups_[group].count;}
     unsigned rank(unsigned group,size_t local) const {
         if(groups_[group].complete)return local;
         return primary_.groups[group].rank(local);
@@ -192,12 +210,15 @@ class GroupedUGA {
                     if(q==r)continue;
                     auto key=mid;
                     key.remove(bit(q));
-                    probes.push_back({key,hash(key)&(slots_.size()-1),probes.size()});
+                    probes.push_back({key,hash(key),probes.size()});
                 }
             });
-            std::sort(probes.begin(),probes.end(),[](const Probe &a,const Probe &b) {return a.bucket<b.bucket;});
+            const size_t mask=slots_.size()-1;
+            std::sort(probes.begin(),probes.end(),[mask](const Probe &a,const Probe &b) {
+                return (a.hash&mask)<(b.hash&mask);
+            });
             resolved.resize(probes.size());
-            for(const auto &p:probes)resolved[p.index]=probe_slot(slots_,p.key,p.bucket);
+            for(const auto &p:probes)resolved[p.index]=find_slot(p.key,p.hash);
             scratch.swept+=probes.size();
         }
         size_t probe=0;
@@ -209,9 +230,13 @@ class GroupedUGA {
                     unsigned q=pop(qs);
                     auto residue=intermediate;
                     residue.remove(bit(q));
-                    const auto &range=q==r ? *removed[s] :
-                        slots_[probes.empty() ? slot_index(slots_,residue) : resolved[probe++]];
-                    for(unsigned i=range.first;i<range.first+range.count;++i) {
+                    const Slot *range=removed[s];
+                    if(q!=r) {
+                        const auto id=probes.empty() ? find_slot(residue,hash(residue)) : resolved[probe++];
+                        if(id==none)continue;
+                        range=&slots_[id];
+                    }
+                    for(unsigned i=range->first;i<range->first+range->count;++i) {
                         auto [target,p]=parents_[i];
                         unsigned pq=q*k_+p;
                         if(target<g || p==q || pq>rs_pair || integral(rs_pair,pq)==0.)continue;
@@ -228,14 +253,17 @@ class GroupedUGA {
         });
     }
 
+    static size_t plan_bytes(const Plan &plan) {
+        return sizeof(Plan)+2*sizeof(void *)+plan.words.size()*sizeof(Word);
+    }
     void retain(unsigned g,const Plan &plan) {
         if(cache_.empty())return;
-        const size_t bytes=sizeof(Plan)+plan.words.size()*sizeof(Word);
+        const size_t bytes=plan_bytes(plan);
         auto used=cache_bytes_.load(std::memory_order_relaxed);
         while(bytes<=cache_limit_-used) {
             if(cache_bytes_.compare_exchange_weak(used,used+bytes,std::memory_order_relaxed)) {
                 try {
-                    cache_[g]=std::make_unique<Plan>(plan);
+                    cache_[g]=std::make_shared<const Plan>(plan);
                 } catch (...) {
                     cache_bytes_.fetch_sub(bytes,std::memory_order_relaxed);
                     throw;
@@ -357,7 +385,8 @@ public:
         groups_.reserve(p.groups.size());
         for(const auto &g:p.groups) {
             const auto &block=*g.block;
-            groups_.push_back({{block.key.first[0],block.key.first[1]},block.offset,block.complete()});
+            groups_.push_back({{block.key.first[0],block.key.first[1]},block.offset,
+                static_cast<unsigned>(block.size()),block.complete()});
             complete_+=block.complete();
         }
         const bool dense_table=integrals.format==ERIFormat::dense;
@@ -395,6 +424,13 @@ public:
                 parents_[--entry.first]={group,orbital};
             });
             fixed_bytes_+=parents_.capacity()*sizeof(Parent);
+            if(slots_.size()<=metadata-fixed_bytes_) {
+                fingerprints_.resize(slots_.size());
+                workers_.run(slots_.size(),[&](size_t i,size_t) {
+                    if(slots_[i].count)fingerprints_[i]=fingerprint(hash(slots_[i].key));
+                },512);
+                fixed_bytes_+=fingerprints_.capacity();
+            }
         }
         if(plan_limit && groups_.size() && groups_.size()<=(metadata-fixed_bytes_)/sizeof(cache_[0])) {
             cache_.resize(groups_.size());
@@ -425,6 +461,39 @@ public:
         }
     }
 
+    void reuse_plans(const GroupedUGA &old) {
+        const size_t prefix=old.groups_.size();
+        if(cache_.empty() || old.cache_.empty() || prefix>groups_.size() ||
+            cih_template_electrons(primary_)!=cih_template_electrons(old.primary_))return;
+        const size_t added=groups_.size()-prefix;
+        // Allow a larger append when the mask scan is still small enough to
+        // compete with rebuilding plans.
+        if(added>1024 || (added>256 && prefix>(size_t(1)<<27)/added))return;
+        for(size_t g=0;g<prefix;++g)if(!(groups_[g].occ==old.groups_[g].occ))return;
+        // Plans identify partner occupations by index and spin factors by
+        // template ID. With an unchanged prefix, only new partners within
+        // two transfers can invalidate a retained source plan.
+        workers_.run(prefix,[&](size_t g,size_t) {
+            const auto &plan=old.cache_[g];
+            if(!plan)return;
+            const auto src=groups_[g].occ;
+            for(size_t j=prefix;j<groups_.size();++j) {
+                const auto dst=groups_[j].occ;
+                if(__builtin_popcountll(src.occupied^dst.occupied)+
+                    __builtin_popcountll(src.doubled^dst.doubled)<=4)return;
+            }
+            cache_[g]=plan;
+        },64);
+        size_t used=0;
+        for(auto &plan:cache_)if(plan) {
+            const size_t bytes=plan_bytes(*plan);
+            if(bytes>cache_limit_-used)plan.reset();
+            else {used+=bytes;++reused_plans_;}
+        }
+        cache_bytes_.store(used,std::memory_order_relaxed);
+        cached_plans_.store(reused_plans_,std::memory_order_relaxed);
+    }
+
     void diagonal(size_t group,const double *h,const double *coulomb,const double *exchange,double *result) const {
         cih_diagonal(primary_.groups[group],bank_,h,coulomb,exchange,k_,result);
     }
@@ -434,7 +503,8 @@ public:
         return {{"metadata_bytes",fixed_bytes_+cached},{"coefficient_bytes",bank_.bytes()},
             {"grouped_uga",1},{"slot_sweep",slot_sweep_},{"grouped_dense_eri_bytes",eri_.capacity()*sizeof(double)},{"complete_configurations",complete_},{"residue_links",parents_.size()},
             {"plan_cache_bytes",cached},{"plan_cache_limit",cache_limit_},
-            {"cached_plans",cached_plans_.load(std::memory_order_relaxed)},{"workspace_entries_per_rhs",entries()}};
+            {"cached_plans",cached_plans_.load(std::memory_order_relaxed)},{"reused_plans",reused_plans_},
+            {"workspace_entries_per_rhs",entries()}};
     }
     void apply(const double *x,size_t cols,double *y,Stats &stats,bool serial=false) {
         if(groups_.empty())return;

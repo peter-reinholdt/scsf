@@ -161,6 +161,22 @@ def test_bounded_cache(kernel):
                 assert bool(op.product_info['retained_string_connections']) == bool(cap)
 
 
+def test_grouped_cih_reuses_only_plans_unaffected_by_appended_occupations():
+    one = np.zeros((6, 6))
+    one[0, 3] = one[3, 0] = .5
+    ham = scsf.Hamiltonian(0., one, np.zeros((6,)*4))
+    w = wavefunction(6, 6, 0, ['222000', '000222', 'ud2002'])
+    op = scsf.csf_structured_op(ham, w, strategy='cih', nthreads=2)
+    op.matvec([1., 0., 0.])
+    _, stats = op.select_hci([1., 0., 0.], .1, selection_unit='configuration')
+    assert stats['added'] == 1
+    assert op.product_info['reused_plans'] == 1
+    labels = tuple(op.labels())
+    ref = hamiltonian_block(ham, labels, labels, 0)
+    np.testing.assert_allclose(op.matmat(np.eye(len(labels))), ref, atol=1e-12)
+    assert op.last_product_stats['plans_built'] == len(labels)-1
+
+
 def test_wide_grouped_cih():
     k = 66
     active = [0, 3, 63, 65]

@@ -111,6 +111,41 @@ double transfer_bound(const Config &ket, const std::array<int, 2> &holes,
     return bound.finish(k);
 }
 
+void HCITransferBounds::prepare_single_bounds(int k) {
+    const size_t orbitals=k;
+    std::vector<double> bounds(orbitals*orbitals*(orbitals+1));
+    for(int p=0;p<k;++p) for(int q=0;q<k;++q) if(p!=q) {
+        double *row=bounds.data()+(size_t(p)*k+q)*(k+1);
+        row[k]=2*std::abs(one_.data()[size_t(p)*k+q]);
+        for(int t=0;t<k;++t) {
+            NormBound bound;
+            spatial_coefficients(std::min(q,t),std::max(q,t),std::min(p,t),std::max(p,t),
+                two_.data(),k,[&](int i,int j,int a,int b,double value) {
+                    bound.add(value,i==j || a==b ? 2 : 4);
+                });
+            row[t]=bound.finish(k);
+        }
+    }
+    single_bounds_.swap(bounds);
+}
+
+double HCITransferBounds::single_bound(const Config &source,int p,int q,int k,
+                                       std::uint64_t occupied,std::uint64_t doubled) const {
+    if(single_bounds_.empty())return selection_bound(source,{q,0},{p,0},1,k);
+    const double *row=single_bounds_.data()+(size_t(p)*k+q)*(k+1);
+    occupied&=~((~doubled)&(std::uint64_t(1)<<q));
+    double result=row[k];
+    while(occupied) {
+        result+=row[__builtin_ctzll(occupied)];
+        occupied&=occupied-1;
+    }
+    // The table entries already round outward. Inflate the sum for at most
+    // k double additions. A zero sum consists entirely of exact zeros.
+    if(result==0.)return 0.;
+    return std::nextafter(result*(1+4*(k+1)*std::numeric_limits<double>::epsilon()),
+                          std::numeric_limits<double>::infinity());
+}
+
 namespace {
 template<bool Ranked,bool DiagonalERI=false,class ERI>
 void fill_guga_connection(const PairDescriptor &pair,const double *h,ERI v,

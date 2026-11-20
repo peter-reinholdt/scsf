@@ -81,15 +81,17 @@ using Stats = std::map<std::string, size_t>;
 class HCITransferBounds {
     Array one_, two_;
     const size_t ordered_cap_;
-    std::vector<double> transfer_bounds_;
+    std::vector<double> transfer_bounds_,single_bounds_;
     std::once_flag bound_once_, ordered_once_;
     std::vector<BoundedTransfer> ordered_transfers_;
     std::vector<size_t> ordered_offsets_;
+    void prepare_single_bounds(int k);
 public:
     HCITransferBounds(const Array &one, const Array &two, size_t ordered_cap);
     void prepare_transfer_bounds(int k);
     double selection_bound(const Config &source, const std::array<int,2> &holes,
                            const std::array<int,2> &particles, int order, int k) const;
+    double single_bound(const Config &source,int p,int q,int k,std::uint64_t occupied,std::uint64_t doubled) const;
     bool prepare_ordered_transfers(int k);
     std::pair<const BoundedTransfer *, const BoundedTransfer *> ordered_transfers(int q, int s, int k) const;
 };

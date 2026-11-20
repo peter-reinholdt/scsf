@@ -7,6 +7,7 @@
 #include <chrono>
 #include <set>
 #include <mutex>
+#include <unordered_map>
 
 namespace scsf { namespace structured {
 using Clock=std::chrono::steady_clock;
@@ -74,6 +75,11 @@ struct Primary {
         }
     }
     size_t size() const {return native->size();}
+    int maximum_selected_open() const {
+        int open=s;
+        for(const auto &group:groups)open=std::max(open,group.block->open);
+        return open;
+    }
     std::string label(size_t group,size_t local) const {
         const auto &g=groups[group];
         return native->spin(g.block->open).label(*g.cfg,g.rank(local));
@@ -88,34 +94,49 @@ struct Primary {
 class RemovalBank {
     int spin_;
     size_t maximum_,bytes_=0;
-    std::map<std::string,unsigned> directory_;
+    // Spin/projection, canonical occupation length, and (position, occupation
+    // and spin) for each annihilator. All unlisted sites are singly occupied.
+    using Key=std::array<int,7>;
+    struct Hash {
+        size_t operator()(const Key &key) const {
+            size_t result=0;
+            for(int value:key)result=result*1000003+unsigned(value);
+            return result;
+        }
+    };
+    std::unordered_map<Key,unsigned,Hash> directory_;
 public:
     std::vector<Matrix> matrices;
+    std::vector<unsigned> weights;
     RemovalBank(const Primary &primary,size_t maximum):spin_(primary.s),maximum_(maximum){}
-    unsigned get(const Config &ket,std::initializer_list<Operator> operators,int sb,int mb) {
-        // Removal links supply one or two valid, ordered annihilation operators.
-        // Build the canonical key on hits; expand the spin matrix inputs on misses.
-        std::array<Operator,2> mapped;
-        std::copy(operators.begin(),operators.end(),mapped.begin());
-        const size_t count=operators.size();
-        std::string occupations;
-        for(size_t p=0;p<ket.size();++p) {
-            bool keep=ket[p]==1;
-            for(size_t i=0;i<count;++i)if(operators.begin()[i].orbital==int(p)) {
-                mapped[i].orbital=occupations.size();
-                keep=true;
+    unsigned get(const Primary::Group &group,std::initializer_list<Operator> operators,int sb,int mb) {
+        const auto &ket=*group.cfg;
+        const int first=operators.begin()->orbital,last=(operators.end()-1)->orbital;
+        const auto &occupation=group.block->key;
+        auto position=[&](int orbital) {
+            int rank=0;
+            for(int base=0;base<=orbital/64;++base) {
+                const auto &limb=base ? occupation.high[base-1] : occupation.first;
+                auto open=limb[0]^limb[1];
+                for(int site:{first,last})if(site/64==base)open|=std::uint64_t(1)<<(site%64);
+                if(base==orbital/64)open&=(std::uint64_t(1)<<(orbital%64))-1;
+                rank+=__builtin_popcountll(open);
             }
-            if(keep)occupations+=char(ket[p]);
+            return rank;
+        };
+        const int length=group.block->open+(ket[first]==2)+(last!=first && ket[last]==2);
+        Key key{sb,mb,length,position(first),2*ket[first]+operators.begin()->spin,-1,0};
+        if(operators.size()==2) {
+            key[5]=first==last ? key[3] : position(last);
+            key[6]=2*ket[last]+(operators.end()-1)->spin;
         }
-        std::string key;
-        key.reserve((3+2*count)*sizeof(int)+occupations.size());
-        auto integer=[&](int v) { key.append(reinterpret_cast<const char *>(&v),sizeof(v)); };
-        integer(sb);integer(mb);integer(count);
-        for(size_t i=0;i<count;++i) {integer(mapped[i].orbital);integer(mapped[i].spin);}
-        key+=occupations;
         auto found=directory_.find(key);if(found!=directory_.end())return found->second;
-        Config small(occupations.begin(),occupations.end());
-        std::vector<Operator> ops(mapped.begin(),mapped.begin()+count);
+        Config small(length,1);
+        std::vector<Operator> ops;
+        for(size_t j=3;j<key.size() && key[j]>=0;j+=2) {
+            small[key[j]]=key[j+1]/2;
+            ops.push_back({key[j],key[j+1]%2,false});
+        }
         Config target=small;for(auto &op:ops)--target[op.orbital];
         int ma=std::count(target.begin(),target.end(),1),mk=std::count(small.begin(),small.end(),1);
         SpinPaths rows(ma,sb,maximum_/8),cols(mk,spin_,maximum_/8);
@@ -124,9 +145,11 @@ public:
         for(size_t a=0;a<matrix.rows;++a)for(size_t b=0;b<matrix.cols;++b)
             matrix.at(a,b)=cg_operator(spin_label(target,rows.paths[a]),sb,mb,
                 spin_label(small,cols.paths[b]),spin_,spin_,ops);
-        matrix.sparse();size_t add=matrix.bytes()+key.size()+64;
+        matrix.sparse();size_t add=matrix.bytes()+sizeof(Key)+sizeof(unsigned)+64;
         if(add>maximum_-bytes_)throw BudgetError("removal matrices exceed coefficient budget");
-        bytes_+=add;unsigned id=schedule_index(matrices.size());matrices.push_back(std::move(matrix));directory_.emplace(std::move(key),id);return id;
+        bytes_+=add;unsigned id=schedule_index(matrices.size());matrices.push_back(std::move(matrix));
+        weights.push_back(spin_==0 ? sb+1 : 1);
+        directory_.emplace(std::move(key),id);return id;
     }
     size_t bytes() const{return bytes_;}
 };
@@ -136,9 +159,6 @@ struct Residues {
     std::vector<Record> records;
     std::vector<size_t> ptr;
     std::vector<Config> configs;
-    std::vector<size_t> reverse_ptr;
-    struct Query {unsigned residue;int orbital;};
-    std::vector<Query> queries;
     template<class Getter>Residues(size_t count,int k,int remove,size_t maximum,Getter source) {
         size_t forecast=0;
         for(size_t g=0;g<count;++g) {
@@ -165,39 +185,33 @@ struct Residues {
             configs.push_back(unpack(records[i].key,k));
         }
         if(!records.empty())ptr.push_back(records.size());
-        if(remove==1) {
-            reverse_ptr.assign(count+1,0);for(auto &r:records)++reverse_ptr[r.parent+1];
-            std::partial_sum(reverse_ptr.begin(),reverse_ptr.end(),reverse_ptr.begin());queries.resize(records.size());auto cursor=reverse_ptr;
-            for(size_t a=0;a<configs.size();++a)for(size_t r=ptr[a];r<ptr[a+1];++r)
-                queries[cursor[records[r].parent]++]={schedule_index(a),records[r].p};
-        }
         if(bytes()>maximum)throw BudgetError("residue metadata exceeds metadata budget");
     }
     size_t bytes() const {
-        size_t b=records.capacity()*sizeof(Record)+ptr.capacity()*sizeof(size_t)+reverse_ptr.capacity()*sizeof(size_t)+queries.capacity()*sizeof(Query)+configs.capacity()*sizeof(Config);
+        size_t b=records.capacity()*sizeof(Record)+ptr.capacity()*sizeof(size_t)+configs.capacity()*sizeof(Config);
         for(auto &c:configs)b+=c.capacity()*sizeof(int);
         for(auto &r:records)b+=r.key.capacity()+1;
         return b;
     }
 };
 
-// Up to 32 spatial sites fit in one pair of 32-bit masks. Use these
-// records only during streamed N-2 construction. Wide occupations keep the
-// existing string-key builder.
+// Single-limb occupations sort directly, without string keys or decoded
+// residue configurations. Preserve the narrower records below 33 orbitals.
 struct CompactRemovalResidues {
-    struct Record {std::uint64_t key;unsigned parent;std::uint16_t p,q;};
-    std::vector<Record> records;
+    using Key=Occupation::Limb;
+    template<class Word>struct Record {std::array<Word,2> key;unsigned parent;std::uint8_t p,q;};
+    std::vector<Record<std::uint32_t>> narrow;
+    std::vector<Record<std::uint64_t>> wide;
     std::vector<size_t> ptr;
-    std::vector<int> open;
 
-    CompactRemovalResidues(const Primary &primary,int rank,size_t maximum,size_t begin) {
+    template<class Word,class Getter>
+    void build(std::vector<Record<Word>> &records,size_t groups,int rank,size_t maximum,size_t begin,Getter key_at) {
         size_t count=0;
-        for(size_t id=begin;id<primary.groups.size();++id) {
-            const auto &block=primary.native->blocks()[id];
-            const auto o=block.key.first[0],d=block.key.first[1];
+        for(size_t id=begin;id<groups;++id) {
+            const auto [o,d]=key_at(id);
             const size_t occupied=__builtin_popcountll(o);
             const size_t add=rank==1 ? occupied : occupied*(occupied-1)/2+__builtin_popcountll(d);
-            if(add>maximum/sizeof(Record)-count)throw BudgetError("compact removal records exceed metadata budget");
+            if(add>maximum/sizeof(Record<Word>)-count)throw BudgetError("compact removal records exceed metadata budget");
             count+=add;
         }
         records.reserve(count);
@@ -205,82 +219,140 @@ struct CompactRemovalResidues {
             o^=bit&~d;
             d&=~bit;
         };
-        for(size_t id=begin;id<primary.groups.size();++id) {
-            const auto &key=primary.native->blocks()[id].key.first;
+        for(size_t id=begin;id<groups;++id) {
+            const auto key=key_at(id);
             const auto parent=schedule_index(id);
             auto holes=key[0];
             while(holes) {
-                const auto p=std::uint16_t(__builtin_ctzll(holes));
+                const auto p=std::uint8_t(__builtin_ctzll(holes));
                 const auto bit=std::uint64_t(1)<<p;
                 auto o=key[0],d=key[1];
                 remove(o,d,bit);
-                if(rank==1)records.push_back({o|(d<<32),parent,p,0});
+                if(rank==1)records.push_back({{Word(o),Word(d)},parent,p,0});
                 else {
                     auto seconds=o&~(bit-1);
                     while(seconds) {
-                        const auto q=std::uint16_t(__builtin_ctzll(seconds));
+                        const auto q=std::uint8_t(__builtin_ctzll(seconds));
                         const auto second=std::uint64_t(1)<<q;
                         auto oo=o,dd=d;
                         remove(oo,dd,second);
-                        records.push_back({oo|(dd<<32),parent,p,q});
+                        records.push_back({{Word(oo),Word(dd)},parent,p,q});
                         seconds&=seconds-1;
                     }
                 }
                 holes&=holes-1;
             }
         }
-        std::sort(records.begin(),records.end(),[](const Record &a,const Record &b) {
+        std::sort(records.begin(),records.end(),[](const auto &a,const auto &b) {
             return std::tie(a.key,a.parent,a.p,a.q)<std::tie(b.key,b.parent,b.p,b.q);
         });
         size_t residues=0;
         for(size_t i=0;i<records.size();++i)residues+=!i || records[i-1].key!=records[i].key;
-        if(sizeof(size_t)>maximum-count*sizeof(Record) ||
-            residues>(maximum-count*sizeof(Record)-sizeof(size_t))/(sizeof(size_t)+sizeof(int)))
+        if(sizeof(size_t)>maximum-count*sizeof(Record<Word>) ||
+            residues>(maximum-count*sizeof(Record<Word>)-sizeof(size_t))/sizeof(size_t))
             throw BudgetError("compact residue offsets exceed metadata budget");
         ptr.reserve(residues+1);
-        open.reserve(residues);
-        for(size_t i=0;i<records.size();++i)if(!i || records[i-1].key!=records[i].key) {
-            auto key=records[i].key;
-            ptr.push_back(i);
-            open.push_back(__builtin_popcount(std::uint32_t(key)^std::uint32_t(key>>32)));
-        }
+        for(size_t i=0;i<records.size();++i)
+            if(!i || records[i-1].key!=records[i].key)ptr.push_back(i);
         ptr.push_back(records.size());
     }
+    template<class Getter>
+    CompactRemovalResidues(size_t groups,int k,int rank,size_t maximum,size_t begin,Getter key_at) {
+        if(k<=32)build(narrow,groups,rank,maximum,begin,key_at);
+        else build(wide,groups,rank,maximum,begin,key_at);
+    }
+    Record<std::uint64_t> at(size_t i) const {
+        if(narrow.empty())return wide[i];
+        const auto &r=narrow[i];
+        return {{r.key[0],r.key[1]},r.parent,r.p,r.q};
+    }
     size_t bytes() const {
-        return records.capacity()*sizeof(Record)+ptr.capacity()*sizeof(size_t)+open.capacity()*sizeof(int);
+        return narrow.capacity()*sizeof(narrow[0])+wide.capacity()*sizeof(wide[0])+ptr.capacity()*sizeof(size_t);
+    }
+};
+
+// Bidirectional N-1 neighbor queries through common N-2 occupations.
+struct RemovalQueries {
+    struct Posting {unsigned config;int orbital;};
+    std::vector<size_t> ptr,reverse_ptr;
+    std::vector<Posting> parents,queries;
+    size_t build_bytes=0;
+
+    RemovalQueries(const std::vector<Config> &configs,int k,size_t maximum) {
+        auto compile=[&](auto &index,auto record) {
+            const size_t count=index.ptr.back();
+            const size_t offsets=2*(configs.size()+1)*sizeof(size_t);
+            if(offsets>maximum-index.bytes() || count>(maximum-index.bytes()-offsets)/(2*sizeof(Posting)))
+                throw BudgetError("auxiliary queries exceed metadata budget");
+            build_bytes=index.bytes()+offsets+2*count*sizeof(Posting);
+            ptr=std::move(index.ptr);
+            reverse_ptr.assign(configs.size()+1,0);
+            parents.resize(count);
+            queries.resize(count);
+            for(size_t i=0;i<count;++i) {
+                const auto [parent,orbital]=record(i);
+                parents[i]={parent,orbital};
+                ++reverse_ptr[parent+1];
+            }
+            std::partial_sum(reverse_ptr.begin(),reverse_ptr.end(),reverse_ptr.begin());
+            auto cursor=reverse_ptr;
+            for(size_t a=0;a+1<ptr.size();++a)
+                for(size_t i=ptr[a];i<ptr[a+1];++i)
+                    queries[cursor[parents[i].config]++]={schedule_index(a),parents[i].orbital};
+        };
+        if(k<=64) {
+            CompactRemovalResidues index(configs.size(),k,1,maximum,0,
+                [&](size_t i) {return Occupation(configs[i]).first;});
+            compile(index,[&](size_t i) {const auto r=index.at(i);return Posting{r.parent,r.p};});
+        } else {
+            Residues index(configs.size(),k,1,maximum,[&](size_t i)->const Config &{return configs[i];});
+            compile(index,[&](size_t i) {const auto &r=index.records[i];return Posting{r.parent,r.p};});
+        }
+    }
+    size_t bytes() const {
+        return (ptr.capacity()+reverse_ptr.capacity())*sizeof(size_t)+(parents.capacity()+queries.capacity())*sizeof(Posting);
     }
 };
 
 struct RemovalLinks {
     struct Family {int spin,m;int weight=1;};
-    struct Parent {unsigned group,matrix,channel,weight;};
-    struct Block {unsigned config,family;size_t begin,end,dim,offset;};
+    struct Parent {unsigned group,matrix,channel;};
+    struct Block {unsigned config,family;size_t begin,end,dim;};
     std::unique_ptr<Residues> residues;
     std::vector<Family> families;
     std::vector<Block> blocks;
     std::vector<Parent> parents;
     std::vector<size_t> block_ids,reverse_ptr,offsets;
     std::vector<unsigned> reverse;
-    std::vector<std::uint64_t> keys;
+    std::vector<CompactRemovalResidues::Key> keys;
     size_t entries=0,weighted_links=0,residue_count=0,compact_builder_bytes=0;
     RemovalLinks(const Primary &primary,RemovalBank &bank,int rank,size_t maximum,
                  bool keep_block_ids,bool keep_reverse,size_t begin=0) {
         std::unique_ptr<CompactRemovalResidues> compact;
-        if(primary.k<=32 && !keep_block_ids) {
-            compact=std::make_unique<CompactRemovalResidues>(primary,rank,maximum,begin);
-            residue_count=compact->open.size();
+        if(primary.k<=64 && !keep_block_ids) {
+            compact=std::make_unique<CompactRemovalResidues>(primary.groups.size(),primary.k,rank,maximum,begin,
+                [&](size_t i) {return primary.native->blocks()[i].key.first;});
+            residue_count=compact->ptr.size()-1;
             compact_builder_bytes=compact->bytes();
             if(residue_count>(maximum-compact_builder_bytes)/sizeof(keys[0]))
                 throw BudgetError("incremental residue keys exceed metadata budget");
             keys.reserve(residue_count);
             for(size_t index=0;index<residue_count;++index)
-                keys.push_back(compact->records[compact->ptr[index]].key);
+                keys.push_back(compact->at(compact->ptr[index]).key);
         } else {
             residues=std::make_unique<Residues>(primary.groups.size(),primary.k,rank,maximum,
                 [&](size_t g)->const Config &{return *primary.groups[g].cfg;});
             residue_count=residues->configs.size();
         }
         const auto &ptr=compact ? compact->ptr : residues->ptr;
+        auto removal=[&](size_t i)->std::tuple<unsigned,int,int> {
+            if(compact) {
+                const auto r=compact->at(i);
+                return {r.parent,r.p,r.q};
+            }
+            const auto &r=residues->records[i];
+            return {r.parent,r.p,r.q};
+        };
         if(rank==1) {
             for(int sigma=0;sigma<2;++sigma)for(int spin:{primary.s-1,primary.s+1}) {
                 int m=primary.s-(sigma==0 ? 1 : -1);
@@ -295,7 +367,8 @@ struct RemovalLinks {
         if(keep_block_ids)block_ids.assign(residue_count*families.size(),none);
         std::map<std::pair<int,int>,size_t> dimensions;
         for(size_t a=0;a<residue_count;++a) {
-            int singles=compact ? compact->open[a] : std::count(residues->configs[a].begin(),residues->configs[a].end(),1);
+            int singles=compact ? __builtin_popcountll(keys[a][0]^keys[a][1])
+                : std::count(residues->configs[a].begin(),residues->configs[a].end(),1);
             for(size_t f=0;f<families.size();++f) {
                 auto family=families[f];
                 auto [dimension,inserted]=dimensions.try_emplace({singles,family.spin},0);
@@ -304,15 +377,13 @@ struct RemovalLinks {
                 if(!dim)continue;
                 size_t first=parents.size();
                 for(size_t j=ptr[a];j<ptr[a+1];++j) {
-                    const unsigned parent=compact ? compact->records[j].parent : residues->records[j].parent;
-                    const int p=compact ? compact->records[j].p : residues->records[j].p;
-                    const int q=compact ? compact->records[j].q : residues->records[j].q;
+                    const auto [parent,p,q]=removal(j);
                     const auto &g=primary.groups[parent];
                     auto add=[&](std::initializer_list<Operator> ops,size_t channel) {
                         int projection=primary.s;
                         for(auto &op:ops)projection-=op.spin==0 ? 1 : -1;
                         if(projection!=family.m)return;
-                        unsigned matrix=bank.get(*g.cfg,ops,family.spin,family.m);
+                        unsigned matrix=bank.get(g,ops,family.spin,family.m);
                         const auto &c=bank.matrices[matrix];
                         bool used=false;
                         if(g.canonical_full() || !keep_block_ids) {
@@ -324,9 +395,9 @@ struct RemovalLinks {
                         }
                         if(!used)return;
                         if(keep_reverse)offsets.push_back(entries+(parents.size()-first)*dim);
-                        parents.push_back({parent,matrix,schedule_index(channel),unsigned(family.weight)});
+                        parents.push_back({parent,matrix,schedule_index(channel)});
                     };
-                    if(rank==1)for(int sigma=0;sigma<2;++sigma)add({{p,sigma,false}},p+sigma*primary.k);
+                    if(rank==1)for(int sigma=0;sigma<2;++sigma)add({{p,sigma,false}},p);
                     else if(primary.s==0) {
                         // The singlet spin rotation sign cancels fermionic
                         // reordering, so D(p alpha,q beta) = D(q alpha,p beta).
@@ -342,7 +413,7 @@ struct RemovalLinks {
                 }
                 if(parents.size()==first)continue;
                 if(keep_block_ids)block_ids[a*families.size()+f]=blocks.size();
-                blocks.push_back({schedule_index(a),schedule_index(f),first,parents.size(),dim,entries});
+                blocks.push_back({schedule_index(a),schedule_index(f),first,parents.size(),dim});
                 if(dim && (parents.size()-first)>(no_row-entries)/dim)
                     throw BudgetError("removal amplitude size overflow");
                 entries+=(parents.size()-first)*dim;
@@ -390,7 +461,7 @@ struct RemovalLinks {
                 append(old,a,old_pairs!=nullptr);
                 append(delta,b,false);
                 if(first==parents.size())continue;
-                blocks.push_back({schedule_index(id),schedule_index(f),first,parents.size(),dim,entries});
+                blocks.push_back({schedule_index(id),schedule_index(f),first,parents.size(),dim});
                 if((parents.size()-first)>(no_row-entries)/dim)
                     throw BudgetError("removal amplitude size overflow");
                 entries+=(parents.size()-first)*dim;
@@ -399,14 +470,19 @@ struct RemovalLinks {
         weighted_links=checked_add(old.weighted_links,delta.weighted_links);
         if(keep_reverse) {
             offsets.resize(parents.size());
-            for(const auto &block:blocks)for(size_t j=block.begin;j<block.end;++j)
-                offsets[j]=block.offset+(j-block.begin)*block.dim;
+            size_t base=0;
+            for(const auto &block:blocks)for(size_t j=block.begin;j<block.end;++j) {
+                offsets[j]=base;
+                base+=block.dim;
+            }
             build_reverse(group_count);
         }
         if(bytes()>maximum-retained)throw BudgetError("incremental removal schedule exceeds metadata budget");
         compact_builder_bytes=retained;
     }
 
+    // The forward array begins at the offset of the block's first parent.
+    size_t offset(const Block &block) const {return offsets[block.begin];}
     void build_reverse(size_t group_count) {
             reverse_ptr.assign(group_count+1,0);
             for(auto &p:parents)++reverse_ptr[p.group+1];
@@ -415,7 +491,7 @@ struct RemovalLinks {
             auto cursor=reverse_ptr;
             for(size_t p=0;p<parents.size();++p)reverse[cursor[parents[p].group]++]=schedule_index(p);
     }
-    size_t bytes() const {
+        size_t bytes() const {
         return keys.capacity()*sizeof(keys[0])+(residues ? residues->bytes() : 0)+families.capacity()*sizeof(Family)+blocks.capacity()*sizeof(Block)
             +parents.capacity()*sizeof(Parent)+(block_ids.capacity()+reverse_ptr.capacity()+offsets.capacity())*sizeof(size_t)
             +reverse.capacity()*sizeof(unsigned);

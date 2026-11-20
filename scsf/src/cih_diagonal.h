@@ -6,9 +6,7 @@
 namespace scsf::structured {
 
 inline int cih_template_electrons(const Primary &p) {
-    int open=p.s;
-    for(const auto &group:p.groups)open=std::max(open,group.block->open);
-    return std::min(p.n,open+4);
+    return std::min(p.n,p.maximum_selected_open()+4);
 }
 
 inline void cih_diagonal(const Primary::Group &group,const OneBank &bank,

@@ -31,7 +31,7 @@ class StructuredHamiltonian {
     structured::SpatialERI integrals_{};
     std::vector<double> diagonal_;
     bool diagonal_ready_=false;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
 public:
     StructuredHamiltonian(const Array &one,const Array &two,std::optional<Array> core,std::shared_ptr<const Basis> basis,int mode,size_t threads,
         size_t metadata,size_t coefficients,size_t work,size_t pair_limit,std::vector<int> cpus,bool private_output,
@@ -67,17 +67,23 @@ public:
             throw std::invalid_argument("invalid structured integral dimensions");
         integrals_={two.data(),core_ ? core_->data() : nullptr,size_t(k),rank,format};
         auto start=structured::Clock::now();pybind11::gil_scoped_release release;
+        if(previous && (previous->kernel_!=kernel_ || previous->one_.data()!=one_.data() ||
+                previous->two_.data()!=two_.data() || previous->core_.has_value()!=core_.has_value() ||
+                (core_ && previous->core_->data()!=core_->data()) || previous->primary_.s!=primary_.s ||
+                previous->primary_.n!=primary_.n))previous=nullptr;
         if(kernel_==Kernel::nminus2 || kernel_==Kernel::nminus1)auxiliary_=std::make_unique<structured::Auxiliary>(primary_,one.data(),integrals_,
             kernel_==Kernel::nminus2 ? 1 : 0,workers_,metadata,coefficients,pair_limit,private_output,
-            previous && previous->kernel_==kernel_ && previous->one_.data()==one_.data() &&
-                previous->two_.data()==two_.data() && previous->core_.has_value()==core_.has_value() &&
-                (!core_ || previous->core_->data()==core_->data()) ? previous->auxiliary_.get() : nullptr);
+            previous ? previous->auxiliary_.get() : nullptr);
         else {
             if(kernel_==Kernel::cih)try {
-                if(k<=64 && primary_.n<=structured::OneBank::mask_electron_limit)
+                if(k<=64 && primary_.n<=structured::OneBank::mask_electron_limit) {
                     grouped_=std::make_unique<structured::GroupedUGA>(primary_,one.data(),integrals_,workers_,
                         metadata,coefficients,cache_limit,slot_sweep);
-                else
+                    if(previous && previous->grouped_) {
+                        std::lock_guard<std::mutex> lock(previous->mutex_);
+                        grouped_->reuse_plans(*previous->grouped_);
+                    }
+                } else
                     wide_cih_=std::make_unique<structured::WideCIH>(primary_,one.data(),integrals_,workers_,metadata,coefficients);
             } catch(const BudgetError &) {
                 // Fall back to the exact row product if templates exceed their budgets.
