@@ -3,15 +3,15 @@
 #include "structured_internal.h"
 #include "structured_eri.h"
 
-namespace scsf::v2 {
+namespace scsf::structured {
 
-inline int cih_template_electrons(const structured::Primary &p) {
+inline int cih_template_electrons(const Primary &p) {
     int open=p.s;
     for(const auto &group:p.groups)open=std::max(open,group.block->open);
     return std::min(p.n,open+4);
 }
 
-inline void cih_diagonal(const structured::Primary::Group &group,const structured::OneBank &bank,
+inline void cih_diagonal(const Primary::Group &group,const OneBank &bank,
         const double *h,const double *coulomb,const double *exchange,int k,double *result) {
     const auto &cfg=*group.cfg;
     double constant=0.;
@@ -31,4 +31,4 @@ inline void cih_diagonal(const structured::Primary::Group &group,const structure
                 result[group.row(i)]+=weight*norms[group.rank(i)];
         }
 }
-} // namespace scsf::v2
+} // namespace scsf::structured

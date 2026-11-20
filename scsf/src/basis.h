@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <numeric>
 
-namespace scsf::v2 {
+namespace scsf {
 
 inline constexpr size_t no_row = std::numeric_limits<size_t>::max();
 
@@ -321,4 +321,4 @@ public:
                 {"wide_mask_bytes",wide},{"spin_rank_bytes",spin_bytes},{"generation",generation_}};
     }
 };
-} // namespace scsf::v2
+} // namespace scsf

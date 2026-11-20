@@ -2,18 +2,18 @@
 #pragma once
 #include "cih_diagonal.h"
 
-namespace scsf::v2 {
+namespace scsf::structured {
 
 class GeneratorPostings {
-    const structured::Primary &primary_;
-    structured::OneBank bank_;
+    const Primary &primary_;
+    OneBank bank_;
     size_t allocated_=0,records_=0;
 
 public:
     struct Channel {size_t source;int create,destroy;};
     std::map<Config,std::vector<Channel>> groups;
 
-    GeneratorPostings(const structured::Primary &p,size_t link_bytes,size_t coefficient_bytes,
+    GeneratorPostings(const Primary &p,size_t link_bytes,size_t coefficient_bytes,
                       const double *active=nullptr)
         :primary_(p),bank_(cih_template_electrons(p),p.s,coefficient_bytes) {
         auto stash=[&](const Config &cfg,Channel c) {
@@ -77,4 +77,4 @@ public:
                 {"posting_bytes",allocated_},{"coefficient_bytes",bank_.bytes()}};
     }
 };
-} // namespace scsf::v2
+} // namespace scsf::structured

@@ -53,18 +53,18 @@ public:
 struct Primary {
     struct Group {
         const Config *cfg;
-        const v2::Block *block;
+        const Block *block;
         size_t size() const {return block->size();}
         size_t row(size_t i) const {return block->offset+i;}
         size_t rank(size_t i) const {return block->rank(i);}
         bool canonical_full() const {return block->complete();}
     };
-    std::shared_ptr<const v2::Basis> native;
+    std::shared_ptr<const Basis> native;
     std::vector<Config> configurations;
     int k,n,s;
     std::vector<Group> groups;
 
-    explicit Primary(std::shared_ptr<const v2::Basis> b)
+    explicit Primary(std::shared_ptr<const Basis> b)
         : native(std::move(b)),k(native->orbitals()),n(native->electrons()),s(native->two_s()) {
         configurations.reserve(native->blocks().size());
         groups.reserve(native->blocks().size());
@@ -343,7 +343,7 @@ struct RemovalLinks {
                 if(parents.size()==first)continue;
                 if(keep_block_ids)block_ids[a*families.size()+f]=blocks.size();
                 blocks.push_back({schedule_index(a),schedule_index(f),first,parents.size(),dim,entries});
-                if(dim && (parents.size()-first)>(v2::no_row-entries)/dim)
+                if(dim && (parents.size()-first)>(no_row-entries)/dim)
                     throw BudgetError("removal amplitude size overflow");
                 entries+=(parents.size()-first)*dim;
             }
@@ -362,9 +362,9 @@ struct RemovalLinks {
                 (maximum-retained-old.bytes())/sizeof(size_t)))
             throw BudgetError("incremental removal merge exceeds metadata budget");
         families=old.families;
-        parents.reserve(v2::checked_add(old.parents.size(),delta.parents.size()));
-        blocks.reserve(v2::checked_add(old.blocks.size(),delta.blocks.size()));
-        keys.reserve(v2::checked_add(old.keys.size(),delta.keys.size()));
+        parents.reserve(checked_add(old.parents.size(),delta.parents.size()));
+        blocks.reserve(checked_add(old.blocks.size(),delta.blocks.size()));
+        keys.reserve(checked_add(old.keys.size(),delta.keys.size()));
         std::set_union(old.keys.begin(),old.keys.end(),delta.keys.begin(),delta.keys.end(),std::back_inserter(keys));
         residue_count=keys.size();
         size_t a=0,b=0;
@@ -391,12 +391,12 @@ struct RemovalLinks {
                 append(delta,b,false);
                 if(first==parents.size())continue;
                 blocks.push_back({schedule_index(id),schedule_index(f),first,parents.size(),dim,entries});
-                if((parents.size()-first)>(v2::no_row-entries)/dim)
+                if((parents.size()-first)>(no_row-entries)/dim)
                     throw BudgetError("removal amplitude size overflow");
                 entries+=(parents.size()-first)*dim;
             }
         }
-        weighted_links=v2::checked_add(old.weighted_links,delta.weighted_links);
+        weighted_links=checked_add(old.weighted_links,delta.weighted_links);
         if(keep_reverse) {
             offsets.resize(parents.size());
             for(const auto &block:blocks)for(size_t j=block.begin;j<block.end;++j)

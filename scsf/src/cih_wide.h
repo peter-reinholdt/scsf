@@ -2,19 +2,18 @@
 #pragma once
 #include "cih_diagonal.h"
 
-namespace scsf::v2 {
+namespace scsf::structured {
 
 class WideCIH {
-    using Matrix=structured::Matrix;
     struct Posting {size_t group;int orbital;};
     struct Scratch {
         std::vector<double> forward,backward;
         size_t groups=0,links=0;
     };
-    const structured::Primary &p_;
-    structured::Workers &workers_;
-    structured::SpatialERI eri_;
-    structured::OneBank bank_;
+    const Primary &p_;
+    Workers &workers_;
+    SpatialERI eri_;
+    OneBank bank_;
     std::vector<double> one_;
     std::map<Config,std::vector<Posting>> skeletons_;
     std::vector<Scratch> scratch_;
@@ -113,8 +112,8 @@ class WideCIH {
     }
 
 public:
-    WideCIH(const structured::Primary &p,const double *h,structured::SpatialERI eri,
-            structured::Workers &workers,size_t metadata,size_t coefficients)
+    WideCIH(const Primary &p,const double *h,SpatialERI eri,
+            Workers &workers,size_t metadata,size_t coefficients)
         : p_(p),workers_(workers),eri_(eri),bank_(cih_template_electrons(p),p.s,coefficients,true),scratch_(workers.count()) {
         const size_t k=p.k;
         if(k && k>metadata/sizeof(double)/k)throw BudgetError("wide CIH one-electron table exceeds metadata budget");
@@ -182,4 +181,4 @@ public:
         }
     }
 };
-} // namespace scsf::v2
+} // namespace scsf::structured

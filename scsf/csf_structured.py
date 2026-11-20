@@ -32,7 +32,7 @@ class csf_structured_op:
         if strategy not in self.kernels:
             raise ValueError('unknown Hamiltonian kernel')
         if cih_slot_sweep and strategy != 'cih':
-            raise ValueError('cih_slot_sweep requires the v2 CIH kernel')
+            raise ValueError('cih_slot_sweep requires the CIH kernel')
         self.cih_slot_sweep = bool(cih_slot_sweep)
         self.incremental_removals = bool(incremental_removals)
         self.max_plan_bytes = _limit(max_plan_bytes if max_plan_bytes is not None else
@@ -181,7 +181,7 @@ class csf_structured_op:
     def native_matmat(self, x):
         return self._matmat(x, canonical=True)
 
-    def select_hci(self, weights, eps, *, selection_unit='csf', screening=True):
+    def select_hci(self, weights, eps, *, selection_unit='csf'):
         """Grow with strict HCI using absolute native-row weights.
 
         Return the old-to-new row map and statistics. An empty map represents
@@ -201,7 +201,7 @@ class csf_structured_op:
                 info = old.info
                 if info['configurations'] != info['complete_configurations']:
                     raise ValueError('configuration selection requires a complete starting space')
-            basis, remap, stats = old.select_hci(weights, eps, complete, screening, self._transfer_bounds)
+            basis, remap, stats = old.select_hci(weights, eps, complete, self._transfer_bounds)
             if basis is not None:
                 start = perf_counter()
                 replacement = self._construct(basis, previous=old)

@@ -351,7 +351,7 @@ class GroupedUGA {
 public:
     GroupedUGA(const Primary &p,const double *h,const SpatialERI &integrals,Workers &w,
                size_t metadata,size_t coefficients,size_t plan_limit=std::numeric_limits<size_t>::max(),bool slot_sweep=false):
-        primary_(p),workers_(w),bank_(v2::cih_template_electrons(p),p.s,coefficients,true),k_(p.k),k2_(k_*k_),
+        primary_(p),workers_(w),bank_(cih_template_electrons(p),p.s,coefficients,true),k_(p.k),k2_(k_*k_),
         orbitals_(k_==64 ? ~Word(0) : bit(k_)-1),integrals_(integrals),slot_sweep_(slot_sweep),scratch_(w.count()) {
         if(p.size()>=no_plan)throw BudgetError("grouped UGA basis exceeds index capacity");
         groups_.reserve(p.groups.size());
@@ -426,7 +426,7 @@ public:
     }
 
     void diagonal(size_t group,const double *h,const double *coulomb,const double *exchange,double *result) const {
-        v2::cih_diagonal(primary_.groups[group],bank_,h,coulomb,exchange,k_,result);
+        cih_diagonal(primary_.groups[group],bank_,h,coulomb,exchange,k_,result);
     }
     size_t entries() const {return workers_.count()>1 ? primary_.size()*workers_.count() : 0;}
     Stats info() const {

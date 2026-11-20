@@ -69,7 +69,6 @@ def build_parser():
                           default='nminus2', help='Hamiltonian kernel (default: nminus2)')
     selection.add_argument('--selection-unit', choices=('csf', 'configuration'), default='csf',
                            help='HCI selection unit (default: csf)')
-    selection.add_argument('--no-screening', action='store_true', help='disable HCI transfer screening')
     selection.add_argument('--max-ordered-bytes', type=int, default=16*1024**2,
                            help='memory ceiling for ordered HCI transfer bounds')
     parser.add_argument('--sci-stats', action='store_true')
@@ -209,8 +208,7 @@ def main(argv=None):
         if args.max_iterations is not None and iteration>args.max_iterations:
             raise RuntimeError('HCI did not stop within max-iterations')
         weights = np.max(np.abs(vectors), axis=1)
-        remap, stats = op.select_hci(weights, args.eps, selection_unit=args.selection_unit,
-                                    screening=not args.no_screening)
+        remap, stats = op.select_hci(weights, args.eps, selection_unit=args.selection_unit)
         if args.sci_stats:
             print(f'selection {stats}')
         added = stats['added']

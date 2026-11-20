@@ -2,16 +2,16 @@
 #pragma once
 #include "generator_postings.h"
 
-namespace scsf::v2 {
+namespace scsf::structured {
 
-inline Stats shared_generator_product(const structured::Primary &p,const double *h,
-        const structured::SpatialERI &eri,const double *x,double *y,
+inline Stats shared_generator_product(const Primary &p,const double *h,
+        const SpatialERI &eri,const double *x,double *y,
         size_t link_bytes,size_t workspace_bytes,size_t coefficient_bytes) {
-    const auto start=structured::Clock::now();
+    const auto start=Clock::now();
     const GeneratorPostings postings(p,link_bytes,coefficient_bytes);
     auto stats=postings.info();
-    stats["setup_ns"]=structured::ns(start);
-    const auto begin_product=structured::Clock::now();
+    stats["setup_ns"]=ns(start);
+    const auto begin_product=Clock::now();
     const size_t k=p.k;
     const size_t capacity=workspace_bytes/sizeof(double);
     if(k*k>capacity)throw BudgetError("normal-ordered one-body table exceeds generator workspace");
@@ -23,7 +23,7 @@ inline Stats shared_generator_product(const structured::Primary &p,const double 
     }
     for(const auto &[cfg,channels]:postings.groups) {
         const size_t count=channels.size(),dim=postings.rows(channels.front());
-        const bool factored=eri.format==structured::ERIFormat::cholesky && eri.rank<count/2;
+        const bool factored=eri.format==ERIFormat::cholesky && eri.rank<count/2;
         size_t stride=checked_add(2*count,factored ? eri.rank : 0);
         if(dim>(capacity-shifted.size())/stride)
             throw BudgetError("one shared intermediate occupation exceeds product workspace");
@@ -48,13 +48,13 @@ inline Stats shared_generator_product(const structured::Primary &p,const double 
             double *projection=mixed+count*dim;
             for(size_t a=0;a<count;++a) {
                 const auto &c=channels[a];
-                const double *v=eri.data+structured::orbital_pair(c.create,c.destroy)*eri.rank;
+                const double *v=eri.data+orbital_pair(c.create,c.destroy)*eri.rank;
                 for(size_t l=0;l<eri.rank;++l)for(size_t i=0;i<dim;++i)
                     projection[l*dim+i]+=v[l]*forward[a*dim+i];
             }
             for(size_t a=0;a<count;++a) {
                 const auto &c=channels[a];
-                const double *v=eri.data+structured::orbital_pair(c.create,c.destroy)*eri.rank;
+                const double *v=eri.data+orbital_pair(c.create,c.destroy)*eri.rank;
                 for(size_t l=0;l<eri.rank;++l)for(size_t i=0;i<dim;++i)
                     mixed[a*dim+i]+=.5*v[l]*projection[l*dim+i];
             }
@@ -68,9 +68,9 @@ inline Stats shared_generator_product(const structured::Primary &p,const double 
         }
         for(size_t a=0;a<count;++a)postings.contract<true>(channels[a],mixed+a*dim,y);
     }
-    stats["product_ns"]=structured::ns(begin_product);
+    stats["product_ns"]=ns(begin_product);
     stats["workspace_bytes"]=(shifted.capacity()+work.capacity())*sizeof(double);
     return stats;
 }
 
-} // namespace scsf::v2
+} // namespace scsf::structured

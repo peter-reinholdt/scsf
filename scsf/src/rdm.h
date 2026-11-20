@@ -2,12 +2,12 @@
 #pragma once
 #include "generator_postings.h"
 
-namespace scsf::v2 {
+namespace scsf::structured {
 
 // T[p,q] = E_pq c. For each intermediate occupation contract its
 // channel block once. The normal-order correction converts E_pq E_rs
 // to the spin-summed a+_p a+_r a_s a_q operator.
-inline Stats occupation_rdms(const structured::Primary &p,const double *x,double *one,double *two,
+inline Stats occupation_rdms(const Primary &p,const double *x,double *one,double *two,
                              size_t link_bytes,size_t workspace_bytes,size_t coefficient_bytes) {
     const size_t k=p.k;
     const GeneratorPostings postings(p,link_bytes,coefficient_bytes,x);
@@ -47,4 +47,4 @@ inline Stats occupation_rdms(const structured::Primary &p,const double *x,double
     stats["workspace_bytes"]=amplitudes.capacity()*sizeof(double);
     return stats;
 }
-} // namespace scsf::v2
+} // namespace scsf::structured

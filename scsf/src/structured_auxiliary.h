@@ -398,7 +398,7 @@ public:
                 auto next=std::make_unique<RemovalLinks>(rank==1 ? *old.one : *old.two,delta,
                     p_.groups.size(),allowance,!private_output_,rank==1 ? nullptr : &old.orbital_pairs,2*p_.k);
                 next->compact_builder_bytes=std::max(next->compact_builder_bytes,
-                    v2::checked_add(delta.bytes(),delta.compact_builder_bytes));
+                    checked_add(delta.bytes(),delta.compact_builder_bytes));
                 return next;
             };
             topology_->one=links(1,metadata);
@@ -460,7 +460,7 @@ public:
                 construct(false);
             }
         } else construct(false);
-        overlap_bytes_=previous ? v2::checked_add(previous->topology_->metadata_bytes,topology_->build_bytes) :
+        overlap_bytes_=previous ? checked_add(previous->topology_->metadata_bytes,topology_->build_bytes) :
             topology_->build_bytes;
     }
     size_t entries() const {

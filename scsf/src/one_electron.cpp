@@ -14,7 +14,7 @@ bool finite(Complex value) {
     return std::isfinite(value.real()) && std::isfinite(value.imag());
 }
 
-void validate(const ComplexArray &one, const std::shared_ptr<const v2::Basis> &basis, size_t workers) {
+void validate(const ComplexArray &one, const std::shared_ptr<const Basis> &basis, size_t workers) {
     if (!basis || one.ndim()!=2 || one.shape(0)!=basis->orbitals() || one.shape(1)!=basis->orbitals())
         throw std::invalid_argument("one-electron operator shape must match the orbital count");
     if (!workers || workers>256)
@@ -23,7 +23,7 @@ void validate(const ComplexArray &one, const std::shared_ptr<const v2::Basis> &b
         if (!finite(one.data()[i])) throw std::invalid_argument("one-electron operator must be finite");
 }
 
-std::vector<size_t> public_indices(const v2::Basis &basis) {
+std::vector<size_t> public_indices(const Basis &basis) {
     const auto &forward=basis.public_rows();
     std::vector<size_t> inverse(forward.size());
     for (size_t i=0;i<forward.size();++i) inverse[forward[i]]=i;
@@ -43,7 +43,7 @@ std::vector<Path> prepare_paths(const structured::Primary &primary) {
 // numbers are used at the vector boundary so a coefficient prefix can be
 // read without padding or scattering between occupation tiles.
 ComplexArray one_electron_product(const ComplexArray &one,
-        std::shared_ptr<const v2::Basis> basis, const ComplexArray &x,
+        std::shared_ptr<const Basis> basis, const ComplexArray &x,
         size_t nthreads) {
     validate(one,basis,nthreads);
     if (x.ndim()!=2 || size_t(x.shape(0))>basis->size())
@@ -87,9 +87,9 @@ ComplexArray one_electron_product(const ComplexArray &one,
                 const auto integral=integrals[p*k+q];
                 if (p==q || source[q]==2 || integral==Complex{}) continue;
                 ++source[q];
-                const size_t id=primary.native->find(v2::Occupation(source));
+                const size_t id=primary.native->find(Occupation(source));
                 --source[q];
-                if (id==v2::no_row) continue;
+                if (id==no_row) continue;
                 const auto &ket=primary.groups[id];
                 for (size_t i=begin;i<end;++i) {
                     const size_t bra_row=bra.row(i), out=public_row(bra_row)*columns;
@@ -107,7 +107,7 @@ ComplexArray one_electron_product(const ComplexArray &one,
     return output;
 }
 
-py::tuple select_one_electron(const ComplexArray &one, std::shared_ptr<const v2::Basis> basis,
+py::tuple select_one_electron(const ComplexArray &one, std::shared_ptr<const Basis> basis,
         const Array &weights, double eps, size_t nthreads) {
     validate(one,basis,nthreads);
     if (weights.ndim()!=1 || size_t(weights.size())!=basis->size() || !std::isfinite(eps) || eps<0)
@@ -151,9 +151,9 @@ py::tuple select_one_electron(const ComplexArray &one, std::shared_ptr<const v2:
                     if (p==q || target[p]==2 || integral==Complex{}) continue;
                     ++target[p];
                     ++census["configuration_pairs"];
-                    const auto key=v2::Occupation(target);
+                    const auto key=Occupation(target);
                     const size_t id=primary.native->find(key);
-                    const auto *block=id==v2::no_row ? nullptr : &primary.native->blocks()[id];
+                    const auto *block=id==no_row ? nullptr : &primary.native->blocks()[id];
                     if (!block || !block->complete()) {
                         auto evaluate=[&](const std::string &label) {
                             if (local.count(label) || (block &&
@@ -172,7 +172,7 @@ py::tuple select_one_electron(const ComplexArray &one, std::shared_ptr<const v2:
                         const bool connected=key.singles()>=12 && guga_connected_paths(target,active_paths,channel,
                             4*1024*1024/count,evaluate,census);
                         if (!connected) {
-                            const v2::SpinRanks ranks(key.singles(),primary.s);
+                            const SpinRanks ranks(key.singles(),primary.s);
                             for (size_t rank=0;rank<ranks.size();++rank) evaluate(ranks.label(target,rank));
                         }
                     }

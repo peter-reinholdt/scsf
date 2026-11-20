@@ -25,7 +25,7 @@ class StructuredHamiltonian {
     std::unique_ptr<structured::Auxiliary> auxiliary_;
     std::unique_ptr<structured::MatrixDirect> direct_;
     std::unique_ptr<structured::GroupedUGA> grouped_;
-    std::unique_ptr<v2::WideCIH> wide_cih_;
+    std::unique_ptr<structured::WideCIH> wide_cih_;
     size_t work_limit_,setup_ns_=0;
     Kernel kernel_;
     structured::SpatialERI integrals_{};
@@ -33,7 +33,7 @@ class StructuredHamiltonian {
     bool diagonal_ready_=false;
     std::mutex mutex_;
 public:
-    StructuredHamiltonian(const Array &one,const Array &two,std::optional<Array> core,std::shared_ptr<const v2::Basis> basis,int mode,size_t threads,
+    StructuredHamiltonian(const Array &one,const Array &two,std::optional<Array> core,std::shared_ptr<const Basis> basis,int mode,size_t threads,
         size_t metadata,size_t coefficients,size_t work,size_t pair_limit,std::vector<int> cpus,bool private_output,
         size_t cache_limit,const StructuredHamiltonian *previous,bool slot_sweep):
         one_(one),two_(two),core_(std::move(core)),primary_([&] {
@@ -78,7 +78,7 @@ public:
                     grouped_=std::make_unique<structured::GroupedUGA>(primary_,one.data(),integrals_,workers_,
                         metadata,coefficients,cache_limit,slot_sweep);
                 else
-                    wide_cih_=std::make_unique<v2::WideCIH>(primary_,one.data(),integrals_,workers_,metadata,coefficients);
+                    wide_cih_=std::make_unique<structured::WideCIH>(primary_,one.data(),integrals_,workers_,metadata,coefficients);
             } catch(const BudgetError &) {
                 // Fall back to the exact row product if templates exceed their budgets.
             }
@@ -104,11 +104,11 @@ public:
         s["primary_rank_bytes"]=primary_.groups.capacity()*sizeof(structured::Primary::Group);
         return s;
     }
-    pybind11::tuple select_hci(const Array &weights,double eps,bool complete,bool screening,
+    pybind11::tuple select_hci(const Array &weights,double eps,bool complete,
             std::shared_ptr<HCITransferBounds> bounds) {
         if(weights.ndim()!=1 || size_t(weights.size())!=primary_.size() || !std::isfinite(eps) || eps<0)
             throw std::invalid_argument("invalid native HCI weights or threshold");
-        std::shared_ptr<v2::Basis> next;
+        std::shared_ptr<Basis> next;
         std::vector<size_t> remap;
         Stats stats;
         {
@@ -117,8 +117,8 @@ public:
             for(size_t i=0;i<primary_.size();++i)
                 if(!std::isfinite(weights.data()[i]) || weights.data()[i]<0.)
                     throw std::invalid_argument("HCI weights must be finite and nonnegative");
-            auto [additions,data]=v2::hci(primary_,workers_,one_.data(),integrals_,weights.data(),eps,
-                complete,screening,bounds.get());
+            auto [additions,data]=hci(primary_,workers_,one_.data(),integrals_,weights.data(),eps,
+                complete,bounds.get());
             stats=std::move(data);
             if(!additions.empty()) {
                 auto start=structured::Clock::now();
@@ -134,13 +134,13 @@ public:
     pybind11::tuple generator_probe(const Array &x,size_t link_bytes,size_t workspace_bytes,
                                   size_t coefficient_bytes) const {
         if(x.ndim()!=1 || size_t(x.size())!=primary_.size())
-            throw std::invalid_argument("shared generator probe needs a v2 native-row vector");
+            throw std::invalid_argument("shared generator probe needs a native-row vector");
         Array y(x.size());
         Stats stats;
         {
             pybind11::gil_scoped_release release;
             std::fill_n(y.mutable_data(),y.size(),0.);
-            stats=v2::shared_generator_product(primary_,one_.data(),integrals_,x.data(),y.mutable_data(),
+            stats=structured::shared_generator_product(primary_,one_.data(),integrals_,x.data(),y.mutable_data(),
                                                link_bytes,workspace_bytes,coefficient_bytes);
         }
         return pybind11::make_tuple(y,stats);
@@ -148,7 +148,7 @@ public:
     pybind11::tuple rdms(const Array &x,size_t output_bytes,size_t link_bytes,
                         size_t workspace_bytes,size_t coefficient_bytes) const {
         if(x.ndim()!=1 || size_t(x.size())!=primary_.size())
-            throw std::invalid_argument("density matrices need a v2 native-row coefficient vector");
+            throw std::invalid_argument("density matrices need a native-row coefficient vector");
         const size_t k=primary_.k,kk=k*k;
         if(k && (kk>output_bytes/sizeof(double) || kk>(output_bytes/sizeof(double)-kk)/kk))
             throw BudgetError("density matrices exceed output budget");
@@ -161,7 +161,7 @@ public:
             pybind11::gil_scoped_release release;
             std::fill_n(one.mutable_data(),one.size(),0.);
             std::fill_n(two.mutable_data(),two.size(),0.);
-            stats=v2::occupation_rdms(primary_,x.data(),one.mutable_data(),two.mutable_data(),
+            stats=structured::occupation_rdms(primary_,x.data(),one.mutable_data(),two.mutable_data(),
                 link_bytes,workspace_bytes,coefficient_bytes);
         }
         return pybind11::make_tuple(one,two,stats);
@@ -236,7 +236,7 @@ public:
             pybind11::gil_scoped_release release;std::lock_guard<std::mutex> lock(mutex_);
             std::fill(result.mutable_data(),result.mutable_data()+n*cols,0.);
             const size_t entries=auxiliary_ ? auxiliary_->entries() : grouped_ ? grouped_->entries() : wide_cih_ ? wide_cih_->entries() : direct_->entries();
-            if(entries>v2::no_row/sizeof(double))throw BudgetError("structured product scratch size overflow");
+            if(entries>no_row/sizeof(double))throw BudgetError("structured product scratch size overflow");
             size_t per_column=entries*sizeof(double);
             const bool over_budget=per_column>work_limit_;
             const bool batched=over_budget && auxiliary_ && auxiliary_->can_batch(work_limit_);
@@ -270,16 +270,16 @@ public:
 }
 void bind_structured(pybind11::module_ &m) {
     namespace py=pybind11;
-    py::class_<v2::Basis,std::shared_ptr<v2::Basis>>(m,"_OccupationBasis")
+    py::class_<Basis,std::shared_ptr<Basis>>(m,"_OccupationBasis")
         .def(py::init([](int k,int n,int s,const std::vector<std::string> &labels) {
             py::gil_scoped_release release;
-            return std::make_shared<v2::Basis>(k,n,s,labels);
+            return std::make_shared<Basis>(k,n,s,labels);
         }))
-        .def("__len__",&v2::Basis::size)
-        .def("public_label",&v2::Basis::public_label)
-        .def("native_label",&v2::Basis::native_label)
-        .def_property_readonly("info",&v2::Basis::info)
-        .def_property_readonly("public_rows",[](const v2::Basis &b) {
+        .def("__len__",&Basis::size)
+        .def("public_label",&Basis::public_label)
+        .def("native_label",&Basis::native_label)
+        .def_property_readonly("info",&Basis::info)
+        .def_property_readonly("public_rows",[](const Basis &b) {
             const auto &rows=b.public_rows();
             if(rows.empty())return py::array_t<size_t>(0);
             py::array_t<size_t> a(rows.size(),rows.data(),py::cast(&b,py::return_value_policy::reference));
@@ -288,7 +288,7 @@ void bind_structured(pybind11::module_ &m) {
         });
     py::class_<StructuredHamiltonian>(m,"_StructuredHamiltonian")
         .def(py::init([](const Array &one,const Array &two,std::optional<Array> core,
-                std::shared_ptr<const v2::Basis> basis,int mode,size_t threads,size_t metadata,size_t coefficients,
+                std::shared_ptr<const Basis> basis,int mode,size_t threads,size_t metadata,size_t coefficients,
                 size_t work,size_t pair_limit,std::vector<int> cpus,bool private_output,size_t cache_limit,const StructuredHamiltonian *previous,bool slot_sweep) {
             if(!basis)throw std::invalid_argument("native occupation basis is required");
             return std::make_unique<StructuredHamiltonian>(one,two,std::move(core),std::move(basis),mode,threads,

@@ -57,8 +57,7 @@ def test_wide_occupations_and_empty_space():
 
 
 @pytest.mark.parametrize('complete', [False, True])
-@pytest.mark.parametrize('screening', [False, True])
-def test_native_growth_strict_hci_and_remap(complete, screening):
+def test_native_growth_strict_hci_and_remap(complete):
     ham = random_hamiltonian(4, seed=197)
     seed = ('2200',) if complete else ('udud', '2200')
     w = wavefunction(4, 4, 0, seed)
@@ -75,8 +74,7 @@ def test_native_growth_strict_hci_and_remap(complete, screening):
     assert found
     op = scsf.csf_structured_op(ham, w, nthreads=2)
     old_diag = op.native_diagonal()
-    remap, stats = op.select_hci(weights, .04, screening=screening,
-                                selection_unit='configuration' if complete else 'csf')
+    remap, stats = op.select_hci(weights, .04, selection_unit='configuration' if complete else 'csf')
     assert stats['added'] == len(found)
     labels = tuple(op.labels())
     assert labels[:len(seed)] == seed

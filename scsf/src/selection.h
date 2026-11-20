@@ -4,7 +4,7 @@
 #include "structured_internal.h"
 #include "structured_eri.h"
 
-namespace scsf::v2 {
+namespace scsf {
 
 inline bool screened(double bound,double weight,double eps,int k) {
     if (bound==0.) return true;
@@ -14,12 +14,12 @@ inline bool screened(double bound,double weight,double eps,int k) {
 }
 
 inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,structured::Workers &workers,
-        const double *h,const structured::SpatialERI &eri,const double *weights,double eps,bool complete,bool screening,
+        const double *h,const structured::SpatialERI &eri,const double *weights,double eps,bool complete,
         HCITransferBounds *bounds) {
     const auto &basis=*p.native;
     const auto start=structured::Clock::now();
-    if (screening && bounds) bounds->prepare_transfer_bounds(p.k);
-    const bool ordered=screening && bounds && bounds->prepare_ordered_transfers(p.k);
+    if (bounds) bounds->prepare_transfer_bounds(p.k);
+    const bool ordered=bounds && bounds->prepare_ordered_transfers(p.k);
     struct Shard {
         std::mutex mutex;
         std::atomic<bool> ready{false};
@@ -63,7 +63,7 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
         Connection terms;
         auto visit=[&](const std::array<int,2> &holes,const std::array<int,2> &particles,int order) {
             ++stats.visits;
-            if (screening && bounds && !(ordered && order==2)) {
+            if (bounds && !(ordered && order==2)) {
                 const double bound=bounds->selection_bound(ket,holes,particles,order,p.k);
                 if (screened(bound,maximum,eps,p.k)) {++stats.screened;return;}
             }
@@ -93,15 +93,13 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
 
             const auto bra=endpoint(ket,holes,particles,order);
             PairDescriptor pair(bra,ket,0,0,holes,particles,order);
-            ranked_connection(pair,h,eri,screening,terms);
+            ranked_connection(pair,h,eri,true,terms);
             if(terms.generators.empty())return;
             // The prepared bound covers the *sum* of all generator paths.
             // Sort the source ranks once so one suffix rejection covers every
             // weaker parent, before any candidate path is unranked.
             auto last=parents.end();
-            if(screening) {
-                while(last!=parents.begin() && screened(terms.term_bound,(last-1)->first,eps,p.k))--last;
-            }
+            while(last!=parents.begin() && screened(terms.term_bound,(last-1)->first,eps,p.k))--last;
             if(last==parents.begin()) {++stats.screened;return;}
             std::vector<size_t> additions;
             for (size_t rank=0;rank<spin->size();++rank) {
@@ -161,4 +159,4 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
     return {std::move(result),std::move(stats)};
 }
 
-} // namespace scsf::v2
+} // namespace scsf
