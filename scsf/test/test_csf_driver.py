@@ -1,71 +1,12 @@
-"""Driver defaults and removal of implicit work-size stopping limits."""
-import scsf
+"""CLI integration for the native kernels and molecular integral input."""
 import numpy as np
 import pytest
-from scsf.drivers import csf_driver
+import scsf
+from scsf import config
+from scsf.drivers import csf_driver, polarizability
 
 
-def test_compiled_reference_driver_remains_switchable(capsys):
-    csf_driver.main(['--integrals','scsf/test/data/lih_sto3g.npz','--coupling-engine','compiled'])
-    assert 'energy=-7.882324378883' in capsys.readouterr().out
-
-
-@pytest.mark.parametrize('full,strategy,product_threads', [
-    (False, 'compact-spin-guga', None), (True, 'compact-adaptive-guga', 1),
-    (False, 'tuga', 2),
-])
-def test_direct_driver_full_and_selected_products(full, strategy, product_threads,
-                                                 capsys, monkeypatch):
-    original = scsf.csf_direct_op
-    operators = []
-    def direct(*args, **kwargs):
-        result = original(*args, **kwargs)
-        operators.append(result)
-        return result
-    def stored(*args, **kwargs):
-        pytest.fail('direct calculation constructed a stored Hamiltonian')
-    monkeypatch.setattr(scsf, 'csf_direct_op', direct)
-    monkeypatch.setattr(scsf, 'csf_op', stored)
-    argv = ['--integrals', 'scsf/test/data/lih_sto3g.npz', '--direct',
-            '--direct-strategy', strategy, '--nthreads', '2', '--nroots', '2']
-    if full:
-        argv.append('--full')
-        argv += ['--max-product-scratch-bytes','0','--product-accumulation','gather',
-                 '--spin-encoder','portable','--compact-spin-kernel','short']
-    if product_threads is not None:
-        argv += ['--product-nthreads', str(product_threads)]
-    csf_driver.main(argv)
-    output = capsys.readouterr().out
-    ground = next(line for line in output.splitlines() if line.startswith('root=0 '))
-    assert float(ground.split('energy=')[1].split()[0]) == pytest.approx(-7.882324378883, abs=1e-11)
-    assert 'root=1 energy=' in output and f'direct {strategy}' in output
-    assert len(operators) == 1
-    op = operators[0]
-    assert op.nthreads == (2 if product_threads is None else product_threads)
-    assert op.shape[0] > 1
-    assert op.matrix_cutoff == 0.
-    assert op.product_tol == 0.
-    assert op.backend.matrix_index == 'zobrist'
-    if full:
-        assert op.max_product_scratch_bytes == 0 and op.product_accumulation == 'gather'
-        assert op.spin_encoder == 'portable' and op.compact_spin_kernel == 'short'
-    if not full:
-        assert 'iteration=1 added=' in output
-
-
-@pytest.mark.parametrize('options,message', [
-    (['--backend', 'reference'], '--direct requires'),
-    (['--coupling-engine', 'compiled'], '--direct requires'),
-    (['--coupling-engine', 'python'], '--direct requires'),
-    (['--product-tol', '-1'], 'product-tol must be'),
-    (['--product-tol', 'nan'], 'product-tol must be'),
-    (['--max-product-scratch-bytes', '-1'], 'max-product-scratch-bytes must be'),
-])
-def test_direct_driver_invalid_options_fail_before_integrals(options, message, capsys):
-    with pytest.raises(SystemExit) as error:
-        csf_driver.main(['--integrals', 'nonexistent.npz', '--direct', *options])
-    assert error.value.code == 2
-    assert message in capsys.readouterr().err
+LIH = 'scsf/test/data/lih_sto3g.npz'
 
 
 @pytest.mark.parametrize('ncore',[0,1])
@@ -88,9 +29,83 @@ def test_diffuse_xyz_integrals_have_exact_real_symmetry(ncore,monkeypatch):
         np.testing.assert_array_equal(g,g.transpose(axes))
     assert ham.nbasis==41-ncore and nelec==10-2*ncore
     label='2'*(nelec//2)+'0'*(ham.nbasis-nelec//2)
-    # Independent RHF energy checks the restored tensor's index convention,
-    # frozen-core contribution, and acceptance by both coupling backends.
-    for backend in (scsf.CSFReferenceBackend(ham),
-                    scsf.CSFSpinBackend(ham,coupling_engine='guga',cache_bytes=0)):
-        energy=backend.block([label],[label],0)[0,0]+ham.ecore
-        assert energy==pytest.approx(seen['mf'].e_tot,abs=2e-11,rel=0)
+    wfn = scsf.csf_wfn(ham.nbasis, nelec, 0)
+    wfn.add_csf(label)
+    op = scsf.csf_structured_op(ham, wfn, strategy='cih')
+    assert op.diagonal()[0] + ham.ecore == pytest.approx(seen['mf'].e_tot, abs=2e-11, rel=0)
+
+
+@pytest.mark.parametrize('kernel', scsf.csf_structured_op.kernels)
+def test_driver_selected(kernel, capsys):
+    csf_driver.main(['--integrals', LIH, '--kernel', kernel, '--nthreads', '2', '--nroots', '2'])
+    output = capsys.readouterr().out
+    ground = next(line for line in output.splitlines() if line.startswith('root=0 '))
+    assert float(ground.split('energy=')[1].split()[0]) == pytest.approx(-7.882324378883, abs=1e-11)
+    assert f'{kernel}, csf HCI' in output and 'root=1 energy=' in output
+    assert 'iteration=1 added=' in output
+
+
+def test_default_nminus2_without_main_work_array(capsys):
+    csf_driver.main(['--integrals', LIH, '--nthreads', '1', '--max-product-scratch-bytes', '0'])
+    assert 'nminus2, csf HCI' in capsys.readouterr().out
+
+
+def test_configuration_hci_driver(capsys):
+    csf_driver.main(['--integrals', LIH, '--kernel', 'cih', '--selection-unit', 'configuration', '--sci-stats'])
+    output = capsys.readouterr().out
+    assert 'cih, configuration HCI' in output and 'ncsf=41' in output
+    assert "selection {'added': 0" in output
+
+
+@pytest.mark.parametrize('flag', [
+    '--max-expansion-nnz', '--direct', '--backend', '--product-engine', '--full',
+    '--frozen-basis', '--expected-products', '--cih-slot-sweep', '--davidson-olsen',
+    '--davidson-trial-vector-tol', '--davidson-trial-vector-decay', '--davidson-trial-vector-source',
+])
+def test_legacy_flags_are_gone(flag):
+    assert flag not in csf_driver.build_parser().format_help()
+
+
+def test_automatic_kernel_is_rejected(capsys):
+    with pytest.raises(SystemExit, match='2'):
+        csf_driver.build_parser().parse_args(['--integrals', LIH, '--kernel', 'auto'])
+    assert "invalid choice: 'auto'" in capsys.readouterr().err
+
+
+def test_cli_defaults_count_physical_cores_within_affinity(tmp_path, monkeypatch):
+    for cpu, siblings in ((1, '1,3'), (3, '1,3'), (7, '7,9')):
+        topology = tmp_path / f'cpu{cpu}' / 'topology'
+        topology.mkdir(parents=True)
+        (topology / 'thread_siblings_list').write_text(siblings + '\n')
+    monkeypatch.setattr(config, '_CPU_SYSFS', tmp_path)
+    monkeypatch.setattr(config.os, 'sched_getaffinity', lambda _: {1, 3, 7}, raising=False)
+    assert csf_driver.build_parser().parse_args(['--integrals', LIH]).nthreads == 2
+    args = polarizability.build_parser().parse_args(['--xyz', 'water.xyz', '--basis', 'sto-3g'])
+    assert args.nthreads == 2
+
+
+@pytest.mark.parametrize('unit, expected', [('csf', {'uudd00'}), ('configuration', {'uudd00', 'udud00'})])
+def test_reference_is_padded_before_initial_space_selection(unit, expected):
+    parser = csf_driver.build_parser()
+    args = parser.parse_args(['--integrals', LIH, '--reference', 'uudd', '--selection-unit', unit])
+    ham, nelec = csf_driver.integrals(args, parser)
+    wfn, _ = csf_driver.initial_space(args, parser, ham, nelec)
+    assert set(wfn) == expected
+
+
+def test_reference_longer_than_active_space_is_rejected(capsys):
+    with pytest.raises(SystemExit, match='2'):
+        csf_driver.main(['--integrals', LIH, '--reference', '2200000'])
+    assert 'invalid --reference' in capsys.readouterr().err
+
+
+def test_compact_snapshot_and_exact_leading_block(tmp_path, capsys):
+    with np.load(LIH) as data:
+        ham = scsf.Hamiltonian(float(data['ecore']), data['one'], data['two'])
+        compact = scsf.PackedHamiltonian.from_dense(ham)
+        snapshot = tmp_path / 'packed.npz'
+        np.savez(snapshot, ecore=ham.ecore, one=ham.one_mo, packed_eri=compact.packed_eri,
+                 nelec=int(data['nelec']))
+    csf_driver.main(['--integrals', str(snapshot), '--kernel', 'nminus2', '--davidson-block-size', '4'])
+    ground = next(line for line in capsys.readouterr().out.splitlines() if line.startswith('root=0 '))
+    assert float(ground.split('energy=')[1].split()[0]) == pytest.approx(-7.882324378883, abs=1e-11)

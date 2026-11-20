@@ -30,10 +30,6 @@ int main() {
         ++calls[worker];assert(ids[worker]==std::this_thread::get_id());
     });
     for (size_t i=0;i<count;++i) assert(calls[i]==1);
-    // Legacy dynamic tasks, used by the CSR products, still run exactly once.
-    std::array<size_t,31> tasks{};
-    team.apply(tasks.size(),[&](size_t task) { ++tasks[task]; });
-    for (auto n:tasks) assert(n==1);
 #ifdef __linux__
     cpu_set_t after;assert(!sched_getaffinity(0,sizeof(after),&after));
     assert(CPU_EQUAL(&original,&after));

@@ -3,47 +3,63 @@
 import numpy as np
 
 def davidson_response(A, b, hdiag, tol=1e-4, maxiter=100, verbose=False, guess=None):
-    if np.allclose(b, 0.0, atol=1e-20):
+    """Galerkin Davidson solve for real or damped complex response."""
+    b = np.asarray(b)
+    if np.allclose(b, 0., atol=1e-20):
         return b
 
-    def matvec(v, A=A):
-        if not np.any(v.imag):
-            Av = A(v.real)
-        else:
-            Av_real = A(v.real)
-            Av_imag = A(v.imag)
-            Av = Av_real + 1j*Av_imag
-        return Av
-    if guess is None:
-        diagonal_guess = b/(hdiag)
-        diagonal_guess /= np.linalg.norm(diagonal_guess)
-        guess = diagonal_guess
-    V = guess.astype(np.complex128).reshape(-1, 1)
-    AV = np.zeros_like(V, dtype=np.complex128)
-    AV[:, 0] = matvec(V[:, 0])
+    def matvec(v):
+        result = A(v.real)
+        if np.any(v.imag):
+            result = result + 1j*A(v.imag)
+        return result
 
-    bred = V.T @ b
+    # The shifted diagonal can have zero entries, including in the projected
+    # direction. Preserve the phase wherever a denominator is nonzero.
+    diagonal = np.asarray(hdiag, dtype=np.complex128).copy()
+    magnitude = np.abs(diagonal)
+    small = (magnitude>0.) & (magnitude<1e-12)
+    diagonal[small] *= 1e-12/magnitude[small]
+    diagonal[magnitude==0.] = 1e-12
+    seed = b/diagonal if guess is None else np.asarray(guess, dtype=np.complex128)
+    if not np.any(seed):
+        seed = b/diagonal
+    V = (seed/np.linalg.norm(seed))[:, None]
+    AV = matvec(V[:, 0])[:, None]
     for i in range(maxiter):
-        Ered = V.T @ AV
-        xred = np.linalg.solve(Ered, bred)
-        x = xred @ V.T
-        residual = b - (xred @ AV.T)
+        dual = V.conj().T
+        reduced = dual@AV
+        rhs = dual@b
+        try:
+            coefficients = np.linalg.solve(reduced, rhs)
+        except np.linalg.LinAlgError:
+            coefficients = np.linalg.lstsq(reduced, rhs, rcond=None)[0]
+        residual = b-AV@coefficients
+        norm = np.linalg.norm(residual)
         if verbose:
-            print(f'Iteration {i+1:3d} residual norm: {np.linalg.norm(residual):6e}')
-        if np.linalg.norm(residual) < tol:
-            return x
-        delta = residual/(hdiag)
-        delta = delta/np.linalg.norm(delta)
-        vnew = delta - V @ (V.T @ delta)
-        vnew = vnew/np.linalg.norm(vnew)
-        V = np.hstack([V, vnew[:, None]])
-        bred = V.T @ b
-        AV = np.hstack([AV, matvec(vnew)[:, None]])
-    raise ValueError('Not converged')
+            print(f'Iteration {i+1:3d} residual norm: {norm:6e}')
+        if norm<tol:
+            return V@coefficients
+        if i+1==maxiter or V.shape[1]==len(b):
+            break
+        correction = residual/diagonal
+        for _ in range(2):
+            correction -= V@(dual@correction)
+        correction_norm = np.linalg.norm(correction)
+        if correction_norm<=1e-12*norm:
+            correction = residual-V@(dual@residual)
+            correction_norm = np.linalg.norm(correction)
+        if correction_norm<=1e-15*norm:
+            break
+        correction /= correction_norm
+        V = np.column_stack((V, correction))
+        AV = np.column_stack((AV, matvec(correction)))
+    raise ValueError('response Davidson did not converge')
+
 
 def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
-             reference_state=None, max_subspace=None, trial_vector_tol=0.0,
-             trial_vector_decay=0.0, trial_vector_source='orthogonal', stats=None):
+             reference_state=None, max_subspace=None, stats=None,
+             preconditioner_block=None, jd_iterations=0):
     """Block Davidson for a real symmetric electronic Hamiltonian.
 
     Optional ``stats`` is filled with nonoverlapping wall timings, product
@@ -53,27 +69,17 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
     ``hvp`` accepts a matrix of trial vectors as columns. Returns electronic
     eigenvalues, column-oriented eigenvectors, and a convergence flag. ``c0``
     may be a vector or a block, including zero-padded guesses after selection.
+    An optional exact principal block replaces the diagonal preconditioner
+    on its selected rows.
+    Positive ``jd_iterations`` uses bounded MINRES corrections in the
+    orthogonal complement of each Ritz vector. The outer residual still
+    uses the supplied exact operator.
     No core-energy constant is added here. ``reference_state`` retains roots
     through the first state with absolute overlap above 0.9, as in the original
     routine; convergence requires finding that state when tracking is requested.
 
-    ``trial_vector_tol`` optionally zeros components smaller than this absolute
-    threshold in each *normalized orthogonal correction*, before reprojecting
-    onto the Davidson basis. At least the largest component is kept. Products
-    are taken on these sparse vectors; the corresponding orthonormal directions
-    and their images are recovered by the same linear transformations using
-    cached basis images. Thus clamping changes the search directions, not the
-    Hamiltonian or convergence criterion. Dependent sparse directions fall back
-    to ordinary corrections. Guesses and returned Ritz vectors are not clamped.
-    Zero (the default) retains the original algorithm. ``hvp`` must be linear;
-    independently validate residuals when using a screened direct operator.
-    A positive ``trial_vector_decay`` tapers the cutoff by
-    ``min(1, residual_norm / initial_max_residual)**trial_vector_decay`` for
-    each root, restoring fuller corrections as convergence improves. Zero
-    keeps the cutoff fixed. The reference scale is reset at each solve.
-    ``trial_vector_source='preconditioned'`` instead clamps before the initial
-    orthogonalization; ``'orthogonal'`` (default) clamps the proposed new trial
-    direction. Both recover consistent images through cached projections.
+    ``hvp`` must be linear. Independently validate residuals when using a
+    screened direct operator.
     """
     from operator import index
     from time import perf_counter_ns
@@ -81,7 +87,7 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
     if stats is not None:
         stats.clear()
         stats.update(product_ns=0, orthogonalization_ns=0, ritz_ns=0, restart_ns=0,
-                     product_calls=0, product_columns=0, iterations=0, restarts=0, call_widths=[])
+                     product_calls=0, product_columns=0, jd_product_calls=0, iterations=0, restarts=0, call_widths=[])
     def timed(name):
         def decorate(function):
             if stats is None:
@@ -110,12 +116,34 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
     if not 1 <= roots <= dim or not np.isfinite(tol) or tol <= 0 or maxiter < 1:
         raise ValueError('require 1 <= roots <= dimension, tol > 0 and maxiter >= 1')
     maxiter = index(maxiter)
-    if not np.isfinite(trial_vector_tol) or not 0 <= trial_vector_tol < 1:
-        raise ValueError('trial_vector_tol must be finite and in [0, 1)')
-    if not np.isfinite(trial_vector_decay) or trial_vector_decay < 0:
-        raise ValueError('trial_vector_decay must be finite and nonnegative')
-    if trial_vector_source not in ('orthogonal', 'preconditioned'):
-        raise ValueError("trial_vector_source must be 'orthogonal' or 'preconditioned'")
+    jd_iterations = index(jd_iterations)
+    if jd_iterations<0:
+        raise ValueError('jd_iterations must be nonnegative')
+    if jd_iterations:
+        from scipy.sparse.linalg import LinearOperator, minres
+    if preconditioner_block is not None:
+        block_rows, block = preconditioner_block
+        block_rows = np.asarray(block_rows, dtype=np.intp)
+        block = np.asarray(block)
+        if (block_rows.ndim != 1 or block.shape != (block_rows.size,)*2 or
+                not block_rows.size or np.any(block_rows < 0) or np.any(block_rows >= dim) or
+                np.unique(block_rows).size != block_rows.size or not np.isrealobj(block) or
+                not np.isfinite(block).all() or not np.allclose(block, block.T, atol=1e-12, rtol=0)):
+            raise ValueError('preconditioner needs distinct row indices and a finite symmetric block')
+        block_values, block_vectors = np.linalg.eigh((block+block.T)*.5)
+
+    def shifted_denominator(values, shifts):
+        denominators = shifts[None, :]-values[:, None]
+        small = np.abs(denominators)<1e-3
+        denominators[small] = np.where(denominators[small]<0., -1e-3, 1e-3)
+        return denominators
+
+    def inverse(vector, den, local_den):
+        out = vector/den
+        if preconditioner_block is not None:
+            out[block_rows] = block_vectors@((block_vectors.T@vector[block_rows])/local_den)
+        return out
+
     if max_subspace is None:
         max_subspace = min(dim, max(20, 8*roots))
     max_subspace = index(max_subspace)
@@ -162,60 +190,29 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
             raise ValueError('hvp must return a finite real block with the input shape')
         return result
 
-    @timed('orthogonalization_ns')
-    def orthogonalize_transform(vectors, against, min_norm=1e-12):
-        # Return D = vectors @ T + against @ P, using the same two-pass
-        # orthogonalization on all three factors. Carrying the transformation
-        # lets us form H D from sparse H inputs and cached H against, without
-        # either clamping an orthonormal vector or treating H(clamp(D)) as H D.
-        accepted, transforms, projections = [], [], []
-        for j, source in enumerate(vectors.T):
-            vector = source.copy()
-            scale = np.linalg.norm(vector)
-            if scale == 0:
-                continue
-            vector /= scale
-            transform = np.zeros(vectors.shape[1])
-            transform[j] = 1/scale
-            projection = np.zeros(against.shape[1])
-            for _ in range(2):
-                if against.shape[1]:
-                    coefficients = against.T @ vector
-                    vector -= against @ coefficients
-                    projection -= coefficients
-                for q, t, p in zip(accepted, transforms, projections):
-                    coefficient = np.dot(q, vector)
-                    vector -= coefficient*q
-                    transform -= coefficient*t
-                    projection -= coefficient*p
-            norm = np.linalg.norm(vector)
-            if norm > min_norm:
-                accepted.append(vector/norm)
-                transforms.append(transform/norm)
-                projections.append(projection/norm)
-        if not accepted:
-            return np.empty((dim, 0)), None, None
-        return (np.column_stack(accepted), np.column_stack(transforms),
-                np.column_stack(projections))
+    def jd_correction(v, shift, residual):
+        def project(x):
+            return x-v*np.dot(v, x)
 
-    def sparse_corrections(vectors, basis, images, cutoffs):
-        sparse = vectors.copy()
-        for column, cutoff in zip(sparse.T, cutoffs):
-            norm = np.linalg.norm(column)
-            if norm:
-                column /= norm
-                largest = int(np.argmax(np.abs(column)))
-                keep = column[largest]
-                column[np.abs(column) < cutoff] = 0.
-                column[largest] = keep
-                column /= np.linalg.norm(column)
-        # Avoid amplifying product roundoff in nearly dependent sparse inputs.
-        directions, transform, projection = orthogonalize_transform(sparse, basis, min_norm=1e-8)
-        if not directions.shape[1]:
-            return directions, None
-        used = np.any(transform != 0, axis=1)
-        product = apply(sparse[:, used])
-        return directions, product @ transform[used] + images @ projection
+        def action(x):
+            z = project(x)
+            if stats is not None:
+                stats['jd_product_calls'] += 1
+            return project(apply(z[:, None])[:, 0]-shift*z) + (x-z)
+
+        inverse_diag = 1./np.maximum(np.abs(hdiag-shift), 1e-3)
+
+        def precondition(x):
+            z = project(x)
+            return project(inverse_diag*z) + (x-z)
+
+        operator = LinearOperator((dim, dim), matvec=action, dtype=float)
+        preconditioner = LinearOperator((dim, dim), matvec=precondition, dtype=float)
+        rhs = -project(residual)
+        correction, info = minres(operator, rhs, M=preconditioner, maxiter=jd_iterations)
+        if info>=0 and np.isfinite(correction).all():
+            return project(correction)
+        return None
 
     empty = np.empty((dim, 0))
     if c0 is None:
@@ -251,7 +248,6 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
     if nseed:
         V = np.column_stack((V, supplement(V, nseed)))
     AV = apply(V)
-    initial_residual = None
     for iteration in range(maxiter):
         ritz_start = perf_counter_ns() if stats is not None else 0
         if stats is not None: stats['iterations'] = iteration + 1
@@ -268,8 +264,6 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
         residual = AX-X*L[None, :]
         norms = np.linalg.norm(residual, axis=0)
         if stats is not None: stats['ritz_ns'] += perf_counter_ns() - ritz_start
-        if initial_residual is None:
-            initial_residual = max(float(np.max(norms)), np.finfo(float).tiny)
         if verbose:
             for k in range(len(L)):
                 print(f'{iteration+1}       {k+1}   {L[k]:.12e}    {norms[k]:.6e}')
@@ -278,29 +272,16 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
         if iteration+1 == maxiter:
             return finish(L, X, False)
         unconverged = np.flatnonzero(norms >= tol)
-        denom = L[unconverged][None, :]-hdiag[:, None]
-        small = np.abs(denom) < 1e-3
-        denom[small] = np.where(denom[small] < 0, -1e-3, 1e-3)
-        corrections = residual[:, unconverged]/denom
-        correction_images = None
-        if trial_vector_tol:
-            raw_corrections = corrections
-            cutoffs = trial_vector_tol*np.minimum(1., norms[unconverged]/initial_residual)**trial_vector_decay
-            if trial_vector_source == 'orthogonal':
-                # Project first to prevent large components already represented
-                # in V from consuming most of a sparse direction's support.
-                # Handle columns separately so per-root cutoffs stay aligned
-                # even if one direction is rank deficient.
-                trial = []
-                for column in corrections.T:
-                    q = orthogonalize(column[:, None], V)
-                    trial.append(q[:, 0] if q.shape[1] else np.zeros(dim))
-                corrections = np.column_stack(trial) if trial else empty
-            corrections, correction_images = sparse_corrections(corrections, V, AV, cutoffs)
-            if not corrections.shape[1]:
-                corrections = orthogonalize(raw_corrections, V)
-        else:
-            corrections = orthogonalize(corrections, V)
+        shifts = L[unconverged]
+        denom = shifted_denominator(hdiag, shifts)
+        local_den = None if preconditioner_block is None else shifted_denominator(block_values, shifts)
+        corrections = inverse(residual[:, unconverged], denom, local_den)
+        if jd_iterations:
+            for column, root in enumerate(unconverged):
+                corrected = jd_correction(X[:, root], L[root], residual[:, root])
+                if corrected is not None and np.any(corrected):
+                    corrections[:, column] = corrected
+        corrections = orthogonalize(corrections, V)
         if not corrections.shape[1] and V.shape[1] < dim:
             corrections = supplement(V, max(1, roots))
         if not corrections.shape[1]:
@@ -314,21 +295,13 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
                 stats['restarts'] += 1
                 restart_start, orthogonal_before = perf_counter_ns(), stats['orthogonalization_ns']
             V, AV = X, AX
-            if correction_images is None:
-                corrections = orthogonalize(corrections, V)
-            else:
-                corrections, transform, projection = orthogonalize_transform(corrections, V)
-                if corrections.shape[1]:
-                    correction_images = correction_images @ transform + AV @ projection
+            corrections = orthogonalize(corrections, V)
             if stats is not None:
                 stats['restart_ns'] += perf_counter_ns() - restart_start - (stats['orthogonalization_ns'] - orthogonal_before)
         corrections = corrections[:, :max_subspace-V.shape[1]]
         if not corrections.shape[1]:
             return finish(L, X, False)
-        if correction_images is None:
-            correction_images = apply(corrections)
-        else:
-            correction_images = correction_images[:, :corrections.shape[1]]
+        correction_images = apply(corrections)
         V = np.column_stack((V, corrections))
         AV = np.column_stack((AV, correction_images))
     return finish(L, X, False)

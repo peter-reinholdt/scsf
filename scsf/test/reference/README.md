@@ -36,7 +36,20 @@ decimal places; regression tests compare absolute roots at that precision and
 spin gaps more tightly. These inputs and reference data were produced
 independently for the CSF validation.
 
-```sh
-python -m scsf --integrals scsf/test/data/h4_dalton_sto3g.npz --full --nroots 3
-python -m scsf --integrals scsf/test/data/h4_dalton_sto3g.npz --full --two-s 2 --nroots 3
+```python
+import numpy as np
+import scsf
+from scsf.drivers.solvers import solve_ci
+
+with np.load('scsf/test/data/h4_dalton_sto3g.npz') as data:
+    ham = scsf.Hamiltonian(float(data['ecore']), data['one'], data['two'])
+    nelec = int(data['nelec'])
+
+for two_s in (0, 2):
+    wfn = scsf.csf_wfn(ham.nbasis, nelec, two_s)
+    wfn.add_all_csfs()
+    op = scsf.csf_structured_op(ham, wfn)
+    energies, _, converged = solve_ci(op.matmat, op.diagonal(), roots=3, tol=1e-10)
+    assert converged
+    print(two_s, energies + ham.ecore)
 ```

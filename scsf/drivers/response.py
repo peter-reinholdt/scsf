@@ -2,7 +2,6 @@
 import scsf
 import numpy as np
 from .solvers import davidson_response, solve_ci
-from functools import reduce
 from collections import defaultdict
 
 def one_electron_ao2mo(casci, operator, mo_coeff=None, ncas=None, ncore=None):
@@ -13,8 +12,7 @@ def one_electron_ao2mo(casci, operator, mo_coeff=None, ncas=None, ncore=None):
     if ncore is None:
         ncore = casci.ncore
     mo_cas = mo_coeff[:, ncore:ncore + ncas]
-    h1 = reduce(np.dot, (mo_cas.conj().T, operator, mo_cas))
-    return h1
+    return mo_cas.conj().T @ operator @ mo_cas
 
 def wrap_matvec(op, x):
     x = np.asarray(x)
@@ -26,11 +24,7 @@ def wrap_matvec(op, x):
     if x.ndim == 1:
         return op.matvec(np.ascontiguousarray(x))
     if x.ndim == 2:
-        if hasattr(op, 'matmat'):
-            return op.matmat(x)
-        if not x.shape[1]:
-            return np.empty((op.shape[0], 0))
-        return np.column_stack([op.matvec(np.ascontiguousarray(v)) for v in x.T])
+        return op.matmat(x)
     raise ValueError('products require a vector or column block')
 
 def zeropad(x, N):
@@ -39,18 +33,29 @@ def zeropad(x, N):
     out[:len(x), ...] = x
     return out
 
+def grow_space(wfn, op, weights, eps):
+    """Apply native HCI while keeping the response vectors in public order."""
+    old_size = len(wfn)
+    _, stats = op.select_hci(op.to_native_order(weights), eps)
+    if stats['added']:
+        op.append_selected_labels(wfn, old_size)
+    return stats['added']
+
+
 def resp(ham, wfn, op, e_vecs, integrals, perturbations, gamma=0.0, triplet=False, eps_mu=None, eps_resp=None, overwrite=True, nroots=1, state=0, reference_state=None, *, ci_tol=1e-10, response_tol=1e-08, response_maxiter=200, response_growth_tol=0.01, verbose=True):
     """Variational linear response in fixed-spin CSF spaces.
 
     CSF properties are singlet/spin-scalar one-electron operators. Property
     selection uses immutable parent coefficients; Hamiltonian response growth
-    uses the existing backend selector. No PT2 contribution is included.
+    uses native HCI. No PT2 contribution is included.
     Return the selected space/operator, CI columns, response/property vectors,
     and response functions.
     """
     from copy import copy
-    if not isinstance(wfn, scsf.csf_wfn):
-        raise TypeError('response requires csf_wfn')
+    if not isinstance(wfn, scsf.csf_wfn) or not isinstance(op, scsf.csf_structured_op):
+        raise TypeError('response requires a CSF space and its structured Hamiltonian')
+    if len(wfn) != op.shape[0] or any(a != b for a, b in zip(wfn, op.labels())):
+        raise ValueError('response space must match the Hamiltonian row order')
     if triplet:
         raise NotImplementedError('triplet one-electron CSF response is not implemented')
     if not len(wfn) or state < 0 or nroots < 1 or (not np.isfinite(gamma)) or (gamma < 0) or (not np.isfinite(response_growth_tol)) or (not 0 <= response_growth_tol < 1) or (not np.isfinite(ci_tol)) or (ci_tol <= 0) or (not np.isfinite(response_tol)) or (response_tol <= 0) or (response_maxiter < 1):
@@ -65,7 +70,7 @@ def resp(ham, wfn, op, e_vecs, integrals, perturbations, gamma=0.0, triplet=Fals
             raise ValueError('property integrals must be finite spatial orbital matrices')
     if not overwrite:
         wfn = copy(wfn)
-        op = scsf.csf_op(ham, wfn, backend=copy(op.backend), max_matrix_entries=op.max_matrix_entries, product_engine=op.product_engine, product_mode=op.product_mode, product_nthreads=op.product_nthreads, matrix_cutoff=op.matrix_cutoff, storage_engine=op.storage_engine)
+        op = op.with_basis(wfn)
     if np.iscomplexobj(e_vecs):
         raise ValueError('CI coefficients must be real for the real Hamiltonian solver')
     e_vecs = np.array(e_vecs, dtype=float, copy=True)
@@ -74,7 +79,7 @@ def resp(ham, wfn, op, e_vecs, integrals, perturbations, gamma=0.0, triplet=Fals
     if e_vecs.ndim != 2 or e_vecs.shape[0] != len(wfn):
         raise ValueError('CI coefficients must have one row per original basis state')
     nroots = max(nroots, state + 1)
-    nthreads = getattr(getattr(op, 'backend', None), 'nthreads', scsf.get_num_threads())
+    nthreads = op.nthreads
 
     def diagonalize():
         nonlocal e_vecs, state
@@ -101,7 +106,7 @@ def resp(ham, wfn, op, e_vecs, integrals, perturbations, gamma=0.0, triplet=Fals
         energies = diagonalize()
         if verbose:
             print(f'couple_property added={added} basis={len(wfn)} energy={energies[state] + op.ecore:.12f}')
-    property_vectors, response_vectors = ({}, {})
+    property_vectors, response_vectors = {}, {}
 
     def solve_responses(previous=None):
         nonlocal property_vectors, response_vectors
@@ -112,6 +117,7 @@ def resp(ham, wfn, op, e_vecs, integrals, perturbations, gamma=0.0, triplet=Fals
             return x - c * np.vdot(c, x)
         property_vectors = {label: project(property_product(label, c)) for label in dict.fromkeys((p[0] for p in perturbations))}
         response_vectors = {}
+        ci_diagonal = op.diagonal()
         for key in perturbations:
             label, omega, parity = key
             shift = parity * (omega + 1j * gamma)
@@ -119,7 +125,7 @@ def resp(ham, wfn, op, e_vecs, integrals, perturbations, gamma=0.0, triplet=Fals
             def action(x):
                 qx = project(x)
                 return project(wrap_matvec(op, qx) - (e0 + shift) * qx) + c * np.vdot(c, x)
-            diagonal = op.diagonal() - e0 - shift + np.abs(c) ** 2
+            diagonal = ci_diagonal - e0 - shift + np.abs(c)**2
             guess = None if previous is None else project(zeropad(previous[key], len(wfn)))
             x = davidson_response(action, property_vectors[label], diagonal, tol=response_tol, maxiter=response_maxiter, guess=guess)
             x = project(x)
@@ -131,15 +137,16 @@ def resp(ham, wfn, op, e_vecs, integrals, perturbations, gamma=0.0, triplet=Fals
     if eps_resp is not None and response_vectors:
         while True:
             weights = np.max(np.abs(np.array(list(response_vectors.values()))), axis=0)
-            added = scsf.add_csf_hci(ham, wfn, weights, eps=eps_resp, backend=op.backend, max_csfs=None, max_candidates=None, max_configurations=None)
+            added = grow_space(wfn, op, weights, eps_resp)
+            if not added:
+                break
             e_vecs = zeropad(e_vecs, len(wfn))
-            op.update(ham, wfn)
             energies = diagonalize()
             previous = response_vectors
             solve_responses(previous)
             if verbose:
                 print(f'couple_response added={added} basis={len(wfn)} energy={energies[state] + op.ecore:.12f}')
-            if not added or added / len(wfn) < response_growth_tol:
+            if added / len(wfn) < response_growth_tol:
                 break
     response_functions = defaultdict(float)
     for label, omega, parity in perturbations:
@@ -149,16 +156,10 @@ def resp(ham, wfn, op, e_vecs, integrals, perturbations, gamma=0.0, triplet=Fals
     return (wfn, op, e_vecs, response_vectors, property_vectors, response_functions)
 
 def print_var_summary(response_functions):
-    labels = [key for key in response_functions.keys()]
-    for label1, label2, omega in labels:
-        value = response_functions[label1, label2, omega]
-        ω = omega
-        if value.imag != 0:
-            imag = value.imag
-            value = value.real
-            print(f'Re<<{label1}; {label2}>>(ω={ω:}) value={value:16.9f}')
-            value = imag
-            print(f'Im<<{label1}; {label2}>>(ω={ω:}) value={value:16.9f}')
+    for (label1, label2, omega), value in response_functions.items():
+        name = f'<<{label1}; {label2}>>(ω={omega})'
+        if value.imag:
+            print(f'Re{name} value={value.real:16.9f}')
+            print(f'Im{name} value={value.imag:16.9f}')
         else:
-            value = value.real
-            print(f'<<{label1}; {label2}>>(ω={ω:}) value={value:16.9f}')
+            print(f'{name} value={value.real:16.9f}')

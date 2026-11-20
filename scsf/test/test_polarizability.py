@@ -21,8 +21,8 @@ def options(molecule):
             '--response-tol','1e-10','--davidson-tol','1e-12']
 
 
-def test_full_tensor(molecule,capsys):
-    r=polarizability.main(options(molecule)+['--full'])
+def test_selected_tensor(molecule,capsys):
+    r=polarizability.main(options(molecule)+['--eps','1e-8'])
     assert 'CSF singlet response' in capsys.readouterr().out
     assert r[-1][('Z','Z',0.)]==pytest.approx(11.107698996,abs=2e-8)
     assert abs(r[-1][('X','X',0.)])<1e-15
@@ -41,7 +41,7 @@ def test_selected_csf_response_and_component_switch(molecule,capsys):
 def test_static_polarizability_against_pyscf_finite_field_fci(molecule,capsys):
     from pyscf import gto,scf,fci
     from scsf.drivers.csf_driver import integrals_from_scf
-    r=polarizability.main(options(molecule)+['--full','--component','Z'])
+    r=polarizability.main(options(molecule)+['--eps','1e-8','--component','Z'])
     mol=gto.M(atom=molecule,basis='sto-3g',verbose=0)
     mf=scf.RHF(mol);mf.conv_tol=1e-12;mf.kernel()
     ham,nelec,cas=integrals_from_scf(mf,0)
@@ -58,7 +58,7 @@ def test_static_polarizability_against_pyscf_finite_field_fci(molecule,capsys):
 
 def test_module_entry_point_and_excited_singlet(molecule,tmp_path):
     run=subprocess.run([sys.executable,'-m','scsf.drivers.polarizability',
-        *options(molecule),'--full','--state','1','--component','Z'],
+        *options(molecule),'--eps','1e-8','--state','1','--component','Z'],
         cwd=Path(__file__).resolve().parents[2],text=True,capture_output=True)
     assert run.returncode==0,run.stdout+run.stderr
     assert 'root=1' in run.stdout

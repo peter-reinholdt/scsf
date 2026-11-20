@@ -1,0 +1,34 @@
+/* SCSF; GPL-3.0-or-later. CIH diagonal from one-generator column norms. */
+#pragma once
+#include "structured_internal.h"
+#include "structured_eri.h"
+
+namespace scsf::v2 {
+
+inline int cih_template_electrons(const structured::Primary &p) {
+    int open=p.s;
+    for(const auto &group:p.groups)open=std::max(open,group.block->open);
+    return std::min(p.n,open+4);
+}
+
+inline void cih_diagonal(const structured::Primary::Group &group,const structured::OneBank &bank,
+        const double *h,const double *coulomb,const double *exchange,int k,double *result) {
+    const auto &cfg=*group.cfg;
+    double constant=0.;
+    for(int p=0;p<k;++p)if(cfg[p]) {
+        double term=h[size_t(p)*(k+1)];
+        for(int q=0;q<k;++q)term+=.5*(cfg[q]*coulomb[size_t(p)*k+q]-exchange[size_t(p)*k+q]);
+        constant+=cfg[p]*term;
+    }
+    for(size_t i=0;i<group.size();++i)result[group.row(i)]=constant;
+    for(int p=0;p<k;++p)if(cfg[p])
+        for(int q=0;q<k;++q) {
+            if(p==q || cfg[q]==2)continue;
+            const double weight=.5*exchange[size_t(p)*k+q];
+            if(weight==0.)continue;
+            const auto &norms=bank.get(cfg,q,p).squared_columns;
+            for(size_t i=0;i<group.size();++i)
+                result[group.row(i)]+=weight*norms[group.rank(i)];
+        }
+}
+} // namespace scsf::v2

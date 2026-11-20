@@ -5,12 +5,13 @@ import shlex
 from setuptools import Extension, setup
 
 ROOT = Path(__file__).resolve().parent
-HEADERS = (sorted((ROOT/'scsf/src/csf').glob('*.h')) +
+NATIVE_SOURCE = ROOT/'scsf/src'
+HEADERS = (sorted(NATIVE_SOURCE.glob('*.h')) +
            sorted((ROOT/'deps/pybind11/include').rglob('*.h')))
 
 
 setup(ext_modules=[Extension('scsf._csf',
-    sources=[str(p.relative_to(ROOT)) for p in sorted((ROOT/'scsf/src/csf').glob('*.cpp'))],
+    sources=[str(p.relative_to(ROOT)) for p in sorted(NATIVE_SOURCE.glob('*.cpp'))],
     depends=[str(p.relative_to(ROOT)) for p in HEADERS],
     include_dirs=['deps/pybind11/include'],
     libraries=['pthread','m','dl'],

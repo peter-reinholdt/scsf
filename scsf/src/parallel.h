@@ -21,19 +21,17 @@
 namespace scsf {
 // A retained team for repeated coarse jobs. The caller participates. Every
 // generation has a completion barrier, including exceptions; captured buffers
-// cannot expire while any worker still uses the callback. Calls are serialized
-// by the owning operator. No nested team or MKL worker region is entered.
+// cannot expire while any worker still uses the callback. The owning operator
+// serializes calls.
 class ThreadTeam {
     std::vector<std::thread> threads_;
     std::mutex mutex_;
     std::condition_variable ready_, finished_;
-    std::atomic<size_t> next_{0};
     std::atomic<bool> stop_{false};
-    size_t generation_ = 0, completed_ = 0, count_ = 0;
+    size_t generation_ = 0, completed_ = 0;
     bool shutdown_ = false;
     std::exception_ptr failure_;
     std::function<void(size_t)> callback_;
-    bool worker_job_ = false;
     size_t active_ = 0;
     std::vector<int> cpus_;
     // Only the participating caller must recover its original affinity.
@@ -65,17 +63,10 @@ class ThreadTeam {
         }
     };
     void execute(size_t worker) {
+        if (worker>=active_ || stop_.load(std::memory_order_relaxed)) return;
         try {
             Placement placement(cpus_,worker);
-            if (worker_job_) {
-                if (worker<active_ && !stop_.load(std::memory_order_relaxed)) callback_(worker);
-                return;
-            }
-            while (!stop_.load(std::memory_order_relaxed)) {
-                size_t task = next_.fetch_add(1,std::memory_order_relaxed);
-                if (task >= count_) break;
-                callback_(task);
-            }
+            callback_(worker);
         } catch (...) {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!failure_) failure_ = std::current_exception();
@@ -124,20 +115,20 @@ public:
         ready_.notify_all();
         for (auto &thread : threads_) thread.join();
     }
-    void apply(size_t tasks, std::function<void(size_t)> job,bool worker_job=false) {
-        if (worker_job && tasks>threads_.size()+1) throw std::invalid_argument("too many active workers");
-        if (threads_.empty() || !tasks) {
+    // Each active index belongs to the same physical thread on every call.
+    void apply_workers(size_t active,std::function<void(size_t)> job) {
+        if (active>threads_.size()+1) throw std::invalid_argument("too many active workers");
+        if (!active) return;
+        if (threads_.empty()) {
             Placement placement(cpus_,0);
-            for (size_t i = 0; i < tasks; ++i) job(i);
+            job(0);
             return;
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);
             callback_ = std::move(job);
-            worker_job_ = worker_job;active_ = tasks;
-            count_ = tasks;
+            active_ = active;
             completed_ = 0;
-            next_.store(0,std::memory_order_relaxed);
             stop_.store(false,std::memory_order_relaxed);
             failure_ = nullptr;
             ++generation_;
@@ -148,11 +139,6 @@ public:
         finished_.wait(lock,[&] { return completed_ == threads_.size(); });
         callback_ = {};
         if (failure_) std::rethrow_exception(failure_);
-    }
-    // A permanent physical thread owns each index, even when fewer owners are
-    // active. This also makes first-touch and memo ownership agree.
-    void apply_workers(size_t active,std::function<void(size_t)> job) {
-        apply(active,std::move(job),true);
     }
 };
 } // namespace scsf

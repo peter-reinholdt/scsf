@@ -140,38 +140,4 @@ bool guga_connected_paths(const Config &target, const std::vector<Path> &parents
     return complete;
 }
 
-void bind_walks(pybind11::module_ &m) {
-    namespace py = pybind11;
-    m.def("guga_connected_walks", [](const std::string &label, const Config &target, int two_s,
-                                    const std::vector<int> &indices, size_t maximum, int mode) {
-        if (indices.size() != 2 && indices.size() != 4)
-            throw std::invalid_argument("GUGA operator needs two or four indices");
-        if (label.size() != target.size() || mode < 0 || mode > 2 || two_s < 0)
-            throw std::invalid_argument("invalid connected-walk arguments");
-        for (int n : target) if (n < 0 || n > 2) throw std::invalid_argument("occupations must be 0,1,2");
-        for (int p : indices) if (p < 0 || static_cast<size_t>(p) >= target.size())
-            throw std::invalid_argument("orbital index out of range");
-        std::vector<std::string> labels;
-        std::vector<double> values;
-        std::map<std::string,size_t> stats;
-        {
-            py::gil_scoped_release release;
-            size_t budget = (label.size()+1)*(mode == 2 ? 3 : 1);
-            std::vector<Path> parents;
-            parents.emplace_back(label,target.size(),two_s,budget,false,mode);
-            Connection terms;
-            terms.generators.push_back({1.,indices[0],indices[1],indices.size() == 4 ? indices[2] : 0,
-                                         indices.size() == 4 ? indices[3] : 0,indices.size() == 4});
-            bool complete = guga_connected_paths(target,parents,terms,maximum,[&](const std::string &bra) {
-                size_t b = (label.size()+1)*(mode == 2 ? 3 : 1);
-                Path path(bra,target.size(),two_s,b,false,mode);
-                double value = guga_element(path,parents[0],terms);
-                if (value != 0.) { labels.push_back(bra); values.push_back(value); }
-            },stats);
-            if (!complete) throw BudgetError("connected walks exceed max_walk_bytes");
-        }
-        return py::make_tuple(labels,values,stats);
-    },py::arg("label"),py::arg("occupations"),py::arg("two_s"),py::arg("indices"),
-       py::arg("max_walk_bytes") = 4*1024*1024,py::arg("guga_mode") = 0);
-}
 } // namespace scsf

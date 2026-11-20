@@ -36,8 +36,13 @@ struct PairDescriptor {
         if (removed!=inserted) throw std::invalid_argument("configuration electron numbers differ");
         transfer_rank=removed;
     }
+    // Transfers produced by the canonical occupation enumerator already
+    // carry the minimal, ordered hole and particle multisets.
+    PairDescriptor(const Config &a,const Config &b,size_t i,size_t j,
+                   std::array<int,2> q,std::array<int,2> p,int rank)
+        : bra(a),ket(b),I(i),J(j),transfer_rank(rank),holes(q),particles(p) {}
     // Trusted immutable-basis masks: occupations, orbital count and electron
-    // sector have already been validated by SelectedBasis. No integral data.
+    // sector have already been validated by the occupation basis. No integral data.
     static PairDescriptor from_masks(const Config &a,const Config &b,size_t i,size_t j,
         std::uint64_t a1,std::uint64_t a2,std::uint64_t b1,std::uint64_t b2) {
         PairDescriptor pair(a,b,i,j,Trusted{});
@@ -86,9 +91,11 @@ public:
     }
 };
 
-// Rank-specialized preparation reuses a worker-owned generator buffer. It
-// recomputes all integral coefficients and preserves term-limit semantics.
-void ranked_connection(const PairDescriptor &,const double *,const double *,size_t,bool,Connection &);
+// Rank-specialized preparation reuses a worker-owned generator buffer.
+namespace structured { struct SpatialERI; }
+void ranked_connection(const PairDescriptor &,const double *,const structured::SpatialERI &,bool,Connection &);
+// Same-occupation terms only require (pp|rr) and (pr|rp), stored as two k-by-k arrays.
+Connection guga_diagonal_connection(const Config &,const double *,const double *);
 
 // Contraction is explicitly separate from the descriptor's lifetime/identity.
 Connection connection(const PairDescriptor &, const double *h, const double *v,

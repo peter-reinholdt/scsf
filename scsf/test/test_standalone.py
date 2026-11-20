@@ -1,5 +1,4 @@
 """Contracts introduced by the standalone extraction."""
-import importlib.abc
 import json
 import numpy as np
 import numpy.testing as npt
@@ -8,14 +7,14 @@ import scsf
 
 
 def test_integral_container_owns_contiguous_array_storage():
-    h = np.arange(9.).reshape(3,3).T
+    h = np.ones((3,3)).T
     g = np.zeros((3,)*4)
     ham = scsf.hamiltonian(1.25, h, g)
     h[:] = -1.
     g[:] = 2.
     assert ham.nbasis == 3 and ham.ecore == 1.25
     assert ham.one_mo.flags.c_contiguous and ham.two_mo.flags.c_contiguous
-    npt.assert_array_equal(ham.one_mo, np.arange(9.).reshape(3,3).T)
+    npt.assert_array_equal(ham.one_mo, 1.)
     npt.assert_array_equal(ham.two_mo, 0.)
 
 
@@ -70,4 +69,12 @@ def test_basis_files_have_one_schema(tmp_path):
     with pytest.raises(ValueError,match='basis file'):
         scsf.csf_wfn.from_file(path)
     assert not hasattr(w,'to_fullci')
-    assert not hasattr(scsf.csf_op,'solve')
+
+
+def test_dense_integrals_require_physical_symmetry():
+    with pytest.raises(ValueError, match='symmetric'):
+        scsf.Hamiltonian(0., [[0., 1.], [0., 0.]], np.zeros((2,)*4))
+    eri = np.zeros((2,)*4)
+    eri[0, 0, 1, 0] = 1.
+    with pytest.raises(ValueError, match='permutation symmetry'):
+        scsf.Hamiltonian(0., np.eye(2), eri)

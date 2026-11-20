@@ -4,7 +4,7 @@ import numpy as np
 import numpy.testing as npt
 import pytest
 import scsf
-from scsf.test.test_csf_guga import fock_operators
+from .reference.oracle import fock_operators
 
 
 def model(k=4,n=4,s=0):
@@ -72,13 +72,10 @@ def test_one_electron_selection_against_independent_full_matrix(threads,eps):
     npt.assert_array_equal(coeff,saved)
 
 
-def test_selection_guard_failure_and_diagonal_no_growth():
+def test_diagonal_operator_does_not_grow_basis():
     w,one,_=model();base=scsf.csf_wfn(4,4,0);base.add_csf(w[0])
-    old=copy.copy(base)
-    with pytest.raises(MemoryError):
-        scsf.add_csf_one_electron(one,base,[1.],0.,max_csfs=1,nthreads=12)
-    assert tuple(base)==tuple(old) and base._configs==old._configs
     assert scsf.add_csf_one_electron(np.eye(4),base,[1.],0.)==0
+    assert tuple(base)==(w[0],)
     assert scsf.add_csf_one_electron(one,base,[1.],0.,nthreads=12)>0
 
 
@@ -92,7 +89,6 @@ def test_empty_inputs_validation_and_no_triplet_support():
         with pytest.raises(ValueError):f(np.full((3,3),np.nan),w,[1.])
         with pytest.raises(ValueError):f(np.eye(3),w,[np.inf])
         with pytest.raises(ValueError):f(np.eye(3),w,[1.],nthreads=0)
-        with pytest.raises(MemoryError):f(np.ones((3,3)),w,[1.],max_tensor_entries=0)
     with pytest.raises(ValueError):scsf.csf_one_electron_product(np.eye(3),w,[1.,2.])
     with pytest.raises(ValueError):scsf.add_csf_one_electron(np.eye(3),w,[])
 
@@ -115,9 +111,10 @@ def test_many_open_shell_property_selection_uses_connected_walks(threads):
     w=scsf.csf_wfn(k,k,0);w.add_csf('ud'*7)
     occupation=[1]*k;occupation[0]=0;occupation[13]=2
     candidates=list(_paths(occupation,0))
-    ham=scsf.hamiltonian(0.,one+one.T,np.zeros((k,)*4))
-    reference=scsf.CSFSpinBackend(ham,coupling_engine='compiled')
-    values=reference.block(candidates,w,0)[:,0]
+    reference = copy.copy(w)
+    for label in candidates:
+        reference.add_csf(label)
+    values = fock_operators(reference)((13,0))[1:,0]
     expected=sorted(label for label,value in zip(candidates,values) if abs(value)>.05)
     added,stats=scsf.add_csf_one_electron(one,w,[1.],.05,nthreads=threads,return_stats=True)
     assert tuple(w)[1:]==tuple(expected) and added==len(expected)
