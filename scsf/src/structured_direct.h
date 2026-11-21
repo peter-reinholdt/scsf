@@ -55,14 +55,17 @@ public:
 class ParticleHole {
     std::vector<Config> main_,other_;
     std::vector<unsigned> main_id_,other_id_,parents_;
-    std::vector<size_t> parent_ptr_,neighbor_ptr_;
+    std::vector<size_t> parent_ptr_;
+    using NeighborBuckets=std::array<size_t,6>;
+    std::vector<NeighborBuckets> neighbor_ptr_;
+    std::vector<std::uint16_t> narrow_neighbors_;
     std::vector<unsigned> neighbors_;
-    std::vector<unsigned char> neighbor_distances_,distances_;
+    std::vector<unsigned char> distances_;
     std::unique_ptr<OccupationTree> tree_;
     size_t fixed_bytes_=0,main_sample_visits_=0,other_sample_visits_=0;
-    size_t retained_=0;
+    size_t build_bytes_=0;
 public:
-    ParticleHole(const Primary &p,Workers &workers,size_t maximum,size_t neighbor_limit) {
+    ParticleHole(const Primary &p,Workers &workers,size_t maximum) {
         if(p.groups.empty())return;
         const auto &ref=*p.groups.front().cfg;
         std::vector<int> hsites,psites;
@@ -109,7 +112,8 @@ public:
         tree_=std::make_unique<OccupationTree>(main_.size(),main_[0].size(),maximum-fixed_bytes_,
             [&](size_t i)->const Config &{return main_[i];});
         fixed_bytes_=bytes();
-        if(other_.size() && other_.size()<=std::min(size_t(4096),(maximum-fixed_bytes_)/other_.size())) {
+        if(!other_.empty() && other_.size()<=4096) {
+            memory_left(maximum-fixed_bytes_,other_.size()*other_.size(),"particle–hole distance table");
             distances_.resize(other_.size()*other_.size());
             workers.run(other_.size(),[&](size_t i,size_t) {
                 for(size_t j=0;j<other_.size();++j) {
@@ -118,50 +122,34 @@ public:
                 }
             });
         }
-        // Spend the neighbor budget on strings queried by the most primary
-        // configurations. Other strings still use the occupation tree.
         fixed_bytes_=bytes();
-        const auto cache_start=fixed_bytes_;
-        if(main_.size()+1>std::min(neighbor_limit,maximum-fixed_bytes_)/sizeof(size_t))return;
-        neighbor_ptr_.assign(main_.size()+1,0);
+        const bool narrow=main_.size()-1<=std::numeric_limits<std::uint16_t>::max();
+        memory_left(maximum-fixed_bytes_,main_.size()*sizeof(NeighborBuckets),"particle–hole neighbor directory");
+        neighbor_ptr_.resize(main_.size());
         workers.run(main_.size(),[&](size_t i,size_t) {
-            tree_->visit(main_[i],~0u,[&](unsigned,int){++neighbor_ptr_[i+1];});
+            tree_->visit(main_[i],~0u,[&](unsigned,int d){++neighbor_ptr_[i][d+1];});
+            auto &bucket=neighbor_ptr_[i];
+            std::partial_sum(bucket.begin(),bucket.end(),bucket.begin());
         });
-        fixed_bytes_=bytes();
-        const size_t capacity=std::min(maximum-fixed_bytes_,neighbor_limit-(fixed_bytes_-cache_start))/
-            (sizeof(neighbors_[0])+sizeof(neighbor_distances_[0]));
-        const size_t total=std::accumulate(neighbor_ptr_.begin(),neighbor_ptr_.end(),size_t(0));
-        if(total>capacity) {
-            std::vector<unsigned> order(main_.size());
-            std::iota(order.begin(),order.end(),0);
-            auto frequency=[&](unsigned id) {return parent_ptr_[id+1]-parent_ptr_[id];};
-            std::sort(order.begin(),order.end(),[&](unsigned a,unsigned b) {
-                const auto first=frequency(a),second=frequency(b);
-                return first!=second ? first>second : a<b;
-            });
-            size_t remaining=capacity;
-            for(unsigned id:order) {
-                auto &count=neighbor_ptr_[id+1];
-                if(count>remaining)count=0;
-                remaining-=count;
-            }
+        size_t end=0;
+        for(auto &bucket:neighbor_ptr_) {
+            for(auto &offset:bucket)offset=checked_add(offset,end);
+            end=bucket.back();
         }
-        for(auto count:neighbor_ptr_)retained_+=count!=0;
-        if(!retained_) {
-            std::vector<size_t>().swap(neighbor_ptr_);
-            return;
-        }
-        std::partial_sum(neighbor_ptr_.begin(),neighbor_ptr_.end(),neighbor_ptr_.begin());
-        neighbors_.resize(neighbor_ptr_.back());
-        neighbor_distances_.resize(neighbors_.size());
-        workers.run(main_.size(),[&](size_t i,size_t) {
-            size_t at=neighbor_ptr_[i];
-            if(at==neighbor_ptr_[i+1])return;
-            tree_->visit(main_[i],~0u,[&](unsigned id,int d) {
-                neighbors_[at]=id;
-                neighbor_distances_[at++]=static_cast<unsigned char>(d);
+        const size_t id_bytes=narrow ? sizeof(narrow_neighbors_[0]) : sizeof(neighbors_[0]);
+        if(end>memory_left(maximum,bytes(),"particle–hole directory")/id_bytes)
+            throw BudgetError("particle–hole neighbor cache exceeds --max-mem");
+        auto retain=[&](auto &ids) {
+            ids.resize(end);
+            workers.run(main_.size(),[&](size_t i,size_t) {
+                auto next=neighbor_ptr_[i];
+                tree_->visit(main_[i],~0u,[&](unsigned id,int d){ids[next[d]++]=id;});
             });
-        });
+        };
+        if(narrow)retain(narrow_neighbors_);
+        else retain(neighbors_);
+        build_bytes_=bytes();
+        tree_.reset();
     }
     void query(size_t group,std::vector<unsigned> &result) const {
         result.clear();if(main_.empty())return;
@@ -176,22 +164,30 @@ public:
                 if(d+distance<=4)result.push_back(g);
             }
         };
-        if(retained_ && neighbor_ptr_[a]!=neighbor_ptr_[a+1])
-            for(size_t j=neighbor_ptr_[a];j<neighbor_ptr_[a+1];++j)visit(neighbors_[j],neighbor_distances_[j]);
-        else tree_->visit(main_[a],~0u,visit);
+        auto visit_cached=[&](const auto &ids) {
+            const auto &bucket=neighbor_ptr_[a];
+            for(int d=0;d<=4;++d)
+                for(size_t j=bucket[d];j<bucket[d+1];++j)visit(ids[j],d);
+        };
+        if(narrow_neighbors_.empty())visit_cached(neighbors_);
+        else visit_cached(narrow_neighbors_);
         std::sort(result.begin(),result.end());
     }
     size_t bytes() const {
         size_t n=(main_id_.capacity()+other_id_.capacity()+parents_.capacity())*sizeof(unsigned)+
-            (parent_ptr_.capacity()+neighbor_ptr_.capacity())*sizeof(size_t)+neighbors_.capacity()*sizeof(neighbors_[0])+
-            neighbor_distances_.capacity()+distances_.capacity();
+            parent_ptr_.capacity()*sizeof(size_t)+neighbor_ptr_.capacity()*sizeof(NeighborBuckets)+
+            neighbors_.capacity()*sizeof(neighbors_[0])+narrow_neighbors_.capacity()*sizeof(narrow_neighbors_[0])+
+            distances_.capacity();
         n+=(main_.capacity()+other_.capacity())*sizeof(Config);
         for(auto &c:main_)n+=c.capacity()*sizeof(int);
         for(auto &c:other_)n+=c.capacity()*sizeof(int);
         return n+(tree_ ? tree_->bytes() : 0);
     }
     Stats info() const {return {{"main_strings",main_.size()},{"other_strings",other_.size()},
-        {"string_connections",neighbors_.size()},{"retained_string_connections",retained_!=0},{"cached_strings",retained_},
+        {"string_connections",neighbors_.size()+narrow_neighbors_.size()},
+        {"neighbor_cache_bytes",neighbor_ptr_.capacity()*sizeof(NeighborBuckets)+
+            neighbors_.capacity()*sizeof(neighbors_[0])+narrow_neighbors_.capacity()*sizeof(narrow_neighbors_[0])},
+        {"metadata_build_bytes",build_bytes_},{"cached_strings",main_.size()},
         {"particle_sample_postings",main_sample_visits_},{"hole_sample_postings",other_sample_visits_}};}
 };
 
@@ -200,15 +196,14 @@ class MatrixDirect {
     const double *h_;
     SpatialERI eri_;
     Workers &workers_;
-    std::unique_ptr<OneBank> bank_;
-    std::unique_ptr<OccupationTree> tree_;
-    std::unique_ptr<ParticleHole> strings_;
+    OneBank bank_;
+    ParticleHole strings_;
     struct Scratch {
         Connection connection;
         Config intermediate,target;
         std::vector<double> block;
         std::vector<unsigned> neighbors;
-        size_t pairs=0, row_pairs=0;
+        size_t pairs=0;
     };
     std::vector<Scratch> scratch_;
     size_t metadata_=0;
@@ -224,7 +219,7 @@ class MatrixDirect {
         bra=ket;
         if(p==q)return {nullptr,double(ket[p]),dimension,dimension,true};
         if(ket[p]==2 || ket[q]==0)return {};
-        ++bra[p];--bra[q];const auto &m=bank_->get(ket,p,q);
+        ++bra[p];--bra[q];const auto &m=bank_.get(ket,p,q);
         return {&m,0.,m.rows,m.cols,true};
     }
     Factor factor(const Occupation::Limb &ket,int p,int q,Occupation::Limb &bra,size_t dimension) const {
@@ -234,7 +229,7 @@ class MatrixDirect {
         if((ket[1]&pb) || !(ket[0]&qb))return {};
         bra[0]=(ket[0]^(qb&~ket[1]))|pb;
         bra[1]=(ket[1]&~qb)|(pb&ket[0]);
-        const auto &m=bank_->at(bank_->index(ket[0],ket[1],p,q));
+        const auto &m=bank_.at(bank_.index(ket[0],ket[1],p,q));
         return {&m,0.,m.rows,m.cols,true};
     }
     template<bool Complete>
@@ -269,24 +264,6 @@ class MatrixDirect {
             }
         }
     }
-    // Evaluate one selected row pair at a time when a complete template
-    // directory or a rectangular spin tile would exceed the coefficient cap.
-    void row_pair(size_t a,size_t b,const double *x,size_t cols,double *y,const Connection &connection) const {
-        const auto &bra=p_.groups[a],&ket=p_.groups[b];
-        for(size_t i=0;i<bra.size();++i) {
-            const Path left(p_.label(a,i),p_.k,p_.s,2);
-            for(size_t j=0;j<ket.size();++j) {
-                const Path right(p_.label(b,j),p_.k,p_.s,2);
-                const double element=guga_element(left,right,connection);
-                if(element==0.)continue;
-                const size_t ai=bra.row(i)*cols,bi=ket.row(j)*cols;
-                for(size_t v=0;v<cols;++v) {
-                    y[ai+v]+=element*x[bi+v];
-                    if(a!=b)y[bi+v]+=element*x[ai+v];
-                }
-            }
-        }
-    }
     template<bool Complete,class State>
     void spin_block(const Primary::Group &bra,const Primary::Group &ket,const State &source,
                     const State &destination,State &intermediate,State &target,Scratch &s) const {
@@ -314,12 +291,6 @@ class MatrixDirect {
         const auto pair=p_.k<=64 ? PairDescriptor::from_masks(*bra.cfg,*ket.cfg,a,b,left[0],left[1],right[0],right[1])
             : PairDescriptor(*bra.cfg,*ket.cfg,a,b);
         ranked_connection(pair,h_,eri_,false,s.connection);
-        if(!bank_ || bra.size()>8192/ket.size()) {
-            row_pair(a,b,x,cols,y,s.connection);
-            ++s.pairs;
-            ++s.row_pairs;
-            return;
-        }
         s.block.assign(bra.size()*ket.size(),0.);
         if(a==b)for(size_t i=0;i<bra.size();++i)s.block[i*ket.size()+i]=s.connection.scalar;
         const bool complete=bra.canonical_full() && ket.canonical_full();
@@ -356,46 +327,44 @@ class MatrixDirect {
         }
         ++s.pairs;
     }
-    void query(size_t a,std::vector<unsigned> &out) const {
-        if(strings_)strings_->query(a,out);
-        else {
-            out.clear();tree_->visit(*p_.groups[a].cfg,a,[&](unsigned b,int){out.push_back(b);});
-            std::sort(out.begin(),out.end());
-        }
-    }
 public:
-    MatrixDirect(const Primary &p,const double *h,SpatialERI eri,Workers &workers,
-                 size_t metadata,size_t coefficients,size_t neighbors,bool row_only):p_(p),h_(h),eri_(eri),workers_(workers),scratch_(workers.count()) {
-        if(!row_only)try {
-            bank_=std::make_unique<OneBank>(cih_template_electrons(p),p.s,coefficients);
-        } catch(const BudgetError &) {
-            // Evaluate the selected spin paths directly below.
+    MatrixDirect(const Primary &p,const double *h,SpatialERI eri,Workers &workers,size_t budget):
+        p_(p),h_(h),eri_(eri),workers_(workers),bank_(cih_template_electrons(p),p.s,budget),
+        strings_(p,workers,memory_left(budget,bank_.bytes(),"particle–hole spin coefficients")),
+        scratch_(workers.count()) {
+        size_t largest=0;
+        for(const auto &group:p.groups)largest=std::max(largest,group.size());
+        metadata_=strings_.bytes();
+        if(largest) {
+            const size_t space=memory_left(budget,checked_add(metadata_,bank_.bytes()),"particle–hole tables");
+            if(largest>space/sizeof(double)/workers_.count()/largest)
+                throw BudgetError("particle–hole worker spin blocks exceed --max-mem");
+            for(auto &worker:scratch_) {
+                worker.block.reserve(largest*largest);
+                metadata_=checked_add(metadata_,worker.block.capacity()*sizeof(double));
+            }
         }
-        if(!row_only)strings_=std::make_unique<ParticleHole>(p,workers,metadata,neighbors);
-        else tree_=std::make_unique<OccupationTree>(p.groups.size(),p.k,metadata,
-            [&](size_t a)->const Config &{return *p.groups[a].cfg;});
-        metadata_=strings_ ? strings_->bytes() : tree_->bytes();
     }
     size_t entries() const {return workers_.count()==1 ? 0 : workers_.count()*p_.size();}
     Stats info() const {
-        Stats s=strings_ ? strings_->info() : Stats{};
-        s["metadata_bytes"]=metadata_;s["coefficient_bytes"]=bank_ ? bank_->bytes() : 0;
-        s["row_guga_fallback"]=!bank_;
+        Stats s=strings_.info();
+        s["metadata_build_bytes"]=std::max(metadata_,s.at("metadata_build_bytes"));
+        s["metadata_bytes"]=metadata_;
+        s["coefficient_bytes"]=bank_.bytes();
         s["workspace_entries_per_rhs"]=entries();return s;
     }
-    void apply(const double *x,size_t cols,double *y,Stats &stats,bool serial=false) {
-        const bool use_result=serial || (workers_.count()==1);
+    void apply(const double *x,size_t cols,double *y,Stats &stats) {
+        const bool use_result=workers_.count()==1;
         size_t stride=p_.size()*cols;
         std::vector<double> partial(use_result ? 0 : workers_.count()*stride,0.);
-        for(auto &s:scratch_)s.pairs=s.row_pairs=0;
+        for(auto &s:scratch_)s.pairs=0;
         auto start=Clock::now();
         auto run=[&](size_t a,size_t w) {
             auto &s=scratch_[w];auto out=use_result ? y : partial.data()+w*stride;
-            query(a,s.neighbors);
+            strings_.query(a,s.neighbors);
             for(unsigned b:s.neighbors)pair(a,b,x,cols,out,s);
         };
-        if(serial)for(size_t a=0;a<p_.groups.size();++a)run(a,0);
-        else workers_.run(p_.groups.size(),run,8);
+        workers_.run(p_.groups.size(),run,8);
         stats["contraction_ns"]+=ns(start);start=Clock::now();
         if(!use_result)workers_.run(p_.size(),[&](size_t i,size_t) {
             for(size_t v=0;v<cols;++v) {
@@ -404,11 +373,8 @@ public:
             }
         },256);
         stats["reduction_ns"]+=ns(start);
-        for(const auto &s:scratch_) {
-            stats["configuration_pairs"]+=s.pairs;
-            stats["row_guga_pairs"]+=s.row_pairs;
-        }
-        size_t bytes=0;for(auto &s:scratch_)bytes+=s.block.capacity()*8+s.neighbors.capacity()*sizeof(unsigned)+
+        for(const auto &s:scratch_)stats["configuration_pairs"]+=s.pairs;
+        size_t bytes=0;for(auto &s:scratch_)bytes+=s.neighbors.capacity()*sizeof(unsigned)+
             (s.intermediate.capacity()+s.target.capacity())*sizeof(int)+s.connection.generators.capacity()*sizeof(GugaTerm);
         stats["worker_temporary_bytes"]=bytes;
     }

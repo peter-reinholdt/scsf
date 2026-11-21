@@ -32,6 +32,9 @@ python -m scsf.drivers.polarizability --xyz examples/water.xyz --basis sto-3g
 The installed commands are `scsf` and `scsf-polarizability`. N−2 is the
 default Hamiltonian kernel. HCI selects individual spin couplings by default.
 Use `--selection-unit configuration` to add complete occupations.
+The energy driver stops after adding a batch of at most 1% of the current CSF
+count and converging all requested roots in the enlarged space. Set
+`--stop-growth-fraction 0` for strict selection through a zero-addition step.
 The driver right-pads `--reference` with zeros to fill the active orbital space.
 
 Both commands default to one native worker per available physical core,
@@ -41,9 +44,16 @@ to a distinct allowed logical CPU in the order listed. For example,
 `--nthreads 2 --worker-cpus 4 6` pins workers to CPUs 4 and 6 if both are
 in the process's allowed CPU set.
 
-`--max-plan-bytes` option caps cached CIH plans or particle–hole neighbors.
-Use `--sci-stats` to print product counters, Davidson residuals and HCI
-selection statistics. The energy driver also supports an exact leading-block
+`--max-mem 4GiB` sets one shared limit for the tracked native allocation
+sizes, including HCI transfer tables, schedules, spin coefficients, caches,
+and the full RHS block's product arrays. The default is unlimited. An
+insufficient limit raises a memory error. Process RSS also includes the
+integral input, the basis, Python and Davidson arrays, and other workspace.
+The Python constructor accepts the same limit as `max_mem` in bytes.
+
+The energy driver prints HCI growth, per-iteration Davidson timings and a
+final phase table by default. Use `--quiet` for summaries and the table, or
+`--sci-stats` for detailed counters. The energy driver also supports an exact leading-block
 preconditioner and Jacobi–Davidson corrections.
 
 ## Python API

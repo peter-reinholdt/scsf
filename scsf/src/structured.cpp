@@ -26,21 +26,31 @@ class StructuredHamiltonian {
     std::unique_ptr<structured::MatrixDirect> direct_;
     std::unique_ptr<structured::GroupedUGA> grouped_;
     std::unique_ptr<structured::WideCIH> wide_cih_;
-    size_t work_limit_,setup_ns_=0;
+    std::shared_ptr<HCITransferBounds> bounds_;
+    size_t memory_limit_,setup_ns_=0,peak_memory_=0;
     Kernel kernel_;
     structured::SpatialERI integrals_{};
     std::vector<double> diagonal_;
     bool diagonal_ready_=false;
     mutable std::mutex mutex_;
+
+    Stats kernel_info() const {
+        return auxiliary_ ? auxiliary_->info() : grouped_ ? grouped_->info() : wide_cih_ ? wide_cih_->info() : direct_->info();
+    }
+    size_t bound_bytes() const {return bounds_ ? bounds_->bytes() : 0;}
+    void record_peak(size_t bytes,const char *phase) {
+        memory_left(memory_limit_,bytes,phase);
+        peak_memory_=std::max(peak_memory_,bytes);
+    }
 public:
     StructuredHamiltonian(const Array &one,const Array &two,std::optional<Array> core,std::shared_ptr<const Basis> basis,int mode,size_t threads,
-        size_t metadata,size_t coefficients,size_t work,size_t pair_limit,std::vector<int> cpus,bool private_output,
-        size_t cache_limit,const StructuredHamiltonian *previous,bool slot_sweep):
+        size_t memory,std::vector<int> cpus,bool private_output,std::shared_ptr<HCITransferBounds> bounds,
+        const StructuredHamiltonian *previous,bool reuse,bool slot_sweep):
         one_(one),two_(two),core_(std::move(core)),primary_([&] {
             pybind11::gil_scoped_release release;
             return structured::Primary(std::move(basis));
         }()),
-        workers_(checked_structured_workers(threads),std::move(cpus)),work_limit_(work),kernel_(static_cast<Kernel>(mode)) {
+        workers_(checked_structured_workers(threads),std::move(cpus)),bounds_(std::move(bounds)),memory_limit_(memory),kernel_(static_cast<Kernel>(mode)) {
         if(mode<0 || mode>3)throw std::invalid_argument("invalid Hamiltonian kernel");
         int k=primary_.k;
         size_t pairs=structured::orbital_pair(k,0);
@@ -67,36 +77,64 @@ public:
             throw std::invalid_argument("invalid structured integral dimensions");
         integrals_={two.data(),core_ ? core_->data() : nullptr,size_t(k),rank,format};
         auto start=structured::Clock::now();pybind11::gil_scoped_release release;
-        if(previous && (previous->kernel_!=kernel_ || previous->one_.data()!=one_.data() ||
+        std::unique_lock<std::mutex> previous_lock;
+        size_t old_metadata=0,old_coefficients=0;
+        if(previous) {
+            previous_lock=std::unique_lock<std::mutex>(previous->mutex_);
+            const auto old=previous->kernel_info();
+            old_metadata=old.at("metadata_bytes");
+            old_coefficients=old.at("coefficient_bytes");
+            peak_memory_=previous->peak_memory_;
+            if(previous->kernel_!=kernel_ || previous->one_.data()!=one_.data() ||
                 previous->two_.data()!=two_.data() || previous->core_.has_value()!=core_.has_value() ||
                 (core_ && previous->core_->data()!=core_->data()) || previous->primary_.s!=primary_.s ||
-                previous->primary_.n!=primary_.n))previous=nullptr;
-        if(kernel_==Kernel::nminus2 || kernel_==Kernel::nminus1)auxiliary_=std::make_unique<structured::Auxiliary>(primary_,one.data(),integrals_,
-            kernel_==Kernel::nminus2 ? 1 : 0,workers_,metadata,coefficients,pair_limit,private_output,
-            previous ? previous->auxiliary_.get() : nullptr);
-        else {
-            if(kernel_==Kernel::cih)try {
-                if(k<=64 && primary_.n<=structured::OneBank::mask_electron_limit) {
-                    grouped_=std::make_unique<structured::GroupedUGA>(primary_,one.data(),integrals_,workers_,
-                        metadata,coefficients,cache_limit,slot_sweep);
-                    if(previous && previous->grouped_) {
-                        std::lock_guard<std::mutex> lock(previous->mutex_);
-                        grouped_->reuse_plans(*previous->grouped_);
-                    }
-                } else
-                    wide_cih_=std::make_unique<structured::WideCIH>(primary_,one.data(),integrals_,workers_,metadata,coefficients);
-            } catch(const BudgetError &) {
-                // Fall back to the exact row product if templates exceed their budgets.
+                previous->primary_.n!=primary_.n)reuse=false;
+        }
+        const size_t tables=bound_bytes(), available=memory_left(memory_limit_,tables,"HCI transfer tables");
+        const size_t old_kernel=checked_add(old_metadata,old_coefficients);
+        const size_t fresh=memory_left(available,old_kernel,"existing Hamiltonian operator");
+        if(kernel_==Kernel::nminus2 || kernel_==Kernel::nminus1) {
+            const auto *prior=reuse && previous ? previous->auxiliary_.get() : nullptr;
+            // N−1 may hold a reference to the old ERI layout instead of
+            // allocating it again. It still counts in the new operator.
+            const size_t shared_eri=kernel_==Kernel::nminus1 && prior ? prior->auxiliary_integral_bytes() : 0;
+            auxiliary_=std::make_unique<structured::Auxiliary>(primary_,one.data(),integrals_,
+                kernel_==Kernel::nminus2 ? 1 : 0,workers_,checked_add(fresh,shared_eri),private_output,prior);
+            const auto next=auxiliary_->info();
+            const bool shared=next.at("reused_removal_topology");
+            const size_t new_metadata=std::max(next.at("metadata_bytes"),next.at("metadata_build_bytes"));
+            size_t peak=shared ? old_kernel : checked_add(old_kernel,checked_add(new_metadata,next.at("coefficient_bytes")));
+            if(!shared && next.count("reused_auxiliary_integrals") && next.at("reused_auxiliary_integrals"))
+                peak-=next.at("auxiliary_integral_bytes");
+            record_peak(checked_add(tables,peak),"auxiliary Hamiltonian setup");
+        } else {
+            if(kernel_==Kernel::cih) {
+                if(k<=64 && primary_.n<=structured::OneBank::mask_electron_limit)
+                    grouped_=std::make_unique<structured::GroupedUGA>(primary_,one.data(),integrals_,workers_,fresh,slot_sweep);
+                else
+                    wide_cih_=std::make_unique<structured::WideCIH>(primary_,one.data(),integrals_,workers_,fresh);
+            } else {
+                direct_=std::make_unique<structured::MatrixDirect>(primary_,one.data(),integrals_,workers_,fresh);
             }
-            if(!grouped_ && !wide_cih_)direct_=std::make_unique<structured::MatrixDirect>(
-                primary_,one.data(),integrals_,workers_,metadata,coefficients,cache_limit,kernel_==Kernel::cih);
+            const auto next=kernel_info();
+            const auto build=next.find("metadata_build_bytes");
+            const size_t metadata=build==next.end() ? next.at("metadata_bytes") : build->second;
+            record_peak(checked_add(tables,checked_add(old_kernel,checked_add(metadata,next.at("coefficient_bytes")))),
+                        "Hamiltonian setup");
+            if(grouped_ && reuse && previous && previous->grouped_)
+                grouped_->reuse_plans(*previous->grouped_);
         }
         setup_ns_=structured::ns(start);
     }
     Stats info()const {
-        Stats s=auxiliary_ ? auxiliary_->info() : grouped_ ? grouped_->info() : wide_cih_ ? wide_cih_->info() : direct_->info();
+        std::lock_guard<std::mutex> lock(mutex_);
+        Stats s=kernel_info();
         s["basis"]=primary_.size();s["configurations"]=primary_.groups.size();s["native_setup_ns"]=setup_ns_;
-        s["workers"]=workers_.count();s["max_product_scratch_bytes"]=work_limit_;
+        s["workers"]=workers_.count();
+        s["max_mem"]=memory_limit_;
+        s["hci_table_bytes"]=bound_bytes();
+        s["tracked_memory_bytes"]=checked_add(bound_bytes(),checked_add(s.at("metadata_bytes"),s.at("coefficient_bytes")));
+        s["peak_tracked_memory_bytes"]=std::max(peak_memory_,s["tracked_memory_bytes"]);
         s["hamiltonian_offdiagonal_bytes"]=0;s["exact_product"]=1;
         using structured::ERIFormat;
         s["factored_eri"]=integrals_.format==ERIFormat::cholesky || integrals_.format==ERIFormat::thc;
@@ -111,9 +149,11 @@ public:
         return s;
     }
     pybind11::tuple select_hci(const Array &weights,double eps,bool complete,
-            std::shared_ptr<HCITransferBounds> bounds) {
+            double stop_growth_fraction) {
         if(weights.ndim()!=1 || size_t(weights.size())!=primary_.size() || !std::isfinite(eps) || eps<0)
             throw std::invalid_argument("invalid native HCI weights or threshold");
+        if(!(stop_growth_fraction>=0. && stop_growth_fraction<=1.))
+            throw std::invalid_argument("stop_growth_fraction must be in [0, 1]");
         std::shared_ptr<Basis> next;
         std::vector<size_t> remap;
         Stats stats;
@@ -123,10 +163,16 @@ public:
             for(size_t i=0;i<primary_.size();++i)
                 if(!std::isfinite(weights.data()[i]) || weights.data()[i]<0.)
                     throw std::invalid_argument("HCI weights must be finite and nonnegative");
+            const auto current=kernel_info();
+            const size_t kernel_bytes=checked_add(current.at("metadata_bytes"),current.at("coefficient_bytes"));
+            const size_t tables=memory_left(memory_limit_,kernel_bytes,"Hamiltonian storage during HCI selection");
             auto [additions,data]=hci(primary_,workers_,one_.data(),integrals_,weights.data(),eps,
-                complete,bounds.get());
+                complete,bounds_.get(),tables);
+            record_peak(checked_add(kernel_bytes,bound_bytes()),"HCI transfer tables");
             stats=std::move(data);
-            if(!additions.empty()) {
+            stats["hci_table_bytes"]=bound_bytes();
+            const size_t proposed=stats.at("proposed_csfs");
+            if(proposed && double(proposed)/primary_.size()>stop_growth_fraction) {
                 auto start=structured::Clock::now();
                 std::tie(next,remap)=primary_.native->extend(additions);
                 stats["basis_extend_ns"]=structured::ns(start);
@@ -240,34 +286,36 @@ public:
         auto start=structured::Clock::now();
         {
             pybind11::gil_scoped_release release;std::lock_guard<std::mutex> lock(mutex_);
+            const size_t entries=auxiliary_ ? auxiliary_->entries() : grouped_ ? grouped_->entries() :
+                wide_cih_ ? wide_cih_->entries() : direct_->entries();
+            const auto current=kernel_info();
+            const size_t retained=checked_add(bound_bytes(),checked_add(current.at("metadata_bytes"),current.at("coefficient_bytes")));
+            const size_t available=memory_left(memory_limit_,retained,"Hamiltonian storage");
+            if(cols && entries>available/sizeof(double)/cols)
+                throw BudgetError("Hamiltonian product arrays for "+std::to_string(cols)+
+                                  " RHS columns exceed remaining --max-mem ("+std::to_string(available)+" bytes)");
+            const size_t arrays=entries*cols*sizeof(double);
+            record_peak(checked_add(retained,arrays),"Hamiltonian product arrays");
+            stats["product_array_bytes"]=arrays;
             std::fill(result.mutable_data(),result.mutable_data()+n*cols,0.);
-            const size_t entries=auxiliary_ ? auxiliary_->entries() : grouped_ ? grouped_->entries() : wide_cih_ ? wide_cih_->entries() : direct_->entries();
-            if(entries>no_row/sizeof(double))throw BudgetError("structured product scratch size overflow");
-            size_t per_column=entries*sizeof(double);
-            const bool over_budget=per_column>work_limit_;
-            const bool batched=over_budget && auxiliary_ && auxiliary_->can_batch(work_limit_);
-            const bool serial=over_budget && !batched;
-            if(over_budget)per_column=0;
-            size_t width=over_budget ? std::min(size_t(1),cols) : per_column ? std::min(cols,work_limit_/per_column) : cols;
-            stats["serial_streaming_fallback"]=serial;
-            if(cols && !width)throw BudgetError("structured scratch cap cannot fit one RHS column");
-            stats["product_array_bytes"]=per_column*width;
-            for(size_t first=0;first<cols;first+=width) {
-                size_t count=std::min(width,cols-first);const double *input=x.data();double *output=result.mutable_data();
-                std::vector<double> input_tile,output_tile;
-                if(count!=cols) {
-                    input_tile.resize(n*count);output_tile.assign(n*count,0.);
-                    for(size_t i=0;i<n;++i)for(size_t v=0;v<count;++v)input_tile[i*count+v]=x.data()[i*cols+first+v];
-                    input=input_tile.data();output=output_tile.data();
+            if(cols) {
+                if(auxiliary_)auxiliary_->apply(x.data(),cols,result.mutable_data(),stats);
+                else if(grouped_) {
+                    const size_t cached=current.at("plan_cache_bytes");
+                    try {
+                        grouped_->apply(x.data(),cols,result.mutable_data(),stats,checked_add(cached,available-arrays));
+                    } catch (...) {
+                        record_peak(retained+arrays+(grouped_->cached_bytes()-cached),"CIH plans and product arrays");
+                        throw;
+                    }
                 }
-                if(batched)auxiliary_->apply_batched(input,output,work_limit_,stats);
-                else if(auxiliary_)auxiliary_->apply(input,count,output,stats,serial);
-                else if(grouped_)grouped_->apply(input,count,output,stats,serial);
-                else if(wide_cih_)wide_cih_->apply(input,count,output,stats,serial);
-                else direct_->apply(input,count,output,stats,serial);
-                if(count!=cols)for(size_t i=0;i<n;++i)for(size_t v=0;v<count;++v)result.mutable_data()[i*cols+first+v]=output[i*count+v];
-                ++stats["rhs_tiles"];
+                else if(wide_cih_)wide_cih_->apply(x.data(),cols,result.mutable_data(),stats);
+                else direct_->apply(x.data(),cols,result.mutable_data(),stats);
+                stats["rhs_tiles"]=1;
             }
+            if(grouped_)
+                record_peak(checked_add(retained,checked_add(arrays,grouped_->cached_bytes()-current.at("plan_cache_bytes"))),
+                            "CIH plans and product arrays");
             stats["native_total_ns"]=structured::ns(start);
         }
         return pybind11::make_tuple(result,stats);
@@ -294,13 +342,15 @@ void bind_structured(pybind11::module_ &m) {
         });
     py::class_<StructuredHamiltonian>(m,"_StructuredHamiltonian")
         .def(py::init([](const Array &one,const Array &two,std::optional<Array> core,
-                std::shared_ptr<const Basis> basis,int mode,size_t threads,size_t metadata,size_t coefficients,
-                size_t work,size_t pair_limit,std::vector<int> cpus,bool private_output,size_t cache_limit,const StructuredHamiltonian *previous,bool slot_sweep) {
+                std::shared_ptr<const Basis> basis,int mode,size_t threads,size_t memory,
+                std::vector<int> cpus,bool private_output,std::shared_ptr<HCITransferBounds> bounds,
+                const StructuredHamiltonian *previous,bool reuse,bool slot_sweep) {
             if(!basis)throw std::invalid_argument("native occupation basis is required");
             return std::make_unique<StructuredHamiltonian>(one,two,std::move(core),std::move(basis),mode,threads,
-                metadata,coefficients,work,pair_limit,std::move(cpus),private_output,cache_limit,previous,slot_sweep);
+                memory,std::move(cpus),private_output,std::move(bounds),previous,reuse,slot_sweep);
         }))
-        .def("select_hci",&StructuredHamiltonian::select_hci)
+        .def("select_hci",&StructuredHamiltonian::select_hci,pybind11::arg("weights"),
+             pybind11::arg("eps"),pybind11::arg("complete"),pybind11::arg("stop_growth_fraction")=0.)
         .def("rdms",&StructuredHamiltonian::rdms)
         .def("_generator_probe",&StructuredHamiltonian::generator_probe)
         .def("reuse_diagonal",&StructuredHamiltonian::reuse_diagonal)

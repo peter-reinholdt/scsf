@@ -4,8 +4,8 @@
 #include <algorithm>
 
 namespace scsf {
-HCITransferBounds::HCITransferBounds(const Array &one, const Array &two, size_t ordered_cap)
-    : one_(one), two_(two), ordered_cap_(ordered_cap) {
+HCITransferBounds::HCITransferBounds(const Array &one, const Array &two)
+    : one_(one), two_(two) {
     if (one.ndim()!=2 || one.shape(0)!=one.shape(1) || two.ndim()!=4)
         throw std::invalid_argument("invalid HCI bound integral dimensions");
     for (int axis=0;axis<4;++axis)
@@ -13,16 +13,26 @@ HCITransferBounds::HCITransferBounds(const Array &one, const Array &two, size_t 
             throw std::invalid_argument("invalid HCI bound integral dimensions");
 }
 
-void HCITransferBounds::prepare_transfer_bounds(int k) {
+size_t HCITransferBounds::bytes() const {
+    return (transfer_bounds_.capacity()+single_bounds_.capacity())*sizeof(double)
+        +(ordered_transfers_.capacity()+ordered_singles_.capacity())*sizeof(BoundedTransfer)
+        +ordered_offsets_.capacity()*sizeof(size_t);
+}
+
+void HCITransferBounds::prepare_transfer_bounds(int k,size_t limit) {
     std::call_once(bound_once_,[&] {
         constexpr size_t max_entries = 1000000;
         if (k < 2) return;
-        if (k<=64) prepare_single_bounds(k);
+        if(k<=64 && single_bounds_.empty()) {
+            memory_left(limit,size_t(k)*k*(k+1)*sizeof(double),"HCI single transfer bounds");
+            prepare_single_bounds(k);
+        }
         size_t count = 1;
         for (int i = 0; i < 4; ++i) {
             if (count > max_entries/static_cast<size_t>(k)) return;
             count *= static_cast<size_t>(k);
         }
+        memory_left(limit,bytes()+count*sizeof(double),"HCI transfer bounds");
         std::vector<double> values(count,0.0);
         // A minimal double transfer has disjoint hole/particle multisets.
         // Its coarse integral bound is independent of source occupations.
@@ -49,18 +59,20 @@ double HCITransferBounds::selection_bound(const Config &source, const std::array
     return transfer_bound(source,holes,particles,order,one_.data(),two_.data(),k);
 }
 
-bool HCITransferBounds::prepare_ordered_transfers(int k) {
+bool HCITransferBounds::prepare_ordered_transfers(int k,size_t limit) {
     std::call_once(ordered_once_, [&] {
-        const size_t max_bytes = ordered_cap_;
-        if (k < 2 || max_bytes/sizeof(size_t) < 2) return;
+        if (k < 2) return;
+        const size_t max_bytes = memory_left(limit,bytes(),"HCI transfer bounds");
         const size_t extent = static_cast<size_t>(k);
-        if (extent > (max_bytes/sizeof(size_t)-1)/extent) return;
+        if (max_bytes/sizeof(size_t)<2 || extent>(max_bytes/sizeof(size_t)-1)/extent)
+            throw BudgetError("ordered HCI offset table exceeds --max-mem");
         size_t offset_count = extent*extent+1;
         size_t available = max_bytes-offset_count*sizeof(size_t), count = 0;
         for (int q = 0; q < k; ++q) for (int s = q; s < k; ++s) {
             size_t slots = k-(q == s ? 1 : 2);
             size_t add = slots*(slots+1)/2;
-            if (add > available/sizeof(BoundedTransfer)-count) return;
+            if (add > available/sizeof(BoundedTransfer)-count)
+                throw BudgetError("ordered HCI double transfers exceed --max-mem");
             count += add;
         }
         std::vector<BoundedTransfer> values;
@@ -86,7 +98,8 @@ bool HCITransferBounds::prepare_ordered_transfers(int k) {
         }
         offsets.back() = values.size();
         // Account allocated capacities, including the per-hole-pair offsets.
-        if (values.capacity()*sizeof(BoundedTransfer)+offsets.capacity()*sizeof(size_t) > max_bytes) return;
+        memory_left(max_bytes,values.capacity()*sizeof(BoundedTransfer)+offsets.capacity()*sizeof(size_t),
+                    "ordered HCI double transfers");
         ordered_transfers_.swap(values);
         ordered_offsets_.swap(offsets);
     });

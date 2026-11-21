@@ -10,7 +10,9 @@ Examples (run from the repository with SCSF importable)::
 PySCF is required for the XYZ input route.
 """
 import argparse
+from collections import Counter
 from itertools import count
+import re
 from time import perf_counter
 
 import numpy as np
@@ -19,6 +21,18 @@ from ..config import default_cli_threads
 from ..csf import _configuration
 from .molecular import integrals_from_scf, run_scf
 from .solvers import solve_ci
+
+
+def memory_bytes(value):
+    match = re.fullmatch(r'([0-9]+)\s*(B|KiB|MiB|GiB|TiB)?', value.strip(), re.IGNORECASE)
+    if match is None:
+        raise argparse.ArgumentTypeError('expected bytes or an integer with a KiB, MiB, GiB or TiB suffix')
+    number, unit = match.groups()
+    power = ('b', 'kib', 'mib', 'gib', 'tib').index((unit or 'B').lower())
+    size = int(number)*1024**power
+    if size >= 1 << (np.dtype(np.uintp).itemsize*8):
+        raise argparse.ArgumentTypeError('memory limit exceeds the native byte count range')
+    return size
 
 
 def integrals(args, parser):
@@ -64,21 +78,21 @@ def build_parser():
     space.add_argument('--reference', help='initial CSF path, right-padded with zeros (e.g. 2222 or 22ud)')
     davidson.add_argument('--nroots', type=int, default=1)
     selection.add_argument('--eps', type=float, default=0.0001, help='HCI selection threshold')
+    selection.add_argument('--stop-growth-fraction', type=float, default=0.01,
+                           help='solve and stop after an append adding at most this fraction of current CSFs '
+                                '(default: 0.01; use 0 for strict HCI)')
     selection.add_argument('--max-iterations', type=int, help='optional SCI iteration cap; default: unlimited')
     products.add_argument('--kernel', choices=scsf.csf_structured_op.kernels,
                           default='nminus2', help='Hamiltonian kernel (default: nminus2)')
     selection.add_argument('--selection-unit', choices=('csf', 'configuration'), default='csf',
                            help='HCI selection unit (default: csf)')
-    selection.add_argument('--max-ordered-bytes', type=int, default=16*1024**2,
-                           help='memory ceiling for ordered HCI transfer bounds')
-    parser.add_argument('--sci-stats', action='store_true')
+    parser.add_argument('--quiet', action='store_true', help='show cycle summaries and final timings')
+    parser.add_argument('--sci-stats', action='store_true', help='show detailed phase timings and totals')
     products.add_argument('--nthreads', type=int, default=default_cli_threads(),
                           help='native workers (default: available physical cores, up to 256)')
-    products.add_argument('--max-product-scratch-bytes', type=int, default=2*1024**3,
-                          help='product array ceiling (default: 2 GiB)')
-    products.add_argument('--max-plan-bytes', type=int, help='CIH plan or particle–hole neighbor cache cap')
-    products.add_argument('--max-structured-metadata-bytes', type=int, default=8*1024**3)
-    products.add_argument('--max-structured-coefficient-bytes', type=int, default=256*1024**2)
+    products.add_argument('--max-mem', type=memory_bytes,
+                          help='shared budget for native HCI tables, schedules, coefficients, plans and product arrays '
+                               '(bytes or a size such as 4GiB, default: unlimited)')
     products.add_argument('--structured-pair-accumulation', choices=('gather','private'),
                         help='N−2 pair accumulation: gather auxiliary amplitudes or stream into private outputs')
     products.add_argument('--worker-cpus', type=int, nargs='+',
@@ -86,7 +100,7 @@ def build_parser():
     davidson.add_argument('--davidson-jd-iterations', type=int, default=0,
                         help='maximum MINRES steps per projected Jacobi–Davidson correction')
     davidson.add_argument('--davidson-block-size', type=int, default=0, help='size of the exact leading-CSF preconditioner block')
-    davidson.add_argument('--davidson-tol', type=float, default=1e-10)
+    davidson.add_argument('--davidson-tol', type=float, default=1e-6)
     davidson.add_argument('--davidson-maxiter', type=int, default=200)
     davidson.add_argument('--davidson-max-subspace', type=int)
     return parser
@@ -97,12 +111,10 @@ def configure_driver(args, parser):
         parser.error('--nthreads must be in 1..256')
     if args.structured_pair_accumulation is not None and args.kernel != 'nminus2':
         parser.error('--structured-pair-accumulation requires --kernel nminus2')
-    budgets = (args.max_product_scratch_bytes, args.max_structured_metadata_bytes,
-               args.max_structured_coefficient_bytes, args.max_ordered_bytes)
-    if min(budgets) < 0 or (args.max_plan_bytes is not None and args.max_plan_bytes < 0):
-        parser.error('memory limits must be nonnegative')
     if args.nroots < 1 or (args.max_iterations is not None and args.max_iterations < 1) or not np.isfinite(args.eps) or args.eps < 0:
         parser.error('require nroots/max-iterations >= 1 and finite eps >= 0')
+    if not 0. <= args.stop_growth_fraction <= 1.:
+        parser.error('--stop-growth-fraction must be in [0, 1]')
     if min(args.davidson_block_size, args.davidson_jd_iterations) < 0:
         parser.error('Davidson block size and JD iterations must be nonnegative')
 
@@ -134,14 +146,10 @@ def initial_space(args, parser, ham, nelec):
 def make_operator(args, ham, wfn):
     return scsf.csf_structured_op(
         ham, wfn, strategy=args.kernel, nthreads=args.nthreads, worker_cpus=args.worker_cpus,
-        max_metadata_bytes=args.max_structured_metadata_bytes,
-        max_coefficient_bytes=args.max_structured_coefficient_bytes,
-        max_product_scratch_bytes=args.max_product_scratch_bytes,
-        pair_accumulation=args.structured_pair_accumulation,
-        max_plan_bytes=args.max_plan_bytes, max_ordered_bytes=args.max_ordered_bytes)
+        max_mem=args.max_mem, pair_accumulation=args.structured_pair_accumulation)
 
 
-def diagonalize(args, op, c0=None):
+def diagonalize(args, op, c0=None, *, measurements=None, progress=False):
     roots, size = min(args.nroots, op.shape[0]), op.shape[0]
     limit = args.davidson_max_subspace
     if limit is not None:
@@ -150,6 +158,7 @@ def diagonalize(args, op, c0=None):
     diagonal = op.native_diagonal()
     diagonal_seconds = perf_counter()-start
     preconditioner_block = None
+    preconditioner_memory_peak = 0
     block_start = perf_counter()
     if args.davidson_block_size:
         rows = np.arange(size)
@@ -159,21 +168,60 @@ def diagonalize(args, op, c0=None):
         subspace = scsf.csf_wfn(basis['nbasis'], basis['nelec'], basis['two_s'])
         for label in op.native_labels(rows):
             subspace.add_csf(label)
-        preconditioner_block = rows, op.with_basis(subspace).matmat(np.eye(len(rows)))
+        block_op = op.with_basis(subspace, concurrent=True)
+        preconditioner_block = rows, block_op.matmat(np.eye(len(rows)))
+        preconditioner_memory_peak = (op.product_info['tracked_memory_bytes']
+                                      + block_op.product_info['peak_tracked_memory_bytes'])
+        del block_op
     block_seconds = perf_counter()-block_start
-    stats = {} if args.sci_stats else None
-    energies, vectors, converged = solve_ci(op.native_matmat, diagonal, roots=roots, c0=c0,
-        tol=args.davidson_tol, maxiter=args.davidson_maxiter, max_subspace=limit, stats=stats,
+    stats = {} if measurements is not None or args.sci_stats or progress else None
+    products = {}
+
+    def measured_product(vectors, phase='solver'):
+        start = perf_counter()
+        result = op.native_matmat(vectors)
+        elapsed = perf_counter()-start
+        width = vectors.shape[1]
+        key = f'{phase}/{width}'
+        if phase == 'solver' and not products:
+            key = f'first/{width}'
+        bucket = products.setdefault(key, {'calls': 0, 'seconds': 0., 'native': {}})
+        bucket['calls'] += 1
+        bucket['seconds'] += elapsed
+        for name, value in op.last_product_stats.items():
+            if name.endswith('_ns') or name in ('plan_hits', 'plans_built'):
+                native = bucket['native']
+                native[name] = native.get(name, 0) + value
+        return result
+
+    product = measured_product if stats is not None else op.native_matmat
+    energies, vectors, converged = solve_ci(product, diagonal, roots=roots, c0=c0,
+        tol=args.davidson_tol, maxiter=args.davidson_maxiter, max_subspace=limit, stats=stats, verbose=progress,
         preconditioner_block=preconditioner_block, jd_iterations=args.davidson_jd_iterations)
-    residual = np.linalg.norm(op.native_matmat(vectors)-vectors*energies, axis=0)
-    if not converged or np.any(residual > args.davidson_tol):
+    start = perf_counter()
+    image = measured_product(vectors, 'residual') if stats is not None else product(vectors)
+    residual = np.linalg.norm(image-vectors*energies, axis=0)
+    residual_seconds = perf_counter()-start
+    if not converged or not np.all(residual <= args.davidson_tol):
         raise RuntimeError(f'Davidson did not converge, exact residuals {residual}')
-    if stats is not None:
+    if progress:
+        solve_seconds = stats['total_ns']*1e-9
+        print(f'  Davidson converged in {solve_seconds:.3f} s, diagonal {diagonal_seconds:.3f} s, '
+              f'preconditioner {block_seconds:.3f} s, verification {residual_seconds:.3f} s, '
+              f'verified max residual={np.max(residual):.3e} Eh', flush=True)
+    if measurements is not None:
+        measurements.update(solver=stats, products=products, diagonal_seconds=diagonal_seconds,
+                            preconditioner_seconds=block_seconds, residual_seconds=residual_seconds,
+                            residuals=residual.tolist(), preconditioner_memory_peak=preconditioner_memory_peak)
+    if args.sci_stats:
         print(f'cycle setup={op.setup_seconds:.6f} diagonal={diagonal_seconds:.6f} '
               f'preconditioner={block_seconds:.6f} product={stats["product_ns"]*1e-9:.6f} '
               f'product_calls={stats["product_calls"]} product_columns={stats["product_columns"]} '
               f'jd_product_calls={stats["jd_product_calls"]} '
-              f'davidson={(stats["total_ns"]-stats["product_ns"])*1e-9:.6f} residuals={residual}')
+              f'davidson={(stats["total_ns"]-stats["product_ns"])*1e-9:.6f} '
+              f'verification={residual_seconds:.6f} residuals={residual}')
+        print(f'solver {stats}')
+        print(f'products_by_phase_width {products}')
     return energies+op.ecore, vectors
 
 
@@ -186,42 +234,140 @@ def grow_guess(vectors, size, remap=None):
     return result
 
 
+def print_timings(timing, wall):
+    rows = [
+        ('Integrals', timing['integrals']),
+        ('Initial operator setup', timing['initial_setup']),
+        ('Hamiltonian diagonal', timing['diagonal']),
+        ('Davidson preconditioner setup', timing['preconditioner']),
+        ('Hamiltonian products inside Davidson', timing['solver_products']),
+        ('Ritz projection and solve', timing['ritz']),
+        ('Davidson orthogonalization', timing['orthogonalization']),
+        ('Davidson restarts', timing['restart']),
+        ('Other Davidson work', timing['solver_bookkeeping']),
+        ('Independent residual checks', timing['residual']),
+        ('HCI selection', timing['selection']),
+        ('Basis extension', timing['basis_extend']),
+        ('Operator replacement and diagonal reuse', timing['replacement'] + timing['diagonal_reuse']),
+        ('Selection bookkeeping and guess remap', timing['selection_overhead'] + timing['guess_remap']),
+    ]
+    rows += [('Other driver overhead', max(0., wall-sum(seconds for _, seconds in rows))),
+             ('Total', wall)]
+    width = max(len(label) for label, _ in rows)
+    print(f'\n{"Phase":<{width}}  {"Wall (s)":>10}  {"Share":>7}')
+    for label, seconds in rows:
+        print(f'{label:<{width}}  {seconds:10.3f}  {seconds/wall:7.1%}')
+
+
 def main(argv=None):
+    started = perf_counter()
     parser = build_parser()
     args = parser.parse_args(argv)
     configure_driver(args, parser)
+    try:
+        run_hci(args, parser, started)
+    except MemoryError as exc:
+        parser.exit(1, f'{parser.prog}: {exc}\n')
+
+
+def run_hci(args, parser, started):
+    progress = not args.quiet
+    timing = Counter()
+    preconditioner_memory_peak = 0
+    if progress:
+        print(f'Loading integrals from {args.integrals or args.xyz}', flush=True)
+    start = perf_counter()
     ham, nelec = integrals(args, parser)
+    timing['integrals'] = perf_counter()-start
+    start = perf_counter()
     wfn, dimension = initial_space(args, parser, ham, nelec)
     op = make_operator(args, ham, wfn)
+    timing['initial_setup'] = perf_counter()-start
+    if args.sci_stats:
+        print(f'driver_startup_seconds={perf_counter()-started:.6f} cpus={args.worker_cpus}')
+    print(f'{op.strategy}, {args.selection_unit} HCI selection, Davidson: '
+          f'N={nelec}, 2S={args.two_s}, orbitals={ham.nbasis}, full dimension={dimension}')
 
-    def product_stats():
+    def solve_step(iteration, added=0, guess=None, *, final=False):
+        nonlocal preconditioner_memory_peak
+        if progress:
+            stage = 'Final Davidson solve' if final else 'Davidson solve'
+            print(f'HCI step {iteration} | {stage} for {op.shape[0]:,} CSFs '
+                  f'(residual tolerance {args.davidson_tol:g} Eh)', flush=True)
+        measurements = {}
+        energies, vectors = diagonalize(args, op, guess, measurements=measurements, progress=progress)
+        for phase in ('diagonal', 'preconditioner', 'residual'):
+            timing[phase] += measurements[f'{phase}_seconds']
+        solver = measurements['solver']
+        preconditioner_memory_peak = max(preconditioner_memory_peak, measurements['preconditioner_memory_peak'])
+        for phase in ('ritz', 'orthogonalization', 'restart'):
+            timing[phase] += solver[f'{phase}_ns']*1e-9
+        timing['solver_products'] += solver['product_ns']*1e-9
+        timing['solver_other'] += (solver['total_ns']-solver['product_ns'])*1e-9
+        timing['solver_bookkeeping'] += solver['other_ns']*1e-9
+        addition = f' added={added}' if added else ''
+        values = ' '.join(f'{energy:.12f}' for energy in energies)
+        print(f'iteration={iteration}{addition} ncsf={op.shape[0]} energies=[{values}]', flush=True)
         if args.sci_stats:
             print(f'kernel {op.product_info}')
             print(f'product {op.last_product_stats}')
+        return energies, vectors
 
-    energies, vectors = diagonalize(args, op)
-    print(f'{op.strategy}, {args.selection_unit} HCI selection, Davidson: '
-          f'N={nelec}, 2S={args.two_s}, orbitals={ham.nbasis}, full dimension={dimension}')
-    print(f'iteration=0 ncsf={op.shape[0]} energies={energies}')
-    product_stats()
+    energies, vectors = solve_step(0)
     for iteration in count(1):
         if args.max_iterations is not None and iteration>args.max_iterations:
             raise RuntimeError('HCI did not stop within max-iterations')
+        old_size = op.shape[0]
+        if progress:
+            print(f'HCI step {iteration} | Selecting from {old_size:,} CSFs at eps={args.eps:g}', flush=True)
+        start = perf_counter()
         weights = np.max(np.abs(vectors), axis=1)
+        weights_seconds = perf_counter()-start
+        start = perf_counter()
         remap, stats = op.select_hci(weights, args.eps, selection_unit=args.selection_unit)
+        selection_seconds = perf_counter()-start
+        breakdown = {phase: stats.get(f'{phase}_ns', 0)*1e-9
+                     for phase in ('selection', 'basis_extend', 'replacement', 'diagonal_reuse')}
+        timing.update(breakdown)
+        timing['weights'] += weights_seconds
+        timing['selection_update'] += selection_seconds
+        timing['selection_overhead'] += weights_seconds + selection_seconds - sum(breakdown.values())
         if args.sci_stats:
             print(f'selection {stats}')
+            print(f'growth weights={weights_seconds:.6f} selection_and_update={selection_seconds:.6f}')
         added = stats['added']
         if not added:
             if len(energies)<args.nroots:
                 raise RuntimeError('selection stopped before reaching nroots. Lower --eps or choose another --reference.')
+            if progress:
+                print(f'HCI converged with zero additions ({selection_seconds:.3f} s)', flush=True)
             break
+        fraction = added/old_size
+        final = fraction <= args.stop_growth_fraction and op.shape[0] >= args.nroots
+        if progress:
+            print(f'  Added {added:,} CSFs ({fraction:.3%}), now {op.shape[0]:,} '
+                  f'({selection_seconds:.3f} s for selection and update)', flush=True)
+        if final:
+            print(f'HCI growth cutoff reached ({fraction:.3%} ≤ {args.stop_growth_fraction:.3%}). '
+                  'Solving the enlarged space and stopping.', flush=True)
+        start = perf_counter()
         guess = grow_guess(vectors, op.shape[0], remap)
-        energies, vectors = diagonalize(args, op, guess)
-        print(f'iteration={iteration} added={added} ncsf={op.shape[0]} energies={energies}')
-        product_stats()
+        remap_seconds = perf_counter()-start
+        timing['guess_remap'] += remap_seconds
+        if args.sci_stats:
+            print(f'guess remap={remap_seconds:.6f}')
+        energies, vectors = solve_step(iteration, added, guess, final=final)
+        if final:
+            break
     for root, energy in enumerate(energies):
         print(f'root={root} energy={energy:.12f} hartree')
+    wall = perf_counter()-started
+    print_timings(timing, wall)
+    peak_memory = max(op.product_info['peak_tracked_memory_bytes'], preconditioner_memory_peak)
+    print(f'Tracked native peak memory {peak_memory/1024**2:.2f} MiB')
+    if args.sci_stats:
+        print('timing_seconds ' + ' '.join(f'{phase}={seconds:.6f}' for phase, seconds in timing.items()))
+        print(f'driver_wall_seconds={wall:.6f}')
 
 
 if __name__ == '__main__':

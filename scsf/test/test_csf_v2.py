@@ -25,7 +25,7 @@ def test_native_layout_against_fock_space(k, n, s, partial, kernel):
     labels = tuple(full)[::-2] if partial else tuple(full)
     w = wavefunction(k, n, s, labels)
     ref = hamiltonian_block(ham, labels, labels, s)
-    op = scsf.csf_structured_op(ham, w, strategy=kernel, nthreads=2, max_product_scratch_bytes=0)
+    op = scsf.csf_structured_op(ham, w, strategy=kernel, nthreads=2)
     assert tuple(op.labels()) == labels
     if not partial:
         assert op.product_info['rank_map_bytes'] == 0
@@ -37,7 +37,6 @@ def test_native_layout_against_fock_space(k, n, s, partial, kernel):
         x = np.random.default_rng(32+width).normal(size=(len(w), width))
         np.testing.assert_allclose(op.matmat(x), ref@x, atol=1e-12)
         np.testing.assert_allclose(op.native_matmat(x[order]), native_ref@x[order], atol=1e-12)
-    assert op.last_product_stats['serial_streaming_fallback'] == int(kernel != 'nminus1' or n != 0)
 
 
 def test_wide_occupations_and_empty_space():
@@ -93,6 +92,39 @@ def test_native_growth_strict_hci_and_remap(complete):
     np.testing.assert_allclose(op.diagonal(), fresh.diagonal(), atol=1e-12)
 
 
+def test_hci_single_transfer_threshold_is_strict():
+    one = np.diag(np.arange(4, dtype=float))
+    one[0, 1] = one[1, 0] = .125
+    ham = scsf.Hamiltonian(0., one, np.zeros((4,)*4))
+    basis = wavefunction(4, 1, 1, ['u000'])
+    op = scsf.csf_structured_op(ham, basis, nthreads=1)
+    for eps in (np.nextafter(.125, np.inf), .125):
+        _, stats = op.select_hci([1.], eps)
+        assert stats['added'] == 0
+        assert stats['ordered_singles']
+    _, stats = op.select_hci([1.], np.nextafter(.125, 0.))
+    assert stats['added'] == 1
+    assert tuple(op.labels(native=True)) == ('u000', '0u00')
+
+
+def test_nminus1_reuses_integral_layout_after_growth():
+    ham = random_hamiltonian(4, seed=197)
+    basis = wavefunction(4, 4, 0, ['2200'])
+    op = scsf.csf_structured_op(ham, basis, strategy='nminus1', nthreads=1)
+    old = op.product_info
+    _, stats = op.select_hci([1.], .04, selection_unit='configuration')
+    assert stats['added'] > 0
+    new = op.product_info
+    assert new['reused_auxiliary_integrals'] == 1
+    assert new['auxiliary_integral_bytes'] == old['auxiliary_integral_bytes'] > 0
+    assert new['removal_metadata_overlap_bytes'] == (
+        old['metadata_bytes'] + new['metadata_build_bytes'] - new['auxiliary_integral_bytes'])
+    labels = list(op.labels(native=True))
+    fresh = scsf.csf_structured_op(ham, wavefunction(4, 4, 0, labels), strategy='nminus1', nthreads=1)
+    trial = np.random.default_rng(5).normal(size=(len(labels), 1))
+    np.testing.assert_allclose(op.native_matmat(trial), fresh.native_matmat(trial), atol=1e-12)
+
+
 @pytest.mark.parametrize('kernel', scsf.csf_structured_op.kernels)
 def test_signed_native_cih_fixture(kernel):
     root = Path(__file__).resolve().parents[2]
@@ -133,32 +165,49 @@ def test_signed_native_cih_fixture(kernel):
 def test_native_builder_failure_preserves_generation():
     ham = random_hamiltonian(4, seed=197)
     w = wavefunction(4, 4, 0, ('2200',))
-    probe = scsf.csf_structured_op(ham, w, max_pair_integral_bytes=0)
-    cap = probe.product_info['metadata_build_bytes']
-    op = scsf.csf_structured_op(ham, w, max_metadata_bytes=cap,
-                               max_pair_integral_bytes=0)
+    probe = scsf.csf_structured_op(ham, w, nthreads=1)
+    probe.select_hci([1.], 1e8)
+    cap = max(probe.product_info['peak_tracked_memory_bytes'],
+              probe.product_info['tracked_memory_bytes'])
+    op = scsf.csf_structured_op(ham, w, max_mem=cap, nthreads=1)
     expected = op.matvec([1.])
-    with pytest.raises(MemoryError):
+    with pytest.raises(MemoryError, match='max-mem'):
         op.select_hci([1.], .04, selection_unit='configuration')
     assert tuple(op.labels()) == ('2200',)
     np.testing.assert_array_equal(op.matvec([1.]), expected)
 
 
 @pytest.mark.parametrize('kernel', ['cih', 'particle-hole'])
-def test_bounded_cache(kernel):
+def test_neighbor_and_plan_caches_share_the_memory_cap(kernel):
     w = wavefunction(4, 4, 0, ['udud','2200','0022','uudd','2002','u0d2'])
     ham = random_hamiltonian(4, seed=653)
     x = np.random.default_rng(46).normal(size=(len(w), 8))
     ref = hamiltonian_block(ham, tuple(w), tuple(w), 0)@x
-    for cap in (0, 16384):
-        op = scsf.csf_structured_op(ham, w, strategy=kernel, nthreads=3, max_plan_bytes=cap)
-        for step in range(2):
-            np.testing.assert_allclose(op.matmat(x), ref, atol=1e-12)
-            if kernel == 'cih':
-                assert op.product_info['plan_cache_bytes'] <= cap
-                assert bool(op.last_product_stats['plan_hits']) == bool(step and cap)
-            else:
-                assert bool(op.product_info['retained_string_connections']) == bool(cap)
+    probe = scsf.csf_structured_op(ham, w, strategy=kernel, nthreads=3)
+    probe.matmat(x)
+    cap = probe.product_info['peak_tracked_memory_bytes']
+    op = scsf.csf_structured_op(ham, w, strategy=kernel, nthreads=3, max_mem=cap)
+    for _ in range(2):
+        np.testing.assert_allclose(op.matmat(x), ref, atol=1e-12)
+        assert op.product_info['peak_tracked_memory_bytes'] == cap
+    if kernel == 'cih':
+        assert op.last_product_stats['plan_hits'] == op.product_info['configurations']
+    else:
+        assert op.product_info['cached_strings'] == op.product_info['main_strings']
+    with pytest.raises(MemoryError):
+        insufficient = scsf.csf_structured_op(ham, w, strategy=kernel, nthreads=3, max_mem=cap-1)
+        insufficient.matmat(x)
+
+
+def test_hci_tables_share_the_memory_cap_with_operator():
+    ham = random_hamiltonian(5)
+    w = wavefunction(5, 4, 0, ['22000'])
+    probe = scsf.csf_structured_op(ham, w, strategy='cih', nthreads=1)
+    cap = probe.product_info['peak_tracked_memory_bytes']
+    limited = scsf.csf_structured_op(ham, w, strategy='cih', nthreads=1, max_mem=cap)
+    with pytest.raises(MemoryError, match='HCI'):
+        limited.select_hci([1.], .1)
+    assert tuple(limited.labels()) == ('22000',)
 
 
 def test_grouped_cih_reuses_only_plans_unaffected_by_appended_occupations():
@@ -239,17 +288,21 @@ def test_factor_only_native_selection_and_solve():
     assert new.product_info['eri_storage_bytes'] < old.product_info['eri_storage_bytes']
 
 
-def test_nminus2_batched_owner_gather():
+def test_nminus2_owner_gather_requires_space_for_full_trial_block():
     h = random_hamiltonian(5, seed=19)
     w = scsf.csf_wfn(5, 4, 0)
     w.add_all_csfs()
-    op = scsf.csf_structured_op(h, w, pair_accumulation='gather',
-                               nthreads=2, max_product_scratch_bytes=512)
-    x = np.random.default_rng(19).normal(size=(len(w), 3))
+    probe = scsf.csf_structured_op(h, w, pair_accumulation='gather', nthreads=2)
+    info = probe.product_info
+    cap = max(info['peak_tracked_memory_bytes'],
+              info['tracked_memory_bytes'] + info['product_array_bytes_per_rhs'])
+    op = scsf.csf_structured_op(h, w, pair_accumulation='gather', nthreads=2, max_mem=cap)
+    columns = (cap-info['tracked_memory_bytes'])//info['product_array_bytes_per_rhs'] + 1
+    with pytest.raises(MemoryError, match='product arrays'):
+        op.matmat(np.ones((len(w), columns)))
+    x = np.random.default_rng(19).normal(size=len(w))
     ref = hamiltonian_block(h, tuple(w), tuple(w), 0)@x
-    np.testing.assert_allclose(op.matmat(x), ref, atol=1e-12)
-    assert op.last_product_stats['residue_batches'] > 3
-    assert op.last_product_stats['product_array_bytes'] <= 512
+    np.testing.assert_allclose(op.matvec(x), ref, atol=1e-12)
 
 
 def test_nminus2_rank_only_replacement_shares_immutable_topology():
@@ -289,15 +342,12 @@ def test_factor_providers_all_kernels(kernel):
             assert op.product_info['grouped_dense_eri_bytes'] == 0
 
 
-@pytest.mark.parametrize('kernel', ['cih', 'particle-hole'])
-def test_generator_template_budget_falls_back_to_exact_rows(kernel):
+@pytest.mark.parametrize('kernel', ['cih', 'particle-hole', 'nminus1', 'nminus2'])
+def test_operator_rejects_insufficient_memory(kernel):
     h = random_hamiltonian(4)
     w = wavefunction(4, 4, 0, ['2200', 'udud', '0022', 'ud20'])
-    op = scsf.csf_structured_op(h, w, strategy=kernel, max_coefficient_bytes=0)
-    ref = hamiltonian_block(h, tuple(w), tuple(w), 0)
-    np.testing.assert_allclose(op.matmat(np.eye(len(w))), ref, atol=1e-12)
-    assert op.product_info['row_guga_fallback']
-    assert op.last_product_stats['row_guga_pairs'] > 0
+    with pytest.raises(MemoryError):
+        scsf.csf_structured_op(h, w, strategy=kernel, max_mem=0)
 
 
 def test_exact_block_preconditioner():
@@ -363,14 +413,15 @@ def test_new_occupations_merge_nminus2_removal_postings(accumulation):
         fresh = scsf.csf_structured_op(h, fresh_wfn, pair_accumulation=accumulation)
         trial = np.random.default_rng(19).normal(size=(count+1, 3))
         np.testing.assert_allclose(op.matmat(trial), fresh.matmat(trial), atol=1e-12)
+        np.testing.assert_allclose(op.matvec(trial[:, 0]), fresh.matmat(trial)[:, 0], atol=1e-12)
         np.testing.assert_allclose(op.diagonal(), fresh.diagonal(), atol=1e-12)
 
 
 def test_cih_slot_sweep_matches_immediate_probes():
     h = random_hamiltonian(5, seed=15)
     w = wavefunction(5, 4, 0, ['22000','00220','uudd0','ud020','22000','u0d02'])
-    a = scsf.csf_structured_op(h, w, strategy='cih', max_plan_bytes=0)
-    b = scsf.csf_structured_op(h, w, strategy='cih', cih_slot_sweep=True, max_plan_bytes=0)
+    a = scsf.csf_structured_op(h, w, strategy='cih')
+    b = scsf.csf_structured_op(h, w, strategy='cih', cih_slot_sweep=True)
     x = np.random.default_rng(25).normal(size=(len(w), 2))
     np.testing.assert_allclose(b.matmat(x), a.matmat(x), atol=1e-13)
     assert b.last_product_stats['slot_sweep_probes'] > 0

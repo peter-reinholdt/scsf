@@ -59,7 +59,7 @@ def davidson_response(A, b, hdiag, tol=1e-4, maxiter=100, verbose=False, guess=N
 
 def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
              reference_state=None, max_subspace=None, stats=None,
-             preconditioner_block=None, jd_iterations=0):
+             preconditioner_block=None, jd_iterations=0, recycle=None):
     """Block Davidson for a real symmetric electronic Hamiltonian.
 
     Optional ``stats`` is filled with nonoverlapping wall timings, product
@@ -71,6 +71,8 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
     may be a vector or a block, including zero-padded guesses after selection.
     An optional exact principal block replaces the diagonal preconditioner
     on its selected rows.
+    Optional ``recycle`` receives the lowest unused Ritz directions on
+    convergence, up to its column count. Unused columns are zeroed.
     Positive ``jd_iterations`` uses bounded MINRES corrections in the
     orthogonal complement of each Ritz vector. The outer residual still
     uses the supplied exact operator.
@@ -113,6 +115,9 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
         raise ValueError('hdiag must be a finite real vector')
     hdiag = np.asarray(hdiag, dtype=float)
     dim, roots = len(hdiag), index(roots)
+    if recycle is not None and (not isinstance(recycle, np.ndarray) or recycle.ndim != 2
+            or recycle.shape[0] != dim or recycle.dtype != np.dtype(float) or not recycle.flags.writeable):
+        raise ValueError('recycle must be a writable float array with one row per basis state')
     if not 1 <= roots <= dim or not np.isfinite(tol) or tol <= 0 or maxiter < 1:
         raise ValueError('require 1 <= roots <= dimension, tol > 0 and maxiter >= 1')
     maxiter = index(maxiter)
@@ -262,6 +267,7 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
         V = np.column_stack((V, supplement(V, nseed)))
     AV = apply(V)
     projected = project_basis(V, AV)
+    previous_report = started
     for iteration in range(maxiter):
         ritz_start = perf_counter_ns() if stats is not None else 0
         if stats is not None: stats['iterations'] = iteration + 1
@@ -278,9 +284,17 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
         norms = np.linalg.norm(residual, axis=0)
         if stats is not None: stats['ritz_ns'] += perf_counter_ns() - ritz_start
         if verbose:
-            for k in range(len(L)):
-                print(f'{iteration+1}       {k+1}   {L[k]:.12e}    {norms[k]:.6e}')
+            reported = perf_counter_ns()
+            for root, (energy, norm) in enumerate(zip(L, norms)):
+                print(f'  Davidson iter {iteration+1:3d} | subspace={V.shape[1]:3d} | root={root} | '
+                      f'electronic E={energy:.12f} Eh | residual={norm:.3e} Eh | '
+                      f'wall={(reported-previous_report)*1e-9:.3f} s', flush=True)
+            previous_report = perf_counter_ns()
         if np.all(norms < tol) and found_reference:
+            if recycle is not None:
+                recycle.fill(0.)
+                extra = rotations[:, nkeep:nkeep+recycle.shape[1]]
+                recycle[:, :extra.shape[1]] = V @ extra
             return finish(L, X, True)
         if iteration+1 == maxiter:
             return finish(L, X, False)

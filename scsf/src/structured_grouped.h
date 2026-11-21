@@ -57,7 +57,7 @@ class GroupedUGA {
     std::vector<Parent> parents_;
     std::vector<std::shared_ptr<const Plan>> cache_;
     std::vector<Scratch> scratch_;
-    size_t fixed_bytes_=0,cache_limit_=0,complete_=0,reused_plans_=0;
+    size_t fixed_bytes_=0,build_bytes_=0,complete_=0,reused_plans_=0;
     std::atomic<size_t> cache_bytes_{0},cached_plans_{0};
 
     static Word bit(unsigned i) {return Word(1)<<i;}
@@ -86,10 +86,6 @@ class GroupedUGA {
     size_t find_slot(const Occupations &key,Word value) const {
         const size_t mask=slots_.size()-1;
         size_t i=value&mask;
-        if(fingerprints_.empty()) {
-            i=probe_slot(slots_,key,i);
-            return slots_[i].count ? i : none;
-        }
         // Most generator probes miss. Scan compact control bytes and load
         // the full occupation only after a fingerprint match.
         const auto tag=fingerprint(value);
@@ -256,25 +252,22 @@ class GroupedUGA {
     static size_t plan_bytes(const Plan &plan) {
         return sizeof(Plan)+2*sizeof(void *)+plan.words.size()*sizeof(Word);
     }
-    void retain(unsigned g,const Plan &plan) {
-        if(cache_.empty())return;
+    void retain(unsigned g,const Plan &plan,size_t limit) {
         const size_t bytes=plan_bytes(plan);
         auto used=cache_bytes_.load(std::memory_order_relaxed);
-        while(bytes<=cache_limit_-used) {
-            if(cache_bytes_.compare_exchange_weak(used,used+bytes,std::memory_order_relaxed)) {
-                try {
-                    cache_[g]=std::make_shared<const Plan>(plan);
-                } catch (...) {
-                    cache_bytes_.fetch_sub(bytes,std::memory_order_relaxed);
-                    throw;
-                }
-                cached_plans_.fetch_add(1,std::memory_order_relaxed);
-                return;
-            }
+        do {
+            memory_left(limit,checked_add(used,bytes),"CIH plan cache");
+        } while(!cache_bytes_.compare_exchange_weak(used,used+bytes,std::memory_order_relaxed));
+        try {
+            cache_[g]=std::make_shared<const Plan>(plan);
+        } catch (...) {
+            cache_bytes_.fetch_sub(bytes,std::memory_order_relaxed);
+            throw;
         }
+        cached_plans_.fetch_add(1,std::memory_order_relaxed);
     }
 
-    template<size_t Inner>void apply_links_vector(unsigned source,const Word *begin,const Word *end,
+    template<size_t Inner,bool Sparse=false>void apply_links_vector(unsigned source,const Word *begin,const Word *end,
         unsigned first_pair,const Matrix &a,const double *input,double *output,
         const double *forward,double *backward) const {
         const size_t inner=Inner ? Inner : a.rows;
@@ -285,6 +278,20 @@ class GroupedUGA {
             const double scale=integral(first_pair,second_pair)*(first_pair==second_pair ? 0.5 : 1.);
             const size_t offset=first(target),n=count(target);
             const bool transpose=target!=source;
+            if constexpr(Sparse)if(groups_[target].complete) {
+                for(size_t i=0;i<n;++i) {
+                    const double x=scale*input[offset+i];
+                    double sum=0.;
+                    for(size_t j=b.ptr[i];j<b.ptr[i+1];++j) {
+                        const auto col=b.indices[j];
+                        const double value=b.data[j];
+                        sum+=value*forward[col];
+                        if(transpose)backward[col]+=value*x;
+                    }
+                    output[offset+i]+=scale*sum;
+                }
+                continue;
+            }
             for(size_t i=0;i<n;++i) {
                 const double *row=b.values.data()+rank(target,i)*inner;
                 const double x=scale*input[offset+i];
@@ -345,6 +352,12 @@ class GroupedUGA {
                     case 1: apply_links_vector<1>(g,begin,stop,pq,a,input,output,forward,backward); break;
                     case 2: apply_links_vector<2>(g,begin,stop,pq,a,input,output,forward,backward); break;
                     case 5: apply_links_vector<5>(g,begin,stop,pq,a,input,output,forward,backward); break;
+                    // This intermediate rank has mostly structural zeros.
+                    case 14:
+                        if(groups_[g].complete)
+                            apply_links_vector<14,true>(g,begin,stop,pq,a,input,output,forward,backward);
+                        else apply_links_vector<0>(g,begin,stop,pq,a,input,output,forward,backward);
+                        break;
                     default: apply_links_vector<0>(g,begin,stop,pq,a,input,output,forward,backward);
                 }
                 pos=end;
@@ -378,9 +391,10 @@ class GroupedUGA {
 
 public:
     GroupedUGA(const Primary &p,const double *h,const SpatialERI &integrals,Workers &w,
-               size_t metadata,size_t coefficients,size_t plan_limit=std::numeric_limits<size_t>::max(),bool slot_sweep=false):
-        primary_(p),workers_(w),bank_(cih_template_electrons(p),p.s,coefficients,true),k_(p.k),k2_(k_*k_),
+               size_t budget,bool slot_sweep=false):
+        primary_(p),workers_(w),bank_(cih_template_electrons(p),p.s,budget,true),k_(p.k),k2_(k_*k_),
         orbitals_(k_==64 ? ~Word(0) : bit(k_)-1),integrals_(integrals),slot_sweep_(slot_sweep),scratch_(w.count()) {
+        const size_t metadata=memory_left(budget,bank_.bytes(),"CIH spin coefficients");
         if(p.size()>=no_plan)throw BudgetError("grouped UGA basis exceeds index capacity");
         groups_.reserve(p.groups.size());
         for(const auto &g:p.groups) {
@@ -400,7 +414,8 @@ public:
             removals([&](const Occupations &key,unsigned,unsigned) {
                 if(!slots_[slot_index(slots_,key)].count) {
                     if(keys>=slots_.size()*2/3) {
-                        if(slots_.size()>slot_limit/2)throw BudgetError("grouped UGA residue hash exceeds metadata budget");
+                        if(slots_.size()>slot_limit/3)throw BudgetError("CIH residue hash resize exceeds --max-mem");
+                        build_bytes_=std::max(build_bytes_,fixed_bytes_+3*slots_.size()*sizeof(Slot));
                         std::vector<Slot> grown(slots_.size()*2);
                         for(const auto &entry:slots_)if(entry.count)grown[slot_index(grown,entry.key)]=entry;
                         slots_.swap(grown);
@@ -424,19 +439,17 @@ public:
                 parents_[--entry.first]={group,orbital};
             });
             fixed_bytes_+=parents_.capacity()*sizeof(Parent);
-            if(slots_.size()<=metadata-fixed_bytes_) {
-                fingerprints_.resize(slots_.size());
-                workers_.run(slots_.size(),[&](size_t i,size_t) {
-                    if(slots_[i].count)fingerprints_[i]=fingerprint(hash(slots_[i].key));
-                },512);
-                fixed_bytes_+=fingerprints_.capacity();
-            }
+            memory_left(metadata-fixed_bytes_,slots_.size(),"CIH hash fingerprints");
+            fingerprints_.resize(slots_.size());
+            workers_.run(slots_.size(),[&](size_t i,size_t) {
+                if(slots_[i].count)fingerprints_[i]=fingerprint(hash(slots_[i].key));
+            },512);
+            fixed_bytes_+=fingerprints_.capacity();
         }
-        if(plan_limit && groups_.size() && groups_.size()<=(metadata-fixed_bytes_)/sizeof(cache_[0])) {
-            cache_.resize(groups_.size());
-            fixed_bytes_+=cache_.capacity()*sizeof(cache_[0]);
-            cache_limit_=std::min(plan_limit,metadata-fixed_bytes_);
-        }
+        memory_left(metadata-fixed_bytes_,groups_.size()*sizeof(cache_[0]),"CIH plan directory");
+        cache_.resize(groups_.size());
+        fixed_bytes_+=cache_.capacity()*sizeof(cache_[0]);
+        build_bytes_=std::max(build_bytes_,fixed_bytes_);
 
         // H = K E + sum_(pq<rs) (pq|rs) E_pq E_rs + 1/2 sum_pq (pq|pq) E_pq^2.
         // K includes both normal ordering and the generator commutator.
@@ -487,8 +500,8 @@ public:
         size_t used=0;
         for(auto &plan:cache_)if(plan) {
             const size_t bytes=plan_bytes(*plan);
-            if(bytes>cache_limit_-used)plan.reset();
-            else {used+=bytes;++reused_plans_;}
+            used=checked_add(used,bytes);
+            ++reused_plans_;
         }
         cache_bytes_.store(used,std::memory_order_relaxed);
         cached_plans_.store(reused_plans_,std::memory_order_relaxed);
@@ -498,18 +511,19 @@ public:
         cih_diagonal(primary_.groups[group],bank_,h,coulomb,exchange,k_,result);
     }
     size_t entries() const {return workers_.count()>1 ? primary_.size()*workers_.count() : 0;}
+    size_t cached_bytes() const {return cache_bytes_.load(std::memory_order_relaxed);}
     Stats info() const {
-        size_t cached=cache_bytes_.load(std::memory_order_relaxed);
-        return {{"metadata_bytes",fixed_bytes_+cached},{"coefficient_bytes",bank_.bytes()},
+        size_t cached=cached_bytes();
+        return {{"metadata_bytes",fixed_bytes_+cached},{"metadata_build_bytes",build_bytes_},{"coefficient_bytes",bank_.bytes()},
             {"grouped_uga",1},{"slot_sweep",slot_sweep_},{"grouped_dense_eri_bytes",eri_.capacity()*sizeof(double)},{"complete_configurations",complete_},{"residue_links",parents_.size()},
-            {"plan_cache_bytes",cached},{"plan_cache_limit",cache_limit_},
+            {"plan_cache_bytes",cached},
             {"cached_plans",cached_plans_.load(std::memory_order_relaxed)},{"reused_plans",reused_plans_},
             {"workspace_entries_per_rhs",entries()}};
     }
-    void apply(const double *x,size_t cols,double *y,Stats &stats,bool serial=false) {
+    void apply(const double *x,size_t cols,double *y,Stats &stats,size_t plan_limit) {
         if(groups_.empty())return;
         auto start=Clock::now();
-        size_t n=primary_.size(),stride=n*cols,nworkers=serial ? 1 : workers_.count();
+        size_t n=primary_.size(),stride=n*cols,nworkers=workers_.count();
         std::unique_ptr<double[]> output(nworkers>1 ? new double[nworkers*stride] : nullptr);
         if(nworkers>1)workers_.each_worker([&](size_t w) {
             std::fill_n(output.get()+w*stride,stride,0.);
@@ -517,19 +531,18 @@ public:
         for(auto &scratch:scratch_)scratch.built=scratch.hits=scratch.swept=0;
         auto run=[&](size_t g,size_t w) {
             auto &scratch=scratch_[w];
-            const Plan *plan=cache_.empty() ? nullptr : cache_[g].get();
+            const Plan *plan=cache_[g].get();
             if(!plan) {
                 ++scratch.built;
                 build_plan(g,scratch);
                 plan=&scratch.plan;
-                retain(g,*plan);
+                retain(g,*plan,plan_limit);
             } else ++scratch.hits;
             double *out=nworkers==1 ? y : output.get()+w*stride;
             if(cols==1)apply_plan<1>(g,*plan,x,out,cols,scratch);
             else apply_plan<0>(g,*plan,x,out,cols,scratch);
         };
-        if(serial)for(size_t g=0;g<groups_.size();++g)run(g,0);
-        else workers_.run(groups_.size(),run,4);
+        workers_.run(groups_.size(),run,4);
         stats["contraction_ns"]+=ns(start);
         start=Clock::now();
         if(nworkers>1)workers_.run(n,[&](size_t i,size_t) {

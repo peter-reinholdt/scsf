@@ -113,9 +113,10 @@ class WideCIH {
 
 public:
     WideCIH(const Primary &p,const double *h,SpatialERI eri,
-            Workers &workers,size_t metadata,size_t coefficients)
-        : p_(p),workers_(workers),eri_(eri),bank_(cih_template_electrons(p),p.s,coefficients,true),scratch_(workers.count()) {
+            Workers &workers,size_t budget)
+        : p_(p),workers_(workers),eri_(eri),bank_(cih_template_electrons(p),p.s,budget,true),scratch_(workers.count()) {
         const size_t k=p.k;
+        const size_t metadata=memory_left(budget,bank_.bytes(),"wide CIH spin coefficients");
         if(k && k>metadata/sizeof(double)/k)throw BudgetError("wide CIH one-electron table exceeds metadata budget");
         one_.resize(k*k);
         metadata_bytes_=one_.capacity()*sizeof(double);
@@ -160,16 +161,15 @@ public:
                 {"workspace_entries_per_rhs",entries()}};
     }
 
-    void apply(const double *x,size_t width,double *y,Stats &stats,bool serial) {
+    void apply(const double *x,size_t width,double *y,Stats &stats) {
         const size_t stride=p_.size()*width;
-        const bool reduce=!serial && workers_.count()>1;
+        const bool reduce=workers_.count()>1;
         std::vector<double> private_output(reduce ? workers_.count()*stride : 0,0.);
         for(auto &scratch:scratch_)scratch.groups=scratch.links=0;
         auto run=[&](size_t g,size_t w) {
             source(g,x,width,reduce ? private_output.data()+w*stride : y,scratch_[w]);
         };
-        if(serial)for(size_t g=0;g<p_.groups.size();++g)run(g,0);
-        else workers_.run(p_.groups.size(),run,4);
+        workers_.run(p_.groups.size(),run,4);
         if(reduce)workers_.run(p_.size(),[&](size_t i,size_t) {
             for(size_t w=0;w<workers_.count();++w)
                 for(size_t v=0;v<width;++v)y[i*width+v]+=private_output[w*stride+i*width+v];

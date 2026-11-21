@@ -15,11 +15,12 @@ inline bool screened(double bound,double weight,double eps,int k) {
 
 inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,structured::Workers &workers,
         const double *h,const structured::SpatialERI &eri,const double *weights,double eps,bool complete,
-        HCITransferBounds *bounds) {
+        HCITransferBounds *bounds,size_t table_budget) {
     const auto &basis=*p.native;
     const auto start=structured::Clock::now();
-    if (bounds) bounds->prepare_transfer_bounds(p.k);
-    const bool ordered=bounds && bounds->prepare_ordered_transfers(p.k);
+    if (bounds) bounds->prepare_transfer_bounds(p.k,table_budget);
+    const bool ordered=bounds && bounds->prepare_ordered_transfers(p.k,table_budget);
+    const bool ordered_singles=ordered && bounds->prepare_ordered_singles(p.k,p.n,table_budget);
     struct Shard {
         std::mutex mutex;
         std::atomic<bool> ready{false};
@@ -45,7 +46,10 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
         return a.first>b.first || (a.first==b.first && a.second<b.second);
     });
 
-    struct Counts {size_t visits=0, screened=0, elements=0, candidates=0;};
+    struct Counts {
+        size_t visits=0, screened=0, elements=0, candidates=0, single_suffix=0;
+        std::array<size_t,3> rank_visits{};
+    };
     std::vector<Counts> counts(workers.count());
     workers.run(sources.size(),[&](size_t source,size_t worker) {
         auto [maximum,id]=sources[source];
@@ -65,6 +69,7 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
         Connection terms;
         auto visit=[&](const std::array<int,2> &holes,const std::array<int,2> &particles,int order) {
             ++stats.visits;
+            ++stats.rank_visits[order];
             if(order==0 && block.complete())return;
             if (bounds && !(ordered && order==2)) {
                 const double bound=order==1 && p.k<=64
@@ -138,7 +143,18 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
         visit({}, {},0);
         for (int q=0;q<p.k;++q) {
             if (!ket[q]) continue;
-            for (int a=0;a<p.k;++a) if (a!=q && ket[a]<2) visit({q,0},{a,0},1);
+            if (ordered_singles) {
+                auto [item,last]=bounds->ordered_singles(q,p.k);
+                for (;item!=last;++item) {
+                    if (screened(item->bound,maximum,eps,p.k)) {
+                        stats.single_suffix+=last-item;
+                        break;
+                    }
+                    if (ket[item->p]<2) visit({q,0},{item->p,0},1);
+                }
+            } else {
+                for (int a=0;a<p.k;++a) if (a!=q && ket[a]<2) visit({q,0},{a,0},1);
+            }
             for (int s=q;s<p.k;++s) {
                 if (ket[s]<(q==s ? 2 : 1)) continue;
                 auto [item,last]=bounds->ordered_transfers(q,s,p.k);
@@ -151,15 +167,24 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
         }
     },4);
     Basis::Additions result;
-    for (auto &shard:shards) for (auto &[cfg,selected]:shard.targets)
+    size_t proposed=0;
+    for (auto &shard:shards) for (auto &[cfg,selected]:shard.targets) {
+        proposed=checked_add(proposed,complete ? ranks[cfg.singles()]->size() : selected.size());
         result.emplace(cfg.decode(p.k),std::move(selected));
+    }
     Stats stats{{"ordered_search",ordered},
+                {"ordered_singles",ordered_singles},
+                {"proposed_csfs",proposed},
                 {"source_configurations",sources.size()},{"selection_ns",structured::ns(start)}};
     for (const auto &c:counts) {
         stats["candidate_rank_visits"]+=c.candidates;
         stats["transfer_visits"]+=c.visits;
         stats["screened_pairs"]+=c.screened;
         stats["matrix_elements"]+=c.elements;
+        stats["zero_transfer_visits"]+=c.rank_visits[0];
+        stats["single_transfer_visits"]+=c.rank_visits[1];
+        stats["double_transfer_visits"]+=c.rank_visits[2];
+        stats["ordered_single_suffix_entries"]+=c.single_suffix;
     }
     return {std::move(result),std::move(stats)};
 }

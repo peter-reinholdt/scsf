@@ -3,6 +3,7 @@ import numpy as np
 import pytest
 import scsf
 from scsf import config
+from scsf.csf import _configuration
 from scsf.drivers import csf_driver, polarizability
 
 
@@ -45,9 +46,15 @@ def test_driver_selected(kernel, capsys):
     assert 'iteration=1 added=' in output
 
 
-def test_default_nminus2_without_main_work_array(capsys):
-    csf_driver.main(['--integrals', LIH, '--nthreads', '1', '--max-product-scratch-bytes', '0'])
+def test_default_nminus2_with_global_memory_limit(capsys):
+    csf_driver.main(['--integrals', LIH, '--nthreads', '1', '--max-mem', '1MiB'])
     assert 'nminus2, csf HCI' in capsys.readouterr().out
+
+
+def test_insufficient_global_cap_reports_setup_error(capsys):
+    with pytest.raises(SystemExit, match='1'):
+        csf_driver.main(['--integrals', LIH, '--kernel', 'cih', '--max-mem', '1', '--nthreads', '1'])
+    assert 'cih setup with max-mem=1 bytes' in capsys.readouterr().err
 
 
 def test_configuration_hci_driver(capsys):
@@ -57,10 +64,65 @@ def test_configuration_hci_driver(capsys):
     assert "selection {'added': 0" in output
 
 
+def test_driver_solves_cutoff_batch_and_stops_selection(tmp_path, capsys):
+    # The reference connects only to row 1. Solving those two rows gives
+    # enough weight on row 1 to select row 2 in a subsequent HCI step.
+    one = np.diag([0., 1., 2.])
+    one[0, 1] = one[1, 0] = one[1, 2] = one[2, 1] = .125
+    path = tmp_path/'chain.npz'
+    np.savez(path, ecore=0., nelec=1, one=one, two=np.zeros((3,)*4))
+    args = ['--integrals', str(path), '--two-s', '1', '--eps', '.01',
+            '--nthreads', '1', '--selection-unit', 'configuration']
+    csf_driver.main(args + ['--stop-growth-fraction', '1'])
+    output = capsys.readouterr().out
+    assert 'Final Davidson solve for 2 CSFs' in output
+    assert 'Davidson iter' in output and 'wall=' in output
+    assert 'Hamiltonian products inside Davidson' in output
+    assert output.count('Selecting from') == 1
+    assert 'iteration=1 added=1 ncsf=2' in output
+    energy = np.linalg.eigvalsh(one[:2, :2])[0]
+    assert f'root=0 energy={energy:.12f}' in output
+
+    csf_driver.main(args + ['--stop-growth-fraction', '0', '--quiet'])
+    strict = capsys.readouterr().out
+    assert 'iteration=2 added=1 ncsf=3' in strict
+    assert 'Davidson iter' not in strict
+
+
+@pytest.mark.parametrize('unit', ['csf', 'configuration'])
+def test_growth_cutoff_leaves_solved_space_unchanged(unit):
+    parser = csf_driver.build_parser()
+    args = parser.parse_args(['--integrals', LIH, '--selection-unit', unit, '--nthreads', '1'])
+    ham, nelec = csf_driver.integrals(args, parser)
+    wfn, _ = csf_driver.initial_space(args, parser, ham, nelec)
+    wfn.add_all_csfs()
+    # Omit one occupation to leave a small nonzero append.
+    labels = list(wfn)
+    omitted = _configuration(labels[-1])
+    space = scsf.csf_wfn(ham.nbasis, nelec, args.two_s)
+    for label in labels:
+        if _configuration(label) != omitted:
+            space.add_csf(label)
+    op = csf_driver.make_operator(args, ham, space)
+    old_labels = list(op.labels(native=True))
+    _, c = csf_driver.diagonalize(args, op)
+    omitted_count = len(labels)-len(old_labels)
+    cutoff = omitted_count/len(old_labels)
+    remap, stopped = op.select_hci(abs(c[:, 0]), 0., selection_unit=unit, stop_growth_fraction=cutoff)
+    assert remap.size == 0 and stopped['added'] == 0 and stopped['proposed_csfs'] > 0
+    assert 'basis_extend_ns' not in stopped
+    assert list(op.labels(native=True)) == old_labels
+    _, strict = op.select_hci(abs(c[:, 0]), 0., selection_unit=unit,
+                              stop_growth_fraction=np.nextafter(cutoff, 0.))
+    assert strict['added'] == stopped['proposed_csfs']
+
+
 @pytest.mark.parametrize('flag', [
     '--max-expansion-nnz', '--direct', '--backend', '--product-engine', '--full',
     '--frozen-basis', '--expected-products', '--cih-slot-sweep', '--davidson-olsen',
     '--davidson-trial-vector-tol', '--davidson-trial-vector-decay', '--davidson-trial-vector-source',
+    '--max-ordered-bytes', '--max-product-scratch-bytes', '--max-plan-bytes',
+    '--max-structured-metadata-bytes', '--max-structured-coefficient-bytes',
 ])
 def test_legacy_flags_are_gone(flag):
     assert flag not in csf_driver.build_parser().format_help()

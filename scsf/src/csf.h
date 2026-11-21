@@ -78,25 +78,35 @@ struct BoundedTransfer {
 
 using Stats = std::map<std::string, size_t>;
 
+struct BudgetError : std::runtime_error { using std::runtime_error::runtime_error; };
+
+inline size_t memory_left(size_t limit,size_t used,const char *phase) {
+    if(used>limit)
+        throw BudgetError(std::string(phase)+" needs "+std::to_string(used)+
+                          " bytes with "+std::to_string(limit)+" bytes available (--max-mem)");
+    return limit-used;
+}
+
 class HCITransferBounds {
     Array one_, two_;
-    const size_t ordered_cap_;
     std::vector<double> transfer_bounds_,single_bounds_;
-    std::once_flag bound_once_, ordered_once_;
-    std::vector<BoundedTransfer> ordered_transfers_;
+    std::once_flag bound_once_, ordered_once_, ordered_singles_once_;
+    std::vector<BoundedTransfer> ordered_transfers_, ordered_singles_;
     std::vector<size_t> ordered_offsets_;
+    int ordered_single_electrons_=0;
     void prepare_single_bounds(int k);
 public:
-    HCITransferBounds(const Array &one, const Array &two, size_t ordered_cap);
-    void prepare_transfer_bounds(int k);
+    HCITransferBounds(const Array &one, const Array &two);
+    size_t bytes() const;
+    void prepare_transfer_bounds(int k,size_t limit);
     double selection_bound(const Config &source, const std::array<int,2> &holes,
                            const std::array<int,2> &particles, int order, int k) const;
     double single_bound(const Config &source,int p,int q,int k,std::uint64_t occupied,std::uint64_t doubled) const;
-    bool prepare_ordered_transfers(int k);
+    bool prepare_ordered_transfers(int k,size_t limit);
     std::pair<const BoundedTransfer *, const BoundedTransfer *> ordered_transfers(int q, int s, int k) const;
+    bool prepare_ordered_singles(int k,int nelec,size_t limit);
+    std::pair<const BoundedTransfer *, const BoundedTransfer *> ordered_singles(int q,int k) const;
 };
-
-struct BudgetError : std::runtime_error { using std::runtime_error::runtime_error; };
 
 Config configuration(const std::string &label, int two_s);
 inline void validate_config(const Config &config) {

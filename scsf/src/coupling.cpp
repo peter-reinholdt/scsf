@@ -129,6 +129,46 @@ void HCITransferBounds::prepare_single_bounds(int k) {
     single_bounds_.swap(bounds);
 }
 
+bool HCITransferBounds::prepare_ordered_singles(int k,int nelec,size_t limit) {
+    std::call_once(ordered_singles_once_,[&] {
+        if (single_bounds_.empty()) return;
+        const size_t entries=size_t(k)*(k-1);
+        const size_t available=memory_left(limit,bytes(),"HCI transfer bounds");
+        memory_left(available,entries*sizeof(BoundedTransfer),"ordered HCI single transfers");
+        std::vector<BoundedTransfer> ordered;
+        ordered.reserve(entries);
+        std::vector<double> spectators(k);
+        for(int q=0;q<k;++q) {
+            for(int p=0;p<k;++p) if(p!=q) {
+                const double *row=single_bounds_.data()+(size_t(p)*k+q)*(k+1);
+                std::copy_n(row,k,spectators.begin());
+                std::sort(spectators.begin(),spectators.end(),std::greater<double>());
+                // The sharper occupation bound sums at most nelec distinct
+                // nonnegative spectator terms in an arbitrary order.
+                long double total=row[k];
+                for(int t=0;t<std::min(k,nelec);++t)total+=spectators[t];
+                if(total!=0.)total*=1+8*(k+1)*std::numeric_limits<double>::epsilon();
+                const double bound=total==0. ? 0. : std::nextafter(static_cast<double>(total),
+                    std::numeric_limits<double>::infinity());
+                ordered.push_back({bound,p,0});
+            }
+            std::sort(ordered.end()-(k-1),ordered.end(),[](const auto &a,const auto &b) {
+                return a.bound!=b.bound ? a.bound>b.bound : a.p<b.p;
+            });
+        }
+        memory_left(available,ordered.capacity()*sizeof(BoundedTransfer),"ordered HCI single transfers");
+        ordered_singles_.swap(ordered);
+        ordered_single_electrons_=nelec;
+    });
+    return !ordered_singles_.empty() && ordered_single_electrons_==nelec;
+}
+
+std::pair<const BoundedTransfer *,const BoundedTransfer *>
+HCITransferBounds::ordered_singles(int q,int k) const {
+    const auto *first=ordered_singles_.data()+size_t(q)*(k-1);
+    return {first,first+k-1};
+}
+
 double HCITransferBounds::single_bound(const Config &source,int p,int q,int k,
                                        std::uint64_t occupied,std::uint64_t doubled) const {
     if(single_bounds_.empty())return selection_bound(source,{q,0},{p,0},1,k);

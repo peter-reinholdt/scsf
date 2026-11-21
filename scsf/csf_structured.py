@@ -16,17 +16,15 @@ class csf_structured_op:
     Hamiltonian without assembling its off-diagonal matrix. Dense, packed,
     Cholesky and THC integrals use the same interface.
 
-    The product scratch limit covers the main auxiliary arrays. Metadata,
-    coefficient tables, basis storage and worker temporaries are accounted
-    for separately. N−2 supports private outputs and owner gather.
+    The shared memory budget covers native kernel metadata, coefficients,
+    caches, HCI transfer tables and product arrays. N−2 supports private
+    outputs and owner gather.
     """
     kernels = ('nminus2', 'cih', 'nminus1', 'particle-hole')
 
-    def __init__(self, ham, wfn, *, strategy='nminus2', nthreads=None,
-                 max_metadata_bytes=8*1024**3, max_coefficient_bytes=256*1024**2,
-                 max_product_scratch_bytes=2*1024**3, worker_cpus=None, max_pair_integral_bytes=None,
-                 pair_accumulation=None, max_plan_bytes=None, cih_slot_sweep=False,
-                 incremental_removals=True, max_ordered_bytes=16*1024**2):
+    def __init__(self, ham, wfn, *, strategy='nminus2', nthreads=None, max_mem=None,
+                 worker_cpus=None, pair_accumulation=None, cih_slot_sweep=False,
+                 incremental_removals=True):
         if not isinstance(wfn, csf_wfn):
             raise TypeError('csf_structured_op requires csf_wfn')
         if strategy not in self.kernels:
@@ -35,10 +33,6 @@ class csf_structured_op:
             raise ValueError('cih_slot_sweep requires the CIH kernel')
         self.cih_slot_sweep = bool(cih_slot_sweep)
         self.incremental_removals = bool(incremental_removals)
-        self.max_plan_bytes = _limit(max_plan_bytes if max_plan_bytes is not None else
-            16*1024**2 if strategy == 'particle-hole' else None, 'max_plan_bytes')
-        if self.max_plan_bytes < 0:
-            raise ValueError('max_plan_bytes must be nonnegative')
         if pair_accumulation is None:
             pair_accumulation = 'private' if strategy == 'nminus2' else 'gather'
         if pair_accumulation not in ('gather', 'private') or (pair_accumulation == 'private' and strategy != 'nminus2'):
@@ -56,16 +50,9 @@ class csf_structured_op:
                 len(set(self.worker_cpus)) != self.nthreads or not hasattr(os, 'sched_getaffinity') or
                 not set(self.worker_cpus) <= os.sched_getaffinity(0)):
             raise ValueError('worker_cpus must contain one distinct allowed CPU per worker')
-        self.max_metadata_bytes = _integer(max_metadata_bytes, 'max_metadata_bytes')
-        self.max_coefficient_bytes = _integer(max_coefficient_bytes, 'max_coefficient_bytes')
-        self.max_product_scratch_bytes = _integer(max_product_scratch_bytes, 'max_product_scratch_bytes')
-        if max_pair_integral_bytes is None:
-            max_pair_integral_bytes = 16*1024**2 if compact else self.max_metadata_bytes
-        self.max_pair_integral_bytes = _integer(max_pair_integral_bytes, 'max_pair_integral_bytes')
-        self.max_ordered_bytes = _integer(max_ordered_bytes, 'max_ordered_bytes')
-        if min(self.max_ordered_bytes, self.max_metadata_bytes, self.max_coefficient_bytes, self.max_product_scratch_bytes,
-               self.max_pair_integral_bytes) < 0:
-            raise ValueError('budgets must be nonnegative')
+        self.max_mem = _limit(max_mem, 'max_mem')
+        if self.max_mem < 0:
+            raise ValueError('max_mem must be nonnegative')
         self.strategy, self._ham = strategy, ham
         self.pair_accumulation = pair_accumulation
         self.ecore = ham.ecore
@@ -73,7 +60,7 @@ class csf_structured_op:
                            else (ham.one_mo, ham.two_mo, None))
         from . import _csf
         self._transfer_bounds = None if compact else _csf._HCITransferBounds(
-            ham.one_mo, ham.two_mo, self.max_ordered_bytes)
+            ham.one_mo, ham.two_mo)
         self._growth_lock = RLock()
         self._rdm_cache = None
         self._sector = (wfn.nbasis, wfn.nelec, wfn.two_s)
@@ -84,17 +71,17 @@ class csf_structured_op:
         self.last_product_stats = {}
 
     def _config(self):
-        return (self.strategy, self.nthreads, self.max_metadata_bytes, self.max_coefficient_bytes,
-                self.max_product_scratch_bytes, self.worker_cpus, self.max_pair_integral_bytes, self.pair_accumulation,
-                self.max_plan_bytes, self.cih_slot_sweep, self.incremental_removals, self.max_ordered_bytes)
+        return (self.strategy, self.nthreads, self.max_mem, self.worker_cpus,
+                self.pair_accumulation, self.cih_slot_sweep, self.incremental_removals)
 
     def _construct(self, basis, previous=None):
         from . import _csf
-        if not self.incremental_removals:
-            previous = None
-        native = _csf._StructuredHamiltonian(*self._integrals, basis, self.kernels.index(self.strategy), self.nthreads,
-            self.max_metadata_bytes, self.max_coefficient_bytes, self.max_product_scratch_bytes,
-            self.max_pair_integral_bytes, self.worker_cpus, self.pair_accumulation == 'private', self.max_plan_bytes, previous, self.cih_slot_sweep)
+        try:
+            native = _csf._StructuredHamiltonian(*self._integrals, basis, self.kernels.index(self.strategy), self.nthreads,
+                self.max_mem, self.worker_cpus, self.pair_accumulation == 'private', self._transfer_bounds,
+                previous, self.incremental_removals, self.cih_slot_sweep)
+        except _csf.BudgetError as exc:
+            raise _csf.BudgetError(f'{self.strategy} setup with max-mem={self.max_mem} bytes: {exc}') from None
         return basis, native, basis.public_rows
 
     @property
@@ -125,16 +112,14 @@ class csf_structured_op:
         lookup = self._state[0].native_label
         return tuple(lookup(int(row)) for row in rows)
 
-    def with_basis(self, wfn):
-        """Build a separate operator using the same integrals and kernel settings."""
+    def with_basis(self, wfn, *, concurrent=False):
+        """Construct an independent operator on related CSFs."""
+        max_mem = self.max_mem
+        if concurrent:
+            max_mem -= self.product_info['tracked_memory_bytes']
         return type(self)(self._ham, wfn, strategy=self.strategy, nthreads=self.nthreads,
-            worker_cpus=self.worker_cpus, max_metadata_bytes=self.max_metadata_bytes,
-            max_coefficient_bytes=self.max_coefficient_bytes,
-            max_product_scratch_bytes=self.max_product_scratch_bytes,
-            max_pair_integral_bytes=self.max_pair_integral_bytes,
-            pair_accumulation=self.pair_accumulation, max_plan_bytes=self.max_plan_bytes,
-            cih_slot_sweep=self.cih_slot_sweep, incremental_removals=self.incremental_removals,
-            max_ordered_bytes=self.max_ordered_bytes)
+            worker_cpus=self.worker_cpus, max_mem=max_mem, pair_accumulation=self.pair_accumulation,
+            cih_slot_sweep=self.cih_slot_sweep, incremental_removals=self.incremental_removals)
 
     def to_native_order(self, values):
         """Convert a public-order vector or column block to native order."""
@@ -181,15 +166,19 @@ class csf_structured_op:
     def native_matmat(self, x):
         return self._matmat(x, canonical=True)
 
-    def select_hci(self, weights, eps, *, selection_unit='csf'):
+    def select_hci(self, weights, eps, *, selection_unit='csf', stop_growth_fraction=0.):
         """Grow with strict HCI using absolute native-row weights.
 
         Return the old-to-new row map and statistics. An empty map represents
         an unchanged prefix. Publish after the new operator is ready.
+        Skip growth when the proposed CSF count is at most this fraction of
+        the current dimension. The statistics distinguish proposed and added CSFs.
         """
         if np.iscomplexobj(weights):
             raise TypeError('HCI weights must be real')
         weights = np.asarray(weights, dtype=float, order='C')
+        if not 0. <= stop_growth_fraction <= 1.:
+            raise ValueError('stop_growth_fraction must be in [0, 1]')
         with self._growth_lock:
             if self._settings != self._config():
                 raise ValueError('rebuild the operator to change structured settings')
@@ -201,11 +190,15 @@ class csf_structured_op:
                 info = old.info
                 if info['configurations'] != info['complete_configurations']:
                     raise ValueError('configuration selection requires a complete starting space')
-            basis, remap, stats = old.select_hci(weights, eps, complete, self._transfer_bounds)
+            basis, remap, stats = old.select_hci(weights, eps, complete, stop_growth_fraction)
             if basis is not None:
                 start = perf_counter()
                 replacement = self._construct(basis, previous=old)
+                constructed = perf_counter()
                 replacement[1].reuse_diagonal(old, remap)
+                ready = perf_counter()
+                stats['replacement_ns'] = round((constructed-start)*1e9)
+                stats['diagonal_reuse_ns'] = round((ready-constructed)*1e9)
                 self._state = replacement
                 self._rdm_cache = None
                 self.setup_seconds = perf_counter()-start
@@ -226,9 +219,9 @@ class csf_structured_op:
             raise TypeError('density matrix coefficients must be real')
         x = np.asarray(coefficients, dtype=float, order='C')
         budgets = (max_output_bytes,
-            self.max_metadata_bytes if max_link_bytes is None else max_link_bytes,
-            self.max_product_scratch_bytes if max_workspace_bytes is None else max_workspace_bytes,
-            self.max_coefficient_bytes)
+            self.max_mem if max_link_bytes is None else max_link_bytes,
+            self.max_mem if max_workspace_bytes is None else max_workspace_bytes,
+            self.max_mem)
         budgets = tuple(_integer(value, 'density matrix budget') for value in budgets)
         if min(budgets) < 0:
             raise ValueError('density matrix budgets must be nonnegative')
