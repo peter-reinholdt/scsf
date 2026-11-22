@@ -116,6 +116,7 @@ class csf_structured_op:
         """Construct an independent operator on related CSFs."""
         max_mem = self.max_mem
         if concurrent:
+            self._state[1].release_product_workspace()
             max_mem -= self.product_info['tracked_memory_bytes']
         return type(self)(self._ham, wfn, strategy=self.strategy, nthreads=self.nthreads,
             worker_cpus=self.worker_cpus, max_mem=max_mem, pair_accumulation=self.pair_accumulation,

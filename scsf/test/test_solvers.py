@@ -100,6 +100,7 @@ def test_davidson_phase_stats_preserve_solution_and_count_work():
     assert stats['product_columns'] == sum(calls)
     assert stats['call_widths'] == calls
     assert stats['iterations'] > 1 and stats['restarts'] > 0
-    phases = [stats[key] for key in ('product_ns','orthogonalization_ns','ritz_ns','restart_ns','other_ns')]
+    phases = [stats[key] for key in ('product_ns', 'orthogonalization_ns', 'ritz_ns',
+                                    'restart_ns', 'basis_append_ns', 'other_ns')]
     assert all(v >= 0 for v in phases)
     assert sum(phases) == stats['total_ns']

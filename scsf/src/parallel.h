@@ -62,11 +62,19 @@ class ThreadTeam {
 #endif
         }
     };
-    void execute(size_t worker) {
+    void execute(size_t worker,bool &pinned) {
         if (worker>=active_ || stop_.load(std::memory_order_relaxed)) return;
         try {
-            Placement placement(cpus_,worker);
-            callback_(worker);
+            if (worker==0) {
+                Placement placement(cpus_,worker);
+                callback_(worker);
+            } else {
+                if (!pinned) {
+                    Placement placement(cpus_,worker);
+                    pinned=true;
+                }
+                callback_(worker);
+            }
         } catch (...) {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!failure_) failure_ = std::current_exception();
@@ -75,13 +83,14 @@ class ThreadTeam {
     }
     void run(size_t worker) {
         size_t seen = 0;
+        bool pinned = cpus_.empty();
         std::unique_lock<std::mutex> lock(mutex_);
         for (;;) {
             ready_.wait(lock,[&] { return shutdown_ || generation_ != seen; });
             if (shutdown_) return;
             seen = generation_;
             lock.unlock();
-            execute(worker);
+            execute(worker,pinned);
             lock.lock();
             ++completed_;
             finished_.notify_one();
@@ -134,7 +143,8 @@ public:
             ++generation_;
         }
         ready_.notify_all();
-        execute(0);
+        bool pinned = false;
+        execute(0,pinned);
         std::unique_lock<std::mutex> lock(mutex_);
         finished_.wait(lock,[&] { return completed_ == threads_.size(); });
         callback_ = {};

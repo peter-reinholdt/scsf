@@ -93,7 +93,8 @@ struct Primary {
 
 class RemovalBank {
     int spin_;
-    size_t maximum_,bytes_=0;
+    size_t maximum_,bytes_=0,build_ns_=0,parallel_builds_=0;
+public:
     // Spin/projection, canonical occupation length, and (position, occupation
     // and spin) for each annihilator. All unlisted sites are singly occupied.
     using Key=std::array<int,7>;
@@ -104,16 +105,23 @@ class RemovalBank {
             return result;
         }
     };
+private:
     std::unordered_map<Key,unsigned,Hash> directory_;
 public:
     std::vector<Matrix> matrices;
     std::vector<unsigned> weights;
     RemovalBank(const Primary &primary,size_t maximum):spin_(primary.s),maximum_(maximum){}
-    unsigned get(const Primary::Group &group,std::initializer_list<Operator> operators,int sb,int mb) {
+    static Key canonical_key(const Primary::Group &group,std::initializer_list<Operator> operators,
+                             int sb,int mb) {
         const auto &ket=*group.cfg;
         const int first=operators.begin()->orbital,last=(operators.end()-1)->orbital;
         const auto &occupation=group.block->key;
+        const bool single_limb=occupation.high.empty();
+        const auto open=single_limb ? (occupation.first[0]^occupation.first[1])|
+            (std::uint64_t(1)<<first)|(std::uint64_t(1)<<last) : 0;
         auto position=[&](int orbital) {
+            if(single_limb)
+                return __builtin_popcountll(open&((std::uint64_t(1)<<orbital)-1));
             int rank=0;
             for(int base=0;base<=orbital/64;++base) {
                 const auto &limb=base ? occupation.high[base-1] : occupation.first;
@@ -130,7 +138,21 @@ public:
             key[5]=first==last ? key[3] : position(last);
             key[6]=2*ket[last]+(operators.end()-1)->spin;
         }
-        auto found=directory_.find(key);if(found!=directory_.end())return found->second;
+        return key;
+    }
+    size_t lookup(const Key &key) const {
+        const auto found=directory_.find(key);
+        return found==directory_.end() ? none : size_t(found->second);
+    }
+    unsigned get(const Primary::Group &group,std::initializer_list<Operator> operators,int sb,int mb,
+                 Workers *workers) {
+        return ensure(canonical_key(group,operators,sb,mb),workers);
+    }
+    unsigned ensure(const Key &key,Workers *workers,size_t allowance=no_row) {
+        const auto found=lookup(key);
+        if(found!=none)return static_cast<unsigned>(found);
+        const auto start=Clock::now();
+        const int sb=key[0],mb=key[1],length=key[2];
         Config small(length,1);
         std::vector<Operator> ops;
         for(size_t j=3;j<key.size() && key[j]>=0;j+=2) {
@@ -139,19 +161,33 @@ public:
         }
         Config target=small;for(auto &op:ops)--target[op.orbital];
         int ma=std::count(target.begin(),target.end(),1),mk=std::count(small.begin(),small.end(),1);
-        SpinPaths rows(ma,sb,maximum_/8),cols(mk,spin_,maximum_/8);
-        if(rows.paths.size() && cols.paths.size()>maximum_/8/rows.paths.size())throw BudgetError("removal class exceeds coefficient budget");
+        const size_t cells=std::min(maximum_,allowance)/sizeof(double);
+        SpinPaths rows(ma,sb,cells),cols(mk,spin_,cells);
+        if(rows.paths.size() && cols.paths.size()>cells/rows.paths.size())
+            throw BudgetError("removal class exceeds coefficient budget");
         Matrix matrix(rows.paths.size(),cols.paths.size());
-        for(size_t a=0;a<matrix.rows;++a)for(size_t b=0;b<matrix.cols;++b)
-            matrix.at(a,b)=cg_operator(spin_label(target,rows.paths[a]),sb,mb,
-                spin_label(small,cols.paths[b]),spin_,spin_,ops);
+        auto fill_row=[&](size_t a,size_t) {
+            const auto bra=spin_label(target,rows.paths[a]);
+            for(size_t b=0;b<matrix.cols;++b)
+                matrix.at(a,b)=cg_operator(bra,sb,mb,spin_label(small,cols.paths[b]),spin_,spin_,ops);
+        };
+        // Matrix coefficients are independent; sparse packing and bank
+        // publication happen only after all rows have been filled.
+        if(workers && workers->count()>1 && matrix.rows>=16 && matrix.rows*matrix.cols>=4096) {
+            workers->run(matrix.rows,fill_row);
+            ++parallel_builds_;
+        } else for(size_t a=0;a<matrix.rows;++a)fill_row(a,0);
         matrix.sparse();size_t add=matrix.bytes()+sizeof(Key)+sizeof(unsigned)+64;
-        if(add>maximum_-bytes_)throw BudgetError("removal matrices exceed coefficient budget");
+        if(add>std::min(maximum_-bytes_,allowance))throw BudgetError("removal matrices exceed coefficient budget");
         bytes_+=add;unsigned id=schedule_index(matrices.size());matrices.push_back(std::move(matrix));
         weights.push_back(spin_==0 ? sb+1 : 1);
-        directory_.emplace(std::move(key),id);return id;
+        directory_.emplace(key,id);
+        build_ns_+=ns(start);
+        return id;
     }
     size_t bytes() const{return bytes_;}
+    size_t build_ns() const{return build_ns_;}
+    size_t parallel_builds() const{return parallel_builds_;}
 };
 
 struct Residues {
@@ -195,23 +231,35 @@ struct Residues {
     }
 };
 
-// Single-limb occupations sort directly, without string keys or decoded
-// residue configurations. Preserve the narrower records below 33 orbitals.
+// Sort occupation bitsets directly, without allocating keys or decoding residues.
 struct CompactRemovalResidues {
     using Key=Occupation::Limb;
     template<class Word>struct Record {std::array<Word,2> key;unsigned parent;std::uint8_t p,q;};
+    template<size_t Limbs>struct MultiRecord {
+        std::array<Key,Limbs> key;
+        unsigned parent;
+        std::uint8_t p,q;
+    };
     std::vector<Record<std::uint32_t>> narrow;
     std::vector<Record<std::uint64_t>> wide;
+    std::unique_ptr<MultiRecord<2>[]> double_limb;
+    std::unique_ptr<MultiRecord<3>[]> triple_limb;
+    std::unique_ptr<MultiRecord<4>[]> quadruple_limb;
+    size_t multi_bytes=0;
     std::vector<size_t> ptr;
+    size_t generate_ns=0,sort_ns=0;
 
     template<class Word,class Getter>
-    void build(std::vector<Record<Word>> &records,size_t groups,int rank,size_t maximum,size_t begin,Getter key_at) {
+    void build(std::vector<Record<Word>> &records,size_t groups,int rank,size_t maximum,size_t begin,
+               Getter key_at,Workers *workers) {
+        auto start=Clock::now();
         size_t count=0;
         for(size_t id=begin;id<groups;++id) {
             const auto [o,d]=key_at(id);
             const size_t occupied=__builtin_popcountll(o);
             const size_t add=rank==1 ? occupied : occupied*(occupied-1)/2+__builtin_popcountll(d);
-            if(add>maximum/sizeof(Record<Word>)-count)throw BudgetError("compact removal records exceed metadata budget");
+            if(add>maximum/sizeof(Record<Word>)-count)
+                throw BudgetError("compact removal records exceed metadata budget");
             count+=add;
         }
         records.reserve(count);
@@ -243,31 +291,187 @@ struct CompactRemovalResidues {
                 holes&=holes-1;
             }
         }
-        std::sort(records.begin(),records.end(),[](const auto &a,const auto &b) {
+        generate_ns=ns(start);
+        sort_and_index(records.data(),count,maximum,workers);
+    }
+
+    template<class RecordType>
+    void sort_and_index(RecordType *records,size_t count,size_t maximum,Workers *workers) {
+        if(!count) {
+            memory_left(maximum,sizeof(size_t),"compact residue offsets");
+            ptr.push_back(0);
+            return;
+        }
+        const auto start=Clock::now();
+        const auto less=[](const auto &a,const auto &b) {
             return std::tie(a.key,a.parent,a.p,a.q)<std::tie(b.key,b.parent,b.p,b.q);
+        };
+        // Partition at medians, then sort disjoint ranges in place. The
+        // concatenated ranges preserve the original total ordering.
+        const auto boundary=[&](size_t i,size_t ranges) {
+            return records+count/ranges*i+(count%ranges)*i/ranges;
+        };
+        size_t partitions=1;
+        constexpr size_t min_partition=262144;
+        while(workers && 2*partitions<=workers->count() && count/(2*partitions)>=min_partition) {
+            const size_t ranges=2*partitions;
+            workers->run(partitions,[&](size_t i,size_t) {
+                std::nth_element(boundary(2*i,ranges),boundary(2*i+1,ranges),boundary(2*i+2,ranges),less);
+            });
+            partitions=ranges;
+        }
+        if(partitions==1)std::sort(records,records+count,less);
+        else workers->run(partitions,[&](size_t i,size_t) {
+            std::sort(boundary(i,partitions),boundary(i+1,partitions),less);
         });
+        sort_ns=ns(start);
+        auto starts_residue=[&](size_t i) {return !i || records[i-1].key!=records[i].key;};
+        std::array<size_t,257> offsets{};
+        const bool parallel_scan=partitions>1 && partitions<offsets.size();
         size_t residues=0;
-        for(size_t i=0;i<records.size();++i)residues+=!i || records[i-1].key!=records[i].key;
-        if(sizeof(size_t)>maximum-count*sizeof(Record<Word>) ||
-            residues>(maximum-count*sizeof(Record<Word>)-sizeof(size_t))/sizeof(size_t))
+        if(parallel_scan) {
+            workers->run(partitions,[&](size_t task,size_t) {
+                const size_t first=boundary(task,partitions)-records;
+                const size_t last=boundary(task+1,partitions)-records;
+                for(size_t i=first;i<last;++i)offsets[task+1]+=starts_residue(i);
+            });
+            std::partial_sum(offsets.begin(),offsets.begin()+partitions+1,offsets.begin());
+            residues=offsets[partitions];
+        } else {
+            for(size_t i=0;i<count;++i)residues+=starts_residue(i);
+        }
+        if(sizeof(size_t)>maximum-count*sizeof(RecordType) ||
+            residues>(maximum-count*sizeof(RecordType)-sizeof(size_t))/sizeof(size_t))
             throw BudgetError("compact residue offsets exceed metadata budget");
-        ptr.reserve(residues+1);
-        for(size_t i=0;i<records.size();++i)
-            if(!i || records[i-1].key!=records[i].key)ptr.push_back(i);
-        ptr.push_back(records.size());
+        if(parallel_scan) {
+            ptr.resize(residues+1);
+            workers->run(partitions,[&](size_t task,size_t) {
+                const size_t first=boundary(task,partitions)-records;
+                const size_t last=boundary(task+1,partitions)-records;
+                size_t out=offsets[task];
+                for(size_t i=first;i<last;++i)if(starts_residue(i))ptr[out++]=i;
+            });
+            ptr.back()=count;
+        } else {
+            ptr.reserve(residues+1);
+            for(size_t i=0;i<count;++i)if(starts_residue(i))ptr.push_back(i);
+            ptr.push_back(count);
+        }
+    }
+
+    template<size_t Limbs>
+    void build_multi(std::unique_ptr<MultiRecord<Limbs>[]> &records,const Primary &primary,
+                     int rank,size_t maximum,size_t begin,Workers *workers) {
+        using Posting=MultiRecord<Limbs>;
+        const auto start=Clock::now();
+        const size_t groups=primary.groups.size()-begin;
+        const size_t tasks=workers ? std::min(workers->count(),std::max(size_t(1),groups/256)) : 1;
+        const auto boundary=[&](size_t t) {return begin+groups/tasks*t+(groups%tasks)*t/tasks;};
+        const auto run=[&](auto body) {
+            if(tasks==1)body(0,0);
+            else workers->run(tasks,body);
+        };
+        std::array<size_t,257> offsets{};
+        run([&](size_t t,size_t) {
+            size_t count=0;
+            for(size_t g=boundary(t);g<boundary(t+1);++g) {
+                const auto &key=primary.groups[g].block->key;
+                size_t occupied=__builtin_popcountll(key.first[0]),doubles=__builtin_popcountll(key.first[1]);
+                for(const auto &limb:key.high) {
+                    occupied+=__builtin_popcountll(limb[0]);
+                    doubles+=__builtin_popcountll(limb[1]);
+                }
+                const size_t add=rank==1 ? occupied : occupied*(occupied-1)/2+doubles;
+                if(add>maximum/sizeof(Posting)-count)
+                    throw BudgetError("compact removal records exceed metadata budget");
+                count+=add;
+            }
+            offsets[t+1]=count;
+        });
+        for(size_t t=0;t<tasks;++t) {
+            if(offsets[t+1]>maximum/sizeof(Posting)-offsets[t])
+                throw BudgetError("compact removal records exceed metadata budget");
+            offsets[t+1]+=offsets[t];
+        }
+        const size_t count=offsets[tasks];
+        // Every worker writes its own range. Avoid clearing the whole array
+        // on the caller before those writes.
+        records.reset(new Posting[count]);
+        multi_bytes=count*sizeof(Posting);
+        const auto remove=[](auto &key,size_t p) {
+            auto &[occupied,doubled]=key[p/64];
+            const auto bit=std::uint64_t(1)<<(p%64);
+            occupied^=bit&~doubled;
+            doubled&=~bit;
+        };
+        const auto visit_occupied=[](const auto &key,size_t from,auto visit) {
+            for(size_t limb=from/64;limb<Limbs;++limb) {
+                auto bits=key[limb][0];
+                if(limb==from/64)bits&=UINT64_MAX<<(from%64);
+                for(;bits;bits&=bits-1)visit(limb*64+__builtin_ctzll(bits));
+            }
+        };
+        run([&](size_t t,size_t) {
+            size_t out=offsets[t];
+            for(size_t g=boundary(t);g<boundary(t+1);++g) {
+                const auto &occupation=primary.groups[g].block->key;
+                std::array<Key,Limbs> key;
+                key[0]=occupation.first;
+                for(size_t limb=1;limb<Limbs;++limb)key[limb]=occupation.high[limb-1];
+                const auto parent=schedule_index(g);
+                visit_occupied(key,0,[&](size_t p) {
+                    auto reduced=key;
+                    remove(reduced,p);
+                    if(rank==1)records[out++]={reduced,parent,std::uint8_t(p),0};
+                    else visit_occupied(reduced,p,[&](size_t q) {
+                        auto pair=reduced;
+                        remove(pair,q);
+                        records[out++]={pair,parent,std::uint8_t(p),std::uint8_t(q)};
+                    });
+                });
+            }
+        });
+        generate_ns=ns(start);
+        sort_and_index(records.get(),count,maximum,workers);
+    }
+
+    CompactRemovalResidues(const Primary &primary,int rank,size_t maximum,size_t begin,Workers *workers) {
+        if(primary.k<=128)build_multi(double_limb,primary,rank,maximum,begin,workers);
+        else if(primary.k<=192)build_multi(triple_limb,primary,rank,maximum,begin,workers);
+        else build_multi(quadruple_limb,primary,rank,maximum,begin,workers);
     }
     template<class Getter>
-    CompactRemovalResidues(size_t groups,int k,int rank,size_t maximum,size_t begin,Getter key_at) {
-        if(k<=32)build(narrow,groups,rank,maximum,begin,key_at);
-        else build(wide,groups,rank,maximum,begin,key_at);
+    CompactRemovalResidues(size_t groups,int k,int rank,size_t maximum,size_t begin,Getter key_at,
+                           Workers *workers=nullptr) {
+        if(k<=32)build(narrow,groups,rank,maximum,begin,key_at,workers);
+        else build(wide,groups,rank,maximum,begin,key_at,workers);
     }
     Record<std::uint64_t> at(size_t i) const {
         if(narrow.empty())return wide[i];
         const auto &r=narrow[i];
         return {{r.key[0],r.key[1]},r.parent,r.p,r.q};
     }
+    std::tuple<unsigned,int,int> posting(size_t i) const {
+        const auto read=[](const auto &r) {return std::tuple<unsigned,int,int>{r.parent,r.p,r.q};};
+        if(!narrow.empty())return read(narrow[i]);
+        if(!wide.empty())return read(wide[i]);
+        if(double_limb)return read(double_limb[i]);
+        if(triple_limb)return read(triple_limb[i]);
+        return read(quadruple_limb[i]);
+    }
+    int singles(size_t residue) const {
+        const size_t i=ptr[residue];
+        const auto count=[](const auto &r) {
+            int singles=0;
+            for(const auto &limb:r.key)singles+=__builtin_popcountll(limb[0]^limb[1]);
+            return singles;
+        };
+        if(double_limb)return count(double_limb[i]);
+        if(triple_limb)return count(triple_limb[i]);
+        return count(quadruple_limb[i]);
+    }
     size_t bytes() const {
-        return narrow.capacity()*sizeof(narrow[0])+wide.capacity()*sizeof(wide[0])+ptr.capacity()*sizeof(size_t);
+        return narrow.capacity()*sizeof(narrow[0])+wide.capacity()*sizeof(wide[0])+ptr.capacity()*sizeof(size_t)+multi_bytes;
     }
 };
 
@@ -326,12 +530,186 @@ struct RemovalLinks {
     std::vector<unsigned> reverse;
     std::vector<CompactRemovalResidues::Key> keys;
     size_t entries=0,weighted_links=0,residue_count=0,compact_builder_bytes=0;
+    Stats construction;
+    int compact_singles(const CompactRemovalResidues &compact,size_t residue) const {
+        if(keys.empty())return compact.singles(residue);
+        const auto &key=keys[residue];
+        return __builtin_popcountll(key[0]^key[1]);
+    }
+    bool compile_private_singlet(const Primary &primary,RemovalBank &bank,int rank,size_t maximum,
+                                 const CompactRemovalResidues &compact,Workers &workers) {
+        using Key=RemovalBank::Key;
+        constexpr size_t slots=4096,max_tasks=256;
+        const size_t tasks=std::min({max_tasks,workers.count(),residue_count/16384});
+        if(tasks<2)return false;
+        const size_t discovery_bytes=tasks*slots*2*sizeof(Key);
+        const size_t retained=bytes(),occupied=checked_add(retained,compact_builder_bytes);
+        if(occupied>maximum || discovery_bytes>maximum-occupied)return false;
+        const size_t initial_coefficients=bank.bytes();
+        // Split between residues so all families and parents for a residue
+        // remain in one task. Prefixes preserve native order across tasks.
+        const auto boundary=[&](size_t i) {
+            return residue_count/tasks*i+residue_count%tasks*i/tasks;
+        };
+        std::array<std::array<size_t,2>,257> dims{};
+        std::array<bool,257> seen{};
+        for(size_t a=0;a<residue_count;++a) {
+            const size_t singles=compact_singles(compact,a);
+            if(seen[singles])continue;
+            seen[singles]=true;
+            for(size_t f=0;f<families.size();++f)
+                dims[singles][f]=SpinPaths(singles,families[f].spin,maximum/8).paths.size();
+        }
+        const auto visit=[&](size_t t,auto block) {
+            for(size_t a=boundary(t);a<boundary(t+1);++a) {
+                const size_t singles=compact_singles(compact,a);
+                for(size_t f=0;f<families.size();++f) {
+                    const auto family=families[f];
+                    const size_t dim=dims[singles][f];
+                    if(!dim)continue;
+                    block(a,f,dim,[&](auto add) {
+                        for(size_t j=compact.ptr[a];j<compact.ptr[a+1];++j) {
+                            const auto [parent,p,q]=compact.posting(j);
+                            const auto &g=primary.groups[parent];
+                            const int k=primary.k;
+                            if(rank==1) {
+                                const auto key=RemovalBank::canonical_key(g,{{p,1,false}},family.spin,family.m);
+                                add(key,parent,size_t(p));
+                            } else {
+                                const int x=p+(family.spin ? k : 0),y=q+k;
+                                if(x!=y) {
+                                    const auto key=RemovalBank::canonical_key(g,{{p,x/k,false},{q,1,false}},
+                                                                                family.spin,family.m);
+                                    add(key,parent,pair_index(x,y,2*k));
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        };
+
+        // Discover only missing classes against the read-only old bank. A
+        // bounded local hash table avoids per-posting staging allocations.
+        const auto discovery=Clock::now();
+        std::vector<Key> table(tasks*slots);
+        std::array<size_t,max_tasks> missing_counts{};
+        workers.run(tasks,[&](size_t t,size_t) {
+            auto *local=table.data()+t*slots;
+            Key empty{};
+            empty[0]=-1;
+            std::fill_n(local,slots,empty);
+            visit(t,[&](size_t,size_t,size_t,auto records) {
+                records([&](const Key &key,unsigned,size_t) {
+                    if(missing_counts[t]>slots/2 || bank.lookup(key)!=none)return;
+                    size_t i=RemovalBank::Hash{}(key)&(slots-1);
+                    while(local[i][0]>=0 && local[i]!=key)i=(i+1)&(slots-1);
+                    if(local[i][0]<0) {local[i]=key;++missing_counts[t];}
+                });
+            });
+        });
+        size_t total_missing=0;
+        for(size_t t=0;t<tasks;++t) {
+            if(missing_counts[t]>slots/2)return false;
+            total_missing+=missing_counts[t];
+        }
+        std::vector<Key> missing;
+        missing.reserve(total_missing);
+        for(const auto &key:table)if(key[0]>=0)missing.push_back(key);
+        const size_t discovery_scratch=(table.capacity()+missing.capacity())*sizeof(Key);
+        std::vector<Key>().swap(table);
+        std::sort(missing.begin(),missing.end());
+        missing.erase(std::unique(missing.begin(),missing.end()),missing.end());
+        construction["parallel_class_discovery_ns"]=ns(discovery);
+        const size_t created=missing.size();
+        // No worker calls the mutable bank. A class may dispatch its own
+        // parallel matrix-row fill from this controlling thread.
+        const size_t class_allowance=maximum-occupied-missing.capacity()*sizeof(Key);
+        for(const auto &key:missing) {
+            const size_t remaining=memory_left(class_allowance,bank.bytes()-initial_coefficients,
+                                               "removal coefficients");
+            bank.ensure(key,&workers,remaining);
+        }
+        const size_t class_scratch=missing.capacity()*sizeof(Key);
+        std::vector<Key>().swap(missing);
+
+        struct Counts {size_t parents=0,blocks=0,entries=0,weights=0,lookups=0;};
+        std::array<Counts,max_tasks> counts{},offsets{};
+        const auto counted=Clock::now();
+        workers.run(tasks,[&](size_t t,size_t) {
+            auto &c=counts[t];
+            visit(t,[&](size_t,size_t,size_t dim,auto records) {
+                const size_t before=c.parents;
+                records([&](const Key &key,unsigned,size_t) {
+                    ++c.lookups;
+                    const size_t matrix=bank.lookup(key);
+                    if(matrix==none)throw std::logic_error("missing frozen removal class");
+                    const size_t nnz=bank.matrices[matrix].data.size();
+                    c.weights=checked_add(c.weights,nnz);
+                    c.parents+=nnz!=0;
+                });
+                if(c.parents==before)return;
+                ++c.blocks;
+                if(c.parents-before>(no_row-c.entries)/dim)
+                    throw BudgetError("removal amplitude size overflow");
+                c.entries+=(c.parents-before)*dim;
+            });
+        });
+        Counts total;
+        for(size_t t=0;t<tasks;++t) {
+            offsets[t]=total;
+            const auto &c=counts[t];
+            total.parents=checked_add(total.parents,c.parents);
+            total.blocks=checked_add(total.blocks,c.blocks);
+            total.entries=checked_add(total.entries,c.entries);
+            total.weights=checked_add(total.weights,c.weights);
+            total.lookups=checked_add(total.lookups,c.lookups);
+        }
+        construction["parallel_posting_count_ns"]=ns(counted);
+        size_t available=memory_left(maximum-occupied,bank.bytes()-initial_coefficients,
+                                     "removal coefficients");
+        if(total.parents>available/sizeof(Parent))
+            throw BudgetError("removal links exceed metadata budget");
+        available-=total.parents*sizeof(Parent);
+        if(total.blocks>available/sizeof(Block))
+            throw BudgetError("removal links exceed metadata budget");
+        const auto filling=Clock::now();
+        parents.resize(total.parents);
+        blocks.resize(total.blocks);
+        workers.run(tasks,[&](size_t t,size_t) {
+            size_t parent=offsets[t].parents,block=offsets[t].blocks;
+            visit(t,[&](size_t a,size_t f,size_t dim,auto records) {
+                const size_t before=parent;
+                records([&](const Key &key,unsigned g,size_t channel) {
+                    const size_t matrix=bank.lookup(key);
+                    if(matrix==none)throw std::logic_error("missing frozen removal class");
+                    if(!bank.matrices[matrix].data.empty())
+                        parents[parent++]={g,schedule_index(matrix),schedule_index(channel)};
+                });
+                if(parent!=before)blocks[block++]={schedule_index(a),schedule_index(f),before,parent,dim};
+            });
+        });
+        construction["parallel_posting_fill_ns"]=ns(filling);
+        construction["removal_lookup_hits"]=total.lookups-created;
+        construction["parallel_posting_tasks"]=tasks;
+        // Keep the peak of the three live buffer sets, accounting separately
+        // for the coefficient bytes that the caller tracks in the bank.
+        const size_t posting_bytes=bytes()-retained;
+        const size_t scratch=std::max(discovery_scratch,class_scratch);
+        if(scratch>posting_bytes)compact_builder_bytes+=scratch-posting_bytes;
+        entries=total.entries;
+        weighted_links=total.weights;
+        return true;
+    }
+
     RemovalLinks(const Primary &primary,RemovalBank &bank,int rank,size_t maximum,
-                 bool keep_block_ids,bool keep_reverse,size_t begin=0) {
+                 bool keep_block_ids,bool keep_reverse,size_t begin=0,Workers *workers=nullptr,
+                 bool parallel_postings=false) {
+        auto start=Clock::now();
         std::unique_ptr<CompactRemovalResidues> compact;
         if(primary.k<=64 && !keep_block_ids) {
             compact=std::make_unique<CompactRemovalResidues>(primary.groups.size(),primary.k,rank,maximum,begin,
-                [&](size_t i) {return primary.native->blocks()[i].key.first;});
+                [&](size_t i) {return primary.native->blocks()[i].key.first;},workers);
             residue_count=compact->ptr.size()-1;
             compact_builder_bytes=compact->bytes();
             if(residue_count>(maximum-compact_builder_bytes)/sizeof(keys[0]))
@@ -339,17 +717,26 @@ struct RemovalLinks {
             keys.reserve(residue_count);
             for(size_t index=0;index<residue_count;++index)
                 keys.push_back(compact->at(compact->ptr[index]).key);
+        } else if(primary.k<=256 && !keep_block_ids) {
+            compact=std::make_unique<CompactRemovalResidues>(primary,rank,maximum,begin,workers);
+            residue_count=compact->ptr.size()-1;
+            compact_builder_bytes=compact->bytes();
         } else {
             residues=std::make_unique<Residues>(primary.groups.size(),primary.k,rank,maximum,
                 [&](size_t g)->const Config &{return *primary.groups[g].cfg;});
             residue_count=residues->configs.size();
         }
+        const size_t generate=compact ? compact->generate_ns : 0,sort=compact ? compact->sort_ns : 0;
+        construction["residue_generate_ns"]=generate;
+        construction["residue_sort_ns"]=sort;
+        construction["residue_index_ns"]=ns(start)-generate-sort;
+        start=Clock::now();
+        const size_t initial_classes=bank.matrices.size(),initial_build_ns=bank.build_ns();
+        const size_t initial_parallel_builds=bank.parallel_builds();
+        size_t lookups=0,sampled_hits=0,sampled_hit_ns=0;
         const auto &ptr=compact ? compact->ptr : residues->ptr;
         auto removal=[&](size_t i)->std::tuple<unsigned,int,int> {
-            if(compact) {
-                const auto r=compact->at(i);
-                return {r.parent,r.p,r.q};
-            }
+            if(compact)return compact->posting(i);
             const auto &r=residues->records[i];
             return {r.parent,r.p,r.q};
         };
@@ -364,16 +751,24 @@ struct RemovalLinks {
                 if(spin>=std::abs(m) && spin<=primary.n-2 && (primary.s!=0 || m==spin))
                     families.push_back({spin,m,primary.s==0 ? spin+1 : 1});
         }
+        if(parallel_postings && compact && !keep_reverse && primary.s==0 && workers &&
+            compile_private_singlet(primary,bank,rank,maximum,*compact,*workers)) {
+            if(bytes()>maximum-compact_builder_bytes)throw BudgetError("removal links exceed metadata budget");
+            construction["posting_compile_ns"]=ns(start);
+            construction["removal_matrix_build_ns"]=bank.build_ns()-initial_build_ns;
+            construction["parallel_removal_matrices"]=bank.parallel_builds()-initial_parallel_builds;
+            return;
+        }
         if(keep_block_ids)block_ids.assign(residue_count*families.size(),none);
-        std::map<std::pair<int,int>,size_t> dimensions;
+        std::vector<std::array<size_t,5>> dimensions(residue_count ? size_t(primary.n-rank)+1 : 0);
+        for(auto &row:dimensions)row.fill(no_row);
         for(size_t a=0;a<residue_count;++a) {
-            int singles=compact ? __builtin_popcountll(keys[a][0]^keys[a][1])
+            int singles=compact ? compact_singles(*compact,a)
                 : std::count(residues->configs[a].begin(),residues->configs[a].end(),1);
             for(size_t f=0;f<families.size();++f) {
                 auto family=families[f];
-                auto [dimension,inserted]=dimensions.try_emplace({singles,family.spin},0);
-                if(inserted)dimension->second=SpinPaths(singles,family.spin,maximum/8).paths.size();
-                size_t dim=dimension->second;
+                auto &dim=dimensions[singles][family.spin-primary.s+rank];
+                if(dim==no_row)dim=SpinPaths(singles,family.spin,maximum/8).paths.size();
                 if(!dim)continue;
                 size_t first=parents.size();
                 for(size_t j=ptr[a];j<ptr[a+1];++j) {
@@ -383,7 +778,17 @@ struct RemovalLinks {
                         int projection=primary.s;
                         for(auto &op:ops)projection-=op.spin==0 ? 1 : -1;
                         if(projection!=family.m)return;
-                        unsigned matrix=bank.get(g,ops,family.spin,family.m);
+                        unsigned matrix;
+                        // Sampling avoids calling the clock for every hit.
+                        if((lookups++ & 2047)==0) {
+                            const size_t classes=bank.matrices.size();
+                            const auto lookup_start=Clock::now();
+                            matrix=bank.get(g,ops,family.spin,family.m,workers);
+                            if(bank.matrices.size()==classes) {
+                                sampled_hit_ns+=ns(lookup_start);
+                                ++sampled_hits;
+                            }
+                        } else matrix=bank.get(g,ops,family.spin,family.m,workers);
                         const auto &c=bank.matrices[matrix];
                         bool used=false;
                         if(g.canonical_full() || !keep_block_ids) {
@@ -421,12 +826,105 @@ struct RemovalLinks {
         }
         if(keep_reverse)build_reverse(primary.groups.size());
         if(bytes()>maximum-compact_builder_bytes)throw BudgetError("removal links exceed metadata budget");
+        construction["posting_compile_ns"]=ns(start);
+        construction["removal_matrix_build_ns"]=bank.build_ns()-initial_build_ns;
+        construction["parallel_removal_matrices"]=bank.parallel_builds()-initial_parallel_builds;
+        construction["removal_lookup_hits"]=lookups-(bank.matrices.size()-initial_classes);
+        construction["removal_lookup_samples"]=sampled_hits;
+        construction["removal_lookup_sample_ns"]=sampled_hit_ns;
+    }
+
+    void merge_ranges(const RemovalLinks &old,const RemovalLinks &delta,Workers &workers,
+                      const std::vector<std::pair<int,int>> *old_pairs,int modes,size_t tasks) {
+        // Keep every residue and its spin families within one task. The
+        // prefix of merged block counts fixes each destination block range.
+        // Parents are never deduplicated, so their source prefixes also give
+        // the destination parent offset without another counting pass.
+        struct Range {
+            size_t key,old_first,old_last,delta_first,delta_last;
+            size_t block_count=0,block_offset=0,entries=0;
+        };
+        std::array<Range,256> ranges{};
+        auto boundary=[&](size_t i) {return keys.size()/tasks*i+keys.size()%tasks*i/tasks;};
+        auto lower=[&](const RemovalLinks &source,size_t key) {
+            if(key==keys.size())return source.blocks.size();
+            return size_t(std::lower_bound(source.blocks.begin(),source.blocks.end(),keys[key],
+                [&](const Block &block,const auto &value){return source.keys[block.config]<value;})-source.blocks.begin());
+        };
+        const auto order=[](const RemovalLinks &source,const Block &block) {
+            return std::tie(source.keys[block.config],block.family);
+        };
+        workers.run(tasks,[&](size_t t,size_t) {
+            auto &r=ranges[t];
+            r.key=boundary(t);
+            r.old_first=lower(old,r.key);
+            r.old_last=lower(old,boundary(t+1));
+            r.delta_first=lower(delta,r.key);
+            r.delta_last=lower(delta,boundary(t+1));
+            r.block_count=r.old_last-r.old_first+r.delta_last-r.delta_first;
+            size_t a=r.old_first,b=r.delta_first;
+            while(a<r.old_last && b<r.delta_last) {
+                const auto x=order(old,old.blocks[a]),y=order(delta,delta.blocks[b]);
+                if(x<y)++a;
+                else if(y<x)++b;
+                else {++a;++b;--r.block_count;}
+            }
+        });
+        size_t total=0;
+        for(size_t t=0;t<tasks;++t) {
+            ranges[t].block_offset=total;
+            total+=ranges[t].block_count;
+        }
+        blocks.resize(total);
+        parents.resize(checked_add(old.parents.size(),delta.parents.size()));
+        const auto parent_start=[](const RemovalLinks &source,size_t block) {
+            return block==source.blocks.size() ? source.parents.size() : source.blocks[block].begin;
+        };
+        workers.run(tasks,[&](size_t t,size_t) {
+            auto &r=ranges[t];
+            size_t a=r.old_first,b=r.delta_first,key=r.key,block=r.block_offset;
+            size_t next=parent_start(old,a)+parent_start(delta,b);
+            while(a<r.old_last || b<r.delta_last) {
+                const Block *x=a<r.old_last ? &old.blocks[a] : nullptr;
+                const Block *y=b<r.delta_last ? &delta.blocks[b] : nullptr;
+                if(x && y) {
+                    if(order(old,*x)<order(delta,*y))y=nullptr;
+                    else if(order(delta,*y)<order(old,*x))x=nullptr;
+                }
+                const auto &source=x ? old : delta;
+                const auto &item=x ? *x : *y;
+                while(keys[key]!=source.keys[item.config])++key;
+                const size_t first=next;
+                if(x) {
+                    for(size_t j=x->begin;j<x->end;++j) {
+                        auto posting=old.parents[j];
+                        if(old_pairs) {
+                            const auto [p,q]=(*old_pairs)[posting.channel];
+                            posting.channel=schedule_index(pair_index(p,q,modes));
+                        }
+                        parents[next++]=posting;
+                    }
+                    ++a;
+                }
+                if(y) {
+                    std::copy(delta.parents.begin()+y->begin,delta.parents.begin()+y->end,parents.begin()+next);
+                    next+=y->end-y->begin;
+                    ++b;
+                }
+                blocks[block++]={schedule_index(key),item.family,first,next,item.dim};
+                if((next-first)>(no_row-r.entries)/item.dim)
+                    throw BudgetError("removal amplitude size overflow");
+                r.entries+=(next-first)*item.dim;
+            }
+        });
+        for(size_t t=0;t<tasks;++t)entries=checked_add(entries,ranges[t].entries);
     }
 
     // Merge the compiled suffix into a previous append-only N-2 schedule.
     // The same residue/spin family must mix all old and new channels together.
     RemovalLinks(const RemovalLinks &old,const RemovalLinks &delta,size_t group_count,
-                 size_t maximum,bool keep_reverse,const std::vector<std::pair<int,int>> *old_pairs,int modes) {
+                 size_t maximum,bool keep_reverse,const std::vector<std::pair<int,int>> *old_pairs,int modes,
+                 Workers &workers) {
         const size_t retained=delta.bytes();
         if(retained>maximum || old.bytes()>maximum-retained ||
             (keep_reverse && group_count-old.reverse_ptr.size()+1>
@@ -438,33 +936,37 @@ struct RemovalLinks {
         keys.reserve(checked_add(old.keys.size(),delta.keys.size()));
         std::set_union(old.keys.begin(),old.keys.end(),delta.keys.begin(),delta.keys.end(),std::back_inserter(keys));
         residue_count=keys.size();
-        size_t a=0,b=0;
-        for(size_t id=0;id<keys.size();++id) {
-            for(size_t f=0;f<families.size();++f) {
-                const size_t first=parents.size();
-                size_t dim=0;
-                auto append=[&](const RemovalLinks &source,size_t &cursor,bool decode) {
-                    if(cursor==source.blocks.size())return;
-                    const auto &block=source.blocks[cursor];
-                    if(source.keys[block.config]!=keys[id] || block.family!=f)return;
-                    ++cursor;
-                    dim=block.dim;
-                    for(size_t j=block.begin;j<block.end;++j) {
-                        auto posting=source.parents[j];
-                        if(decode) {
-                            const auto [p,q]=(*old_pairs)[posting.channel];
-                            posting.channel=schedule_index(pair_index(p,q,modes));
+        const size_t tasks=std::min({workers.count(),keys.size()/65536,size_t(256)});
+        if(tasks>1)merge_ranges(old,delta,workers,old_pairs,modes,tasks);
+        else {
+            size_t a=0,b=0;
+            for(size_t id=0;id<keys.size();++id) {
+                for(size_t f=0;f<families.size();++f) {
+                    const size_t first=parents.size();
+                    size_t dim=0;
+                    auto append=[&](const RemovalLinks &source,size_t &cursor,bool decode) {
+                        if(cursor==source.blocks.size())return;
+                        const auto &block=source.blocks[cursor];
+                        if(source.keys[block.config]!=keys[id] || block.family!=f)return;
+                        ++cursor;
+                        dim=block.dim;
+                        for(size_t j=block.begin;j<block.end;++j) {
+                            auto posting=source.parents[j];
+                            if(decode) {
+                                const auto [p,q]=(*old_pairs)[posting.channel];
+                                posting.channel=schedule_index(pair_index(p,q,modes));
+                            }
+                            parents.push_back(posting);
                         }
-                        parents.push_back(posting);
-                    }
-                };
-                append(old,a,old_pairs!=nullptr);
-                append(delta,b,false);
-                if(first==parents.size())continue;
-                blocks.push_back({schedule_index(id),schedule_index(f),first,parents.size(),dim});
-                if((parents.size()-first)>(no_row-entries)/dim)
-                    throw BudgetError("removal amplitude size overflow");
-                entries+=(parents.size()-first)*dim;
+                    };
+                    append(old,a,old_pairs!=nullptr);
+                    append(delta,b,false);
+                    if(first==parents.size())continue;
+                    blocks.push_back({schedule_index(id),schedule_index(f),first,parents.size(),dim});
+                    if((parents.size()-first)>(no_row-entries)/dim)
+                        throw BudgetError("removal amplitude size overflow");
+                    entries+=(parents.size()-first)*dim;
+                }
             }
         }
         weighted_links=checked_add(old.weighted_links,delta.weighted_links);

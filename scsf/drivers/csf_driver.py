@@ -244,11 +244,13 @@ def print_timings(timing, wall):
         ('Ritz projection and solve', timing['ritz']),
         ('Davidson orthogonalization', timing['orthogonalization']),
         ('Davidson restarts', timing['restart']),
+        ('Davidson basis storage', timing['basis_append']),
         ('Other Davidson work', timing['solver_bookkeeping']),
         ('Independent residual checks', timing['residual']),
         ('HCI selection', timing['selection']),
         ('Basis extension', timing['basis_extend']),
-        ('Operator replacement and diagonal reuse', timing['replacement'] + timing['diagonal_reuse']),
+        ('Operator replacement', timing['replacement']),
+        ('Diagonal reuse', timing['diagonal_reuse']),
         ('Selection bookkeeping and guess remap', timing['selection_overhead'] + timing['guess_remap']),
     ]
     rows += [('Other driver overhead', max(0., wall-sum(seconds for _, seconds in rows))),
@@ -300,7 +302,7 @@ def run_hci(args, parser, started):
             timing[phase] += measurements[f'{phase}_seconds']
         solver = measurements['solver']
         preconditioner_memory_peak = max(preconditioner_memory_peak, measurements['preconditioner_memory_peak'])
-        for phase in ('ritz', 'orthogonalization', 'restart'):
+        for phase in ('ritz', 'orthogonalization', 'restart', 'basis_append'):
             timing[phase] += solver[f'{phase}_ns']*1e-9
         timing['solver_products'] += solver['product_ns']*1e-9
         timing['solver_other'] += (solver['total_ns']-solver['product_ns'])*1e-9

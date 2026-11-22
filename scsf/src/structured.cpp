@@ -38,6 +38,10 @@ class StructuredHamiltonian {
         return auxiliary_ ? auxiliary_->info() : grouped_ ? grouped_->info() : wide_cih_ ? wide_cih_->info() : direct_->info();
     }
     size_t bound_bytes() const {return bounds_ ? bounds_->bytes() : 0;}
+    void drop_workspace() const {
+        if(grouped_)grouped_->release_workspace();
+        if(auxiliary_)auxiliary_->release_workspace();
+    }
     void record_peak(size_t bytes,const char *phase) {
         memory_left(memory_limit_,bytes,phase);
         peak_memory_=std::max(peak_memory_,bytes);
@@ -81,6 +85,7 @@ public:
         size_t old_metadata=0,old_coefficients=0;
         if(previous) {
             previous_lock=std::unique_lock<std::mutex>(previous->mutex_);
+            previous->drop_workspace();
             const auto old=previous->kernel_info();
             old_metadata=old.at("metadata_bytes");
             old_coefficients=old.at("coefficient_bytes");
@@ -108,10 +113,15 @@ public:
                 peak-=next.at("auxiliary_integral_bytes");
             record_peak(checked_add(tables,peak),"auxiliary Hamiltonian setup");
         } else {
+            size_t shared_coefficients=0;
             if(kernel_==Kernel::cih) {
-                if(k<=64 && primary_.n<=structured::OneBank::mask_electron_limit)
-                    grouped_=std::make_unique<structured::GroupedUGA>(primary_,one.data(),integrals_,workers_,fresh,slot_sweep);
-                else
+                if(k<=64 && primary_.n<=structured::OneBank::mask_electron_limit) {
+                    const auto *prior=reuse && previous ? previous->grouped_.get() : nullptr;
+                    if(prior && !prior->can_share_bank(primary_))prior=nullptr;
+                    if(prior)shared_coefficients=old_coefficients;
+                    grouped_=std::make_unique<structured::GroupedUGA>(primary_,one.data(),integrals_,workers_,
+                        checked_add(fresh,shared_coefficients),slot_sweep,prior);
+                } else
                     wide_cih_=std::make_unique<structured::WideCIH>(primary_,one.data(),integrals_,workers_,fresh);
             } else {
                 direct_=std::make_unique<structured::MatrixDirect>(primary_,one.data(),integrals_,workers_,fresh);
@@ -119,7 +129,8 @@ public:
             const auto next=kernel_info();
             const auto build=next.find("metadata_build_bytes");
             const size_t metadata=build==next.end() ? next.at("metadata_bytes") : build->second;
-            record_peak(checked_add(tables,checked_add(old_kernel,checked_add(metadata,next.at("coefficient_bytes")))),
+            const size_t new_coefficients=next.at("coefficient_bytes")-shared_coefficients;
+            record_peak(checked_add(tables,checked_add(old_kernel,checked_add(metadata,new_coefficients))),
                         "Hamiltonian setup");
             if(grouped_ && reuse && previous && previous->grouped_)
                 grouped_->reuse_plans(*previous->grouped_);
@@ -134,6 +145,10 @@ public:
         s["max_mem"]=memory_limit_;
         s["hci_table_bytes"]=bound_bytes();
         s["tracked_memory_bytes"]=checked_add(bound_bytes(),checked_add(s.at("metadata_bytes"),s.at("coefficient_bytes")));
+        if(grouped_ || auxiliary_) {
+            s["retained_workspace_bytes"]=grouped_ ? grouped_->workspace_bytes() : auxiliary_->workspace_bytes();
+            s["tracked_memory_bytes"]=checked_add(s["tracked_memory_bytes"],s["retained_workspace_bytes"]);
+        }
         s["peak_tracked_memory_bytes"]=std::max(peak_memory_,s["tracked_memory_bytes"]);
         s["hamiltonian_offdiagonal_bytes"]=0;s["exact_product"]=1;
         using structured::ERIFormat;
@@ -147,6 +162,11 @@ public:
         s["decoded_occupation_bytes"]=primary_.configuration_bytes();
         s["primary_rank_bytes"]=primary_.groups.capacity()*sizeof(structured::Primary::Group);
         return s;
+    }
+    void release_product_workspace() {
+        pybind11::gil_scoped_release release;
+        std::lock_guard<std::mutex> lock(mutex_);
+        drop_workspace();
     }
     pybind11::tuple select_hci(const Array &weights,double eps,bool complete,
             double stop_growth_fraction) {
@@ -163,6 +183,7 @@ public:
             for(size_t i=0;i<primary_.size();++i)
                 if(!std::isfinite(weights.data()[i]) || weights.data()[i]<0.)
                     throw std::invalid_argument("HCI weights must be finite and nonnegative");
+            drop_workspace();
             const auto current=kernel_info();
             const size_t kernel_bytes=checked_add(current.at("metadata_bytes"),current.at("coefficient_bytes"));
             const size_t tables=memory_left(memory_limit_,kernel_bytes,"Hamiltonian storage during HCI selection");
@@ -211,6 +232,10 @@ public:
         Stats stats;
         {
             pybind11::gil_scoped_release release;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                drop_workspace();
+            }
             std::fill_n(one.mutable_data(),one.size(),0.);
             std::fill_n(two.mutable_data(),two.size(),0.);
             stats=structured::occupation_rdms(primary_,x.data(),one.mutable_data(),two.mutable_data(),
@@ -226,8 +251,15 @@ public:
         pybind11::gil_scoped_release release;
         std::scoped_lock lock(mutex_,old.mutex_);
         if(old.diagonal_.empty())return;
-        std::vector<double> copy(primary_.size(),std::numeric_limits<double>::quiet_NaN());
-        for(size_t i=0;i<old.diagonal_.size();++i)copy.at(map.size() ? map.data()[i] : i)=old.diagonal_[i];
+        std::vector<double> copy;
+        if(!map.size()) {
+            copy.reserve(primary_.size());
+            copy.insert(copy.end(),old.diagonal_.begin(),old.diagonal_.end());
+            copy.resize(primary_.size(),std::numeric_limits<double>::quiet_NaN());
+        } else {
+            copy.resize(primary_.size(),std::numeric_limits<double>::quiet_NaN());
+            for(size_t i=0;i<old.diagonal_.size();++i)copy.at(map.data()[i])=old.diagonal_[i];
+        }
         diagonal_=std::move(copy);
         diagonal_ready_=false;
     }
@@ -295,6 +327,7 @@ public:
                 throw BudgetError("Hamiltonian product arrays for "+std::to_string(cols)+
                                   " RHS columns exceed remaining --max-mem ("+std::to_string(available)+" bytes)");
             const size_t arrays=entries*cols*sizeof(double);
+            if(cols!=1)drop_workspace();
             record_peak(checked_add(retained,arrays),"Hamiltonian product arrays");
             stats["product_array_bytes"]=arrays;
             std::fill(result.mutable_data(),result.mutable_data()+n*cols,0.);
@@ -355,6 +388,7 @@ void bind_structured(pybind11::module_ &m) {
         .def("_generator_probe",&StructuredHamiltonian::generator_probe)
         .def("reuse_diagonal",&StructuredHamiltonian::reuse_diagonal)
         .def("apply",&StructuredHamiltonian::apply)
+        .def("release_product_workspace",&StructuredHamiltonian::release_product_workspace)
         .def("diagonal",&StructuredHamiltonian::diagonal)
         .def_property_readonly("info",&StructuredHamiltonian::info);
 }

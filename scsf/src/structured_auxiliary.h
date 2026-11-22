@@ -37,10 +37,14 @@ class Auxiliary {
         Topology(const Primary &primary,size_t budget):bank(primary,budget){}
     };
     std::shared_ptr<Topology> topology_;
+    std::unique_ptr<double[]> vector_workspace_;
     std::vector<std::vector<double>> temporary_,mixed_,projected_;
     bool reused_topology_=false;
     bool reused_auxiliary_integrals_=false;
     size_t incremental_groups_=0,overlap_bytes_=0;
+    size_t removal_enumerate_ns_=0,removal_merge_ns_=0,folded_setup_ns_=0;
+    size_t pair_channels_ns_=0,pair_integrals_ns_=0;
+    Stats removal_detail_;
 
     static bool append_prefix(const Primary &p,const Auxiliary *previous) {
         if(!previous || previous->p_.groups.size()>p.groups.size())return false;
@@ -556,10 +560,20 @@ class Auxiliary {
             stats["folded_pair_ns"]+=ns(start);
             start=Clock::now();
         }
-        std::unique_ptr<double[]> partial(reduce ? new double[workers*output_size] : nullptr);
+        std::unique_ptr<double[]> block_workspace;
+        double *partial=nullptr;
+        if(reduce) {
+            if constexpr(Columns==1) {
+                if(!vector_workspace_)vector_workspace_.reset(new double[workers*output_size]);
+                partial=vector_workspace_.get();
+            } else {
+                block_workspace.reset(new double[workers*output_size]);
+                partial=block_workspace.get();
+            }
+        }
         std::atomic<size_t> next_one{0},next_two{0};
         auto run_worker=[&](size_t worker) {
-            double *local=reduce ? partial.get()+worker*output_size : output;
+            double *local=reduce ? partial+worker*output_size : output;
             if(reduce)std::fill_n(local,output_size,0.);
             auto &t=temporary_[worker],&u=mixed_[worker];
             auto process=[&](const RemovalLinks &links,bool pair,std::atomic<size_t> &next) {
@@ -629,13 +643,27 @@ public:
         auto construct=[&](bool use_delta) {
             topology_=std::make_shared<Topology>(p,budget);
             if(use_delta)topology_->bank=previous->topology_->bank;
+            auto collect=[&](const RemovalLinks &schedule) {
+                for(const auto &[name,value]:schedule.construction)removal_detail_[name]+=value;
+            };
             auto links=[&](int rank,size_t allowance) -> std::unique_ptr<RemovalLinks> {
-                if(!use_delta)
-                    return std::make_unique<RemovalLinks>(p_,topology_->bank,rank,allowance,mode_==0,!private_output_);
+                auto start=Clock::now();
+                const bool parallel_postings=mode_==1 && private_output_;
+                if(!use_delta) {
+                    auto next=std::make_unique<RemovalLinks>(p_,topology_->bank,rank,allowance,mode_==0,
+                        !private_output_,0,&workers_,parallel_postings);
+                    removal_enumerate_ns_+=ns(start);
+                    collect(*next);
+                    return next;
+                }
                 const auto &old=*previous->topology_;
-                RemovalLinks delta(p_,topology_->bank,rank,allowance,false,false,before);
+                RemovalLinks delta(p_,topology_->bank,rank,allowance,false,false,before,&workers_,parallel_postings);
+                removal_enumerate_ns_+=ns(start);
+                collect(delta);
+                start=Clock::now();
                 auto next=std::make_unique<RemovalLinks>(rank==1 ? *old.one : *old.two,delta,
-                    p_.groups.size(),allowance,!private_output_,rank==1 ? nullptr : &old.orbital_pairs,2*p_.k);
+                    p_.groups.size(),allowance,!private_output_,rank==1 ? nullptr : &old.orbital_pairs,2*p_.k,workers_);
+                removal_merge_ns_+=ns(start);
                 next->compact_builder_bytes=std::max(next->compact_builder_bytes,
                     checked_add(delta.bytes(),delta.compact_builder_bytes));
                 return next;
@@ -711,6 +739,7 @@ public:
                 // Only parent channels enter either end of the pair contraction.
                 // Compact their orbital-pair directory before constructing the
                 // optional integral table (important for sparse, wide orbital sets).
+                auto start=Clock::now();
                 size_t modes=2*size_t(p_.k),all_pairs=modes*(modes-1)/2;
                 if(all_pairs>(metadata-topology_->metadata_bytes)/sizeof(size_t))
                     throw BudgetError("pair channel directory exceeds metadata budget");
@@ -722,15 +751,31 @@ public:
                     if(channel_ids[channel]!=none) {
                         channel_ids[channel]=topology_->orbital_pairs.size();topology_->orbital_pairs.push_back({a,b});
                     }
-                for(auto &parent:topology_->two->parents)parent.channel=channel_ids[parent.channel];
+                auto &parents=topology_->two->parents;
+                constexpr size_t tile=16384;
+                if(parents.size()<=tile || workers_.count()==1) {
+                    for(auto &parent:parents)parent.channel=channel_ids[parent.channel];
+                } else {
+                    workers_.run(parents.size()/tile+(parents.size()%tile!=0),[&](size_t t,size_t) {
+                        const size_t first=t*tile,last=std::min(first+tile,parents.size());
+                        for(size_t i=first;i<last;++i)parents[i].channel=channel_ids[parents[i].channel];
+                    });
+                }
                 size_t orbital_bytes=topology_->orbital_pairs.capacity()*sizeof(topology_->orbital_pairs[0]);
                 if(orbital_bytes>metadata-topology_->metadata_bytes)throw BudgetError("pair directory exceeds metadata budget");
                 topology_->metadata_bytes+=orbital_bytes;
                 std::vector<size_t>().swap(channel_ids);
+                pair_channels_ns_=ns(start);
+                start=Clock::now();
                 prepare_pair_integrals(metadata-topology_->metadata_bytes);
+                pair_integrals_ns_=ns(start);
                 topology_->metadata_bytes+=(topology_->pair_integrals.capacity()+topology_->pair_features.capacity())*8
                     +(topology_->pair_rows.capacity()+topology_->pair_columns.capacity())*sizeof(size_t);
-                if(private_output_)fold_single_parent_pairs(metadata-topology_->metadata_bytes);
+                if(private_output_) {
+                    start=Clock::now();
+                    fold_single_parent_pairs(metadata-topology_->metadata_bytes);
+                    folded_setup_ns_+=ns(start);
+                }
             }
         };
         construct(incremental);
@@ -747,6 +792,8 @@ public:
         if(private_output_)return workers_.count()==1 ? 0 : workers_.count()*p_.size();
         return mode_==0 ? 2*topology_->one->entries : std::max(2*topology_->one->entries,topology_->two->entries);
     }
+    size_t workspace_bytes() const {return vector_workspace_ ? entries()*sizeof(double) : 0;}
+    void release_workspace() {vector_workspace_.reset();}
     void apply(const double *input,size_t cols,double *output,Stats &stats) {
         if(private_output_) {
             if(cols==1)apply_private<1>(input,cols,output,stats);
@@ -776,6 +823,7 @@ public:
     }
     Stats info() const {
         Stats s={{"metadata_bytes",topology_->metadata_bytes},{"metadata_build_bytes",reused_topology_ ? 0 : topology_->build_bytes},{"reused_removal_topology",reused_topology_},{"incremental_removal_groups",incremental_groups_},{"removal_metadata_overlap_bytes",overlap_bytes_},{"coefficient_bytes",topology_->bank.bytes()},
+            {"removal_enumerate_ns",removal_enumerate_ns_},{"removal_merge_ns",removal_merge_ns_},{"folded_setup_ns",folded_setup_ns_},
             {"singlet_magnetic_reduction",p_.s==0},
             {"removal_classes",topology_->bank.matrices.size()},{"one_auxiliary_configurations",topology_->one_configs},
             {"one_auxiliary_blocks",topology_->one->blocks.size()},{"one_parent_channels",topology_->one->parents.size()},
@@ -783,6 +831,7 @@ public:
             {"product_array_bytes_per_rhs",entries()*8},{"pair_integral_bytes",topology_->pair_integrals.capacity()*8},
             {"pair_factor_bytes",topology_->pair_features.capacity()*8},{"pair_factor_columns",topology_->feature_count},
             {"private_residue_output",private_output_}};
+        s.insert(removal_detail_.begin(),removal_detail_.end());
         for(auto &entry:topology_->one_banks)s["coefficient_bytes"]+=entry.second->bytes();
         if(mode_==0) {
             s["auxiliary_integral_bytes"]=auxiliary_integral_bytes();
@@ -791,6 +840,8 @@ public:
                 topology_->local_offsets.capacity()*sizeof(size_t);
         }
         if(topology_->two) {
+            s["pair_channels_ns"]=pair_channels_ns_;
+            s["pair_integrals_ns"]=pair_integrals_ns_;
             s["two_auxiliary_configurations"]=topology_->two_configs;s["two_auxiliary_blocks"]=topology_->two->blocks.size();
             s["two_parent_channels"]=topology_->two->parents.size();s["two_weighted_links"]=topology_->two->weighted_links;s["two_intermediate_entries"]=topology_->two->entries;
             s["folded_pair_terms"]=topology_->folded_pairs.size();

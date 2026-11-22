@@ -88,7 +88,7 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
     started = perf_counter_ns()
     if stats is not None:
         stats.clear()
-        stats.update(product_ns=0, orthogonalization_ns=0, ritz_ns=0, restart_ns=0,
+        stats.update(product_ns=0, orthogonalization_ns=0, ritz_ns=0, restart_ns=0, basis_append_ns=0,
                      product_calls=0, product_columns=0, jd_product_calls=0, iterations=0, restarts=0, call_widths=[])
     def timed(name):
         def decorate(function):
@@ -106,7 +106,7 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
         if stats is not None:
             stats['total_ns'] = perf_counter_ns() - started
             stats['other_ns'] = stats['total_ns'] - sum(stats[k] for k in
-                ('product_ns', 'orthogonalization_ns', 'ritz_ns', 'restart_ns'))
+                ('product_ns', 'orthogonalization_ns', 'ritz_ns', 'restart_ns', 'basis_append_ns'))
             stats['converged'] = converged
         return values, vectors, converged
 
@@ -208,6 +208,30 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
             [additions.T @ images, additions.T @ addition_images],
         ])
 
+    basis_vectors = basis_images = None
+
+    @timed('basis_append_ns')
+    def store_basis(additions, addition_images, first):
+        nonlocal basis_vectors, basis_images
+        last = first + additions.shape[1]
+        capacity = 0 if basis_vectors is None else basis_vectors.shape[1]
+        if last > capacity:
+            size = min(max_subspace, max(last, 4, 2*capacity))
+            vectors = np.empty((dim, size), dtype=additions.dtype, order='F')
+            if first:
+                vectors[:, :first] = basis_vectors[:, :first]
+            basis_vectors = vectors
+        image_dtype = (addition_images.dtype if basis_images is None else
+                       np.result_type(basis_images.dtype, addition_images.dtype))
+        if last > capacity or image_dtype != basis_images.dtype:
+            images = np.empty(basis_vectors.shape, dtype=image_dtype, order='F')
+            if first:
+                images[:, :first] = basis_images[:, :first]
+            basis_images = images
+        basis_vectors[:, first:last] = additions
+        basis_images[:, first:last] = addition_images
+        return basis_vectors[:, :last], basis_images[:, :last]
+
     def jd_correction(v, shift, residual):
         def project(x):
             return x-v*np.dot(v, x)
@@ -265,7 +289,7 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
     nseed = min(roots, max_subspace-V.shape[1])
     if nseed:
         V = np.column_stack((V, supplement(V, nseed)))
-    AV = apply(V)
+    V, AV = store_basis(V, apply(V), 0)
     projected = project_basis(V, AV)
     previous_report = started
     for iteration in range(maxiter):
@@ -318,10 +342,10 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
             # H a second time to the retained columns.
             if X.shape[1] >= max_subspace:
                 return finish(L, X, False)
+            V, AV = store_basis(X, AX, 0)
             if stats is not None:
                 stats['restarts'] += 1
                 restart_start, orthogonal_before = perf_counter_ns(), stats['orthogonalization_ns']
-            V, AV = X, AX
             corrections = orthogonalize(corrections, V)
             if stats is not None:
                 stats['restart_ns'] += perf_counter_ns() - restart_start - (stats['orthogonalization_ns'] - orthogonal_before)
@@ -331,6 +355,5 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
             return finish(L, X, False)
         correction_images = apply(corrections)
         projected = expand_projection(projected, V, AV, corrections, correction_images)
-        V = np.column_stack((V, corrections))
-        AV = np.column_stack((AV, correction_images))
+        V, AV = store_basis(corrections, correction_images, V.shape[1])
     return finish(L, X, False)

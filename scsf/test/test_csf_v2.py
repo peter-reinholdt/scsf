@@ -1,4 +1,5 @@
 """Signed native occupation-block, growth and CIH cross-checks."""
+from itertools import combinations, islice
 from pathlib import Path
 
 import numpy as np
@@ -210,6 +211,56 @@ def test_hci_tables_share_the_memory_cap_with_operator():
     assert tuple(limited.labels()) == ('22000',)
 
 
+def test_cih_reuses_vector_workspace_and_releases_it_for_other_operations():
+    ham = random_hamiltonian(5)
+    w = wavefunction(5, 4, 0, ['22000', '20200', '20020'])
+    op = scsf.csf_structured_op(ham, w, strategy='cih', nthreads=2)
+    matrix = hamiltonian_block(ham, tuple(w), tuple(w), 0)
+    vector = np.arange(len(w), dtype=float)
+    for trial in (vector, -vector):
+        np.testing.assert_allclose(op.matvec(trial), matrix@trial, atol=1e-12)
+        info = op.product_info
+        assert info['retained_workspace_bytes'] == 2*len(w)*8
+        assert info['tracked_memory_bytes'] <= info['peak_tracked_memory_bytes']
+    block = np.column_stack((vector, -vector))
+    np.testing.assert_allclose(op.matmat(block), matrix@block, atol=1e-12)
+    assert op.product_info['retained_workspace_bytes'] == 0
+    op.matvec(vector)
+    op.select_hci(np.zeros(len(w)), .1)
+    assert op.product_info['retained_workspace_bytes'] == 0
+
+
+def test_nminus2_private_vector_workspace_survives_retry_and_releases():
+    ham = random_hamiltonian(5)
+    w = scsf.csf_wfn(5, 4, 0)
+    w.add_all_csfs()
+    opts = dict(strategy='nminus2', pair_accumulation='private', nthreads=3)
+    probe = scsf.csf_structured_op(ham, w, **opts)
+    x = np.random.default_rng(918).normal(size=len(w))
+    reference = probe.matvec(x)
+    expected_bytes = len(w)*3*8
+    assert probe.product_info['retained_workspace_bytes'] == expected_bytes
+    cap = probe.product_info['peak_tracked_memory_bytes']
+    limited = scsf.csf_structured_op(ham, w, max_mem=cap, **opts)
+    np.testing.assert_allclose(limited.matvec(x), reference, atol=1e-12)
+    columns = cap//expected_bytes+1
+    with pytest.raises(MemoryError, match='product arrays'):
+        limited.matmat(np.zeros((len(w), columns)))
+    np.testing.assert_allclose(limited.matvec(-x), -reference, atol=1e-12)
+    assert limited.product_info['retained_workspace_bytes'] == expected_bytes
+    assert limited.matmat(np.empty((len(w), 0))).shape == (len(w), 0)
+    assert limited.product_info['retained_workspace_bytes'] == 0
+    block = np.column_stack((x, -x))
+    np.testing.assert_allclose(probe.matmat(block), np.column_stack((reference, -reference)), atol=1e-12)
+    assert probe.product_info['retained_workspace_bytes'] == 0
+    probe.matvec(x)
+    probe.select_hci(np.zeros(len(w)), .1, selection_unit='configuration')
+    assert probe.product_info['retained_workspace_bytes'] == 0
+    serial = scsf.csf_structured_op(ham, w, strategy='nminus2', nthreads=1)
+    np.testing.assert_allclose(serial.matvec(x), reference, atol=1e-12)
+    assert serial.product_info['retained_workspace_bytes'] == 0
+
+
 def test_grouped_cih_reuses_only_plans_unaffected_by_appended_occupations():
     one = np.zeros((6, 6))
     one[0, 3] = one[3, 0] = .5
@@ -220,10 +271,53 @@ def test_grouped_cih_reuses_only_plans_unaffected_by_appended_occupations():
     _, stats = op.select_hci([1., 0., 0.], .1, selection_unit='configuration')
     assert stats['added'] == 1
     assert op.product_info['reused_plans'] == 1
+    assert op.product_info['reused_spin_bank'] == 1
     labels = tuple(op.labels())
     ref = hamiltonian_block(ham, labels, labels, 0)
     np.testing.assert_allclose(op.matmat(np.eye(len(labels))), ref, atol=1e-12)
     assert op.last_product_stats['plans_built'] == len(labels)-1
+
+
+def test_grouped_cih_suffix_index_reuses_only_unaffected_plans():
+    k = 19
+    ham = random_hamiltonian(k, seed=217)
+    w = scsf.csf_wfn(k, 4, 0)
+
+    def add(sites):
+        w.add_configuration(tuple(int(i in sites) for i in range(k)))
+
+    add((0, 1, 2, 3))
+    add((4, 5, 6, 7))
+    op = scsf.csf_structured_op(ham, w, strategy='cih', nthreads=2)
+    op.matvec(np.ones(len(w)))
+
+    for sites in islice(combinations(range(4, k), 4), 1, 1026):
+        add(sites)
+    op.update(ham, w)
+    assert op.product_info['reused_spin_bank'] == 1
+    assert op.product_info['reused_plans'] == 1
+    ref = scsf.csf_structured_op(ham, w, strategy='nminus2', nthreads=2)
+    x = np.random.default_rng(926).normal(size=(len(w), 2)) / np.sqrt(len(w))
+    np.testing.assert_allclose(op.matmat(x), ref.matmat(x), atol=1e-11, rtol=1e-11)
+    assert op.last_product_stats['plans_built'] == 1026
+
+
+def test_grouped_cih_width_one_complete_eight_open_shells():
+    k = 9
+    ham = random_hamiltonian(k, seed=256)
+    w = scsf.csf_wfn(k, 8, 0)
+    for vacancy in (0, 2, 5, 8):
+        w.add_configuration(tuple(int(i != vacancy) for i in range(k)))
+    assert len(w) == 56
+    opts = dict(nthreads=3)
+    cih = scsf.csf_structured_op(ham, w, strategy='cih', **opts)
+    nminus2 = scsf.csf_structured_op(ham, w, strategy='nminus2', **opts)
+    vector = np.random.default_rng(256).normal(size=len(w))
+    coordinate = np.zeros(len(w))
+    coordinate[19] = -1.
+    for trial in (vector, coordinate):
+        np.testing.assert_allclose(cih.matvec(trial), nminus2.matvec(trial),
+                                   atol=1e-11, rtol=1e-11)
 
 
 def test_wide_grouped_cih():
@@ -415,6 +509,72 @@ def test_new_occupations_merge_nminus2_removal_postings(accumulation):
         np.testing.assert_allclose(op.matmat(trial), fresh.matmat(trial), atol=1e-12)
         np.testing.assert_allclose(op.matvec(trial[:, 0]), fresh.matmat(trial)[:, 0], atol=1e-12)
         np.testing.assert_allclose(op.diagonal(), fresh.diagonal(), atol=1e-12)
+
+
+def test_parallel_private_nminus2_postings_match_serial_and_append():
+    k = 23
+    rng = np.random.default_rng(601)
+    patterns = set()
+    while len(patterns) < 2400:
+        patterns.add(tuple(sorted(rng.choice(k, size=8, replace=False))))
+    labels = []
+    for sites in sorted(patterns):
+        label = ['0'] * k
+        for site, step in zip(sites, 'uududdud'):
+            label[site] = step
+        labels.append(''.join(label))
+
+    h = random_hamiltonian(k, seed=595)
+    w = wavefunction(k, 8, 0, labels)
+    op = scsf.csf_structured_op(h, w, strategy='nminus2', nthreads=3)
+    assert op.product_info['parallel_posting_tasks'] >= 2
+
+    def compare_with_serial():
+        serial = scsf.csf_structured_op(h, w, strategy='nminus2', nthreads=1)
+        x = rng.normal(size=(len(w), 2))
+        x /= np.linalg.norm(x, axis=0)
+        np.testing.assert_allclose(op.diagonal(), serial.diagonal(), atol=1e-11, rtol=1e-11)
+        np.testing.assert_allclose(op.matvec(x[:, 0]), serial.matvec(x[:, 0]), atol=1e-11, rtol=1e-11)
+        np.testing.assert_allclose(op.matmat(x), serial.matmat(x), atol=1e-11, rtol=1e-11)
+
+    compare_with_serial()
+    w.add_csf('2222' + '0' * (k-4))
+    op.update(h, w)
+    assert op.product_info['incremental_removal_groups'] == 1
+    compare_with_serial()
+
+
+@pytest.mark.parametrize('k', [32, 33, 64, 65, 138, 193, 256, 257])
+def test_nminus2_removal_classes_at_occupation_boundaries(k):
+    rng = np.random.default_rng(104)
+    sites = [0, k//2, k-2, k-1]
+    labels = ['2200', 'udud', 'uudd', 'u02d', '0022']
+    one = rng.normal(size=(4, 4))
+    one = (one + one.T) / 2
+    factors = rng.normal(size=(3, 10)) * .1
+    small_h = scsf.CholeskyHamiltonian(0., one, factors)
+    small_w = wavefunction(4, 4, 0, labels)
+    reference = scsf.csf_structured_op(small_h, small_w, strategy='cih')
+
+    large_one = np.zeros((k, k))
+    large_one[np.ix_(sites, sites)] = one
+    large_factors = np.zeros((3, k*(k+1)//2))
+    for column, (i, j) in enumerate(zip(*np.tril_indices(4))):
+        p, q = sites[i], sites[j]
+        large_factors[:, p*(p+1)//2+q] = factors[:, column]
+    large_h = scsf.CholeskyHamiltonian(0., large_one, large_factors)
+    wide_labels = []
+    for compact in labels:
+        label = ['0'] * k
+        for site, step in zip(sites, compact):
+            label[site] = step
+        wide_labels.append(''.join(label))
+    w = wavefunction(k, 4, 0, wide_labels)
+    op = scsf.csf_structured_op(large_h, w, strategy='nminus2', nthreads=2)
+    x = rng.normal(size=(len(w), 2))
+    np.testing.assert_allclose(op.diagonal(), reference.diagonal(), atol=1e-11, rtol=1e-11)
+    np.testing.assert_allclose(op.matvec(x[:, 0]), reference.matvec(x[:, 0]), atol=1e-11, rtol=1e-11)
+    np.testing.assert_allclose(op.matmat(x), reference.matmat(x), atol=1e-11, rtol=1e-11)
 
 
 def test_cih_slot_sweep_matches_immediate_probes():
