@@ -2,6 +2,7 @@
  * See LICENSE for details. */
 
 #include "csf.h"
+#include "basis.h"
 #include "pair_descriptor.h"
 #include "structured_eri.h"
 #include <type_traits>
@@ -130,11 +131,21 @@ void HCITransferBounds::prepare_single_bounds(int k) {
 }
 
 bool HCITransferBounds::prepare_ordered_singles(int k,int nelec,size_t limit) {
+    if(k<2)return false;
     std::call_once(ordered_singles_once_,[&] {
-        if (single_bounds_.empty()) return;
         const size_t entries=size_t(k)*(k-1);
         const size_t available=memory_left(limit,bytes(),"HCI transfer bounds");
-        memory_left(available,entries*sizeof(BoundedTransfer),"ordered HCI single transfers");
+        if (single_bounds_.empty()) {
+            // For wide bases, the single-transfer tables are optional. Leave
+            // room for the ordered index and preserve the direct bound when
+            // the tables do not fit.
+            if (entries>available/sizeof(BoundedTransfer) ||
+                size_t(k)>(available-entries*sizeof(BoundedTransfer))/sizeof(double)/k/(size_t(k)+1))
+                return;
+            prepare_single_bounds(k);
+        }
+        const size_t remaining=memory_left(limit,bytes(),"HCI transfer bounds");
+        memory_left(remaining,entries*sizeof(BoundedTransfer),"ordered HCI single transfers");
         std::vector<BoundedTransfer> ordered;
         ordered.reserve(entries);
         std::vector<double> spectators(k);
@@ -156,7 +167,7 @@ bool HCITransferBounds::prepare_ordered_singles(int k,int nelec,size_t limit) {
                 return a.bound!=b.bound ? a.bound>b.bound : a.p<b.p;
             });
         }
-        memory_left(available,ordered.capacity()*sizeof(BoundedTransfer),"ordered HCI single transfers");
+        memory_left(remaining,ordered.capacity()*sizeof(BoundedTransfer),"ordered HCI single transfers");
         ordered_singles_.swap(ordered);
         ordered_single_electrons_=nelec;
     });
@@ -170,15 +181,18 @@ HCITransferBounds::ordered_singles(int q,int k) const {
 }
 
 double HCITransferBounds::single_bound(const Config &source,int p,int q,int k,
-                                       std::uint64_t occupied,std::uint64_t doubled) const {
+                                       const Occupation &key) const {
     if(single_bounds_.empty())return selection_bound(source,{q,0},{p,0},1,k);
     const double *row=single_bounds_.data()+(size_t(p)*k+q)*(k+1);
-    occupied&=~((~doubled)&(std::uint64_t(1)<<q));
     double result=row[k];
-    while(occupied) {
-        result+=row[__builtin_ctzll(occupied)];
-        occupied&=occupied-1;
-    }
+    const auto sum_limb=[&](const Occupation::Limb &limb,size_t base) {
+        auto occupied=limb[0];
+        if(size_t(q)/64==base/64)
+            occupied&=~((~limb[1])&(std::uint64_t(1)<<(q%64)));
+        for(;occupied;occupied&=occupied-1)result+=row[base+__builtin_ctzll(occupied)];
+    };
+    sum_limb(key.first,0);
+    for(size_t i=0;i<key.high.size();++i)sum_limb(key.high[i],(i+1)*64);
     // The table entries already round outward. Inflate the sum for at most
     // k double additions. A zero sum consists entirely of exact zeros.
     if(result==0.)return 0.;

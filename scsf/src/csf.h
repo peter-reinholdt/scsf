@@ -19,6 +19,8 @@
 namespace scsf {
 using Array = pybind11::array_t<double, pybind11::array::c_style>;
 using Config = std::vector<int>;
+struct Occupation;
+namespace structured { class Workers; }
 
 struct Path {
     std::string label;
@@ -91,7 +93,9 @@ class HCITransferBounds {
     Array one_, two_;
     std::vector<double> transfer_bounds_,single_bounds_;
     std::once_flag bound_once_, ordered_once_, ordered_singles_once_;
-    std::vector<BoundedTransfer> ordered_transfers_, ordered_singles_;
+    std::unique_ptr<BoundedTransfer[]> ordered_transfers_;
+    size_t ordered_transfer_count_=0;
+    std::vector<BoundedTransfer> ordered_singles_;
     std::vector<size_t> ordered_offsets_;
     int ordered_single_electrons_=0;
     void prepare_single_bounds(int k);
@@ -101,8 +105,8 @@ public:
     void prepare_transfer_bounds(int k,size_t limit);
     double selection_bound(const Config &source, const std::array<int,2> &holes,
                            const std::array<int,2> &particles, int order, int k) const;
-    double single_bound(const Config &source,int p,int q,int k,std::uint64_t occupied,std::uint64_t doubled) const;
-    bool prepare_ordered_transfers(int k,size_t limit);
+    double single_bound(const Config &source,int p,int q,int k,const Occupation &key) const;
+    bool prepare_ordered_transfers(int k,size_t limit,structured::Workers &workers);
     std::pair<const BoundedTransfer *, const BoundedTransfer *> ordered_transfers(int q, int s, int k) const;
     bool prepare_ordered_singles(int k,int nelec,size_t limit);
     std::pair<const BoundedTransfer *, const BoundedTransfer *> ordered_singles(int q,int k) const;

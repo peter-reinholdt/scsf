@@ -93,11 +93,14 @@ def test_native_growth_strict_hci_and_remap(complete):
     np.testing.assert_allclose(op.diagonal(), fresh.diagonal(), atol=1e-12)
 
 
-def test_hci_single_transfer_threshold_is_strict():
-    one = np.diag(np.arange(4, dtype=float))
-    one[0, 1] = one[1, 0] = .125
-    ham = scsf.Hamiltonian(0., one, np.zeros((4,)*4))
-    basis = wavefunction(4, 1, 1, ['u000'])
+@pytest.mark.parametrize('k,hole,particle', [(4, 0, 1), (65, 64, 0)])
+def test_hci_single_transfer_threshold_is_strict(k, hole, particle):
+    one = np.diag(np.arange(k, dtype=float))
+    one[hole, particle] = one[particle, hole] = .125
+    ham = scsf.Hamiltonian(0., one, np.zeros((k,)*4))
+    initial = '0'*hole + 'u' + '0'*(k-hole-1)
+    target = '0'*particle + 'u' + '0'*(k-particle-1)
+    basis = wavefunction(k, 1, 1, [initial])
     op = scsf.csf_structured_op(ham, basis, nthreads=1)
     for eps in (np.nextafter(.125, np.inf), .125):
         _, stats = op.select_hci([1.], eps)
@@ -105,7 +108,7 @@ def test_hci_single_transfer_threshold_is_strict():
         assert stats['ordered_singles']
     _, stats = op.select_hci([1.], np.nextafter(.125, 0.))
     assert stats['added'] == 1
-    assert tuple(op.labels(native=True)) == ('u000', '0u00')
+    assert tuple(op.labels(native=True)) == (initial, target)
 
 
 def test_nminus1_reuses_integral_layout_after_growth():

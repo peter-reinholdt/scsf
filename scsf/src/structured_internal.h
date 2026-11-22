@@ -111,6 +111,13 @@ public:
     std::vector<Matrix> matrices;
     std::vector<unsigned> weights;
     RemovalBank(const Primary &primary,size_t maximum):spin_(primary.s),maximum_(maximum){}
+    void copy_classes(const RemovalBank &old) {
+        memory_left(maximum_,old.bytes_,"removal coefficients");
+        directory_=old.directory_;
+        matrices=old.matrices;
+        weights=old.weights;
+        bytes_=old.bytes_;
+    }
     static Key canonical_key(const Primary::Group &group,std::initializer_list<Operator> operators,
                              int sb,int mb) {
         const auto &ket=*group.cfg;
@@ -537,7 +544,7 @@ struct RemovalLinks {
         return __builtin_popcountll(key[0]^key[1]);
     }
     bool compile_private_singlet(const Primary &primary,RemovalBank &bank,int rank,size_t maximum,
-                                 const CompactRemovalResidues &compact,Workers &workers) {
+                                 const CompactRemovalResidues &compact,Workers &workers,size_t reused_groups) {
         using Key=RemovalBank::Key;
         constexpr size_t slots=4096,max_tasks=256;
         const size_t tasks=std::min({max_tasks,workers.count(),residue_count/16384});
@@ -560,16 +567,21 @@ struct RemovalLinks {
             for(size_t f=0;f<families.size();++f)
                 dims[singles][f]=SpinPaths(singles,families[f].spin,maximum/8).paths.size();
         }
-        const auto visit=[&](size_t t,auto block) {
+        const auto visit=[&](size_t t,size_t first_parent,auto block) {
             for(size_t a=boundary(t);a<boundary(t+1);++a) {
+                const size_t end=compact.ptr[a+1];
+                // Parents within a residue are sorted by group. Old groups
+                // only use classes already in the bank.
+                if(first_parent && std::get<0>(compact.posting(end-1))<first_parent)continue;
                 const size_t singles=compact_singles(compact,a);
                 for(size_t f=0;f<families.size();++f) {
                     const auto family=families[f];
                     const size_t dim=dims[singles][f];
                     if(!dim)continue;
                     block(a,f,dim,[&](auto add) {
-                        for(size_t j=compact.ptr[a];j<compact.ptr[a+1];++j) {
+                        for(size_t j=compact.ptr[a];j<end;++j) {
                             const auto [parent,p,q]=compact.posting(j);
+                            if(parent<first_parent)continue;
                             const auto &g=primary.groups[parent];
                             const int k=primary.k;
                             if(rank==1) {
@@ -599,7 +611,7 @@ struct RemovalLinks {
             Key empty{};
             empty[0]=-1;
             std::fill_n(local,slots,empty);
-            visit(t,[&](size_t,size_t,size_t,auto records) {
+            visit(t,reused_groups,[&](size_t,size_t,size_t,auto records) {
                 records([&](const Key &key,unsigned,size_t) {
                     if(missing_counts[t]>slots/2 || bank.lookup(key)!=none)return;
                     size_t i=RemovalBank::Hash{}(key)&(slots-1);
@@ -638,7 +650,7 @@ struct RemovalLinks {
         const auto counted=Clock::now();
         workers.run(tasks,[&](size_t t,size_t) {
             auto &c=counts[t];
-            visit(t,[&](size_t,size_t,size_t dim,auto records) {
+            visit(t,0,[&](size_t,size_t,size_t dim,auto records) {
                 const size_t before=c.parents;
                 records([&](const Key &key,unsigned,size_t) {
                     ++c.lookups;
@@ -678,7 +690,7 @@ struct RemovalLinks {
         blocks.resize(total.blocks);
         workers.run(tasks,[&](size_t t,size_t) {
             size_t parent=offsets[t].parents,block=offsets[t].blocks;
-            visit(t,[&](size_t a,size_t f,size_t dim,auto records) {
+            visit(t,0,[&](size_t a,size_t f,size_t dim,auto records) {
                 const size_t before=parent;
                 records([&](const Key &key,unsigned g,size_t channel) {
                     const size_t matrix=bank.lookup(key);
@@ -704,7 +716,7 @@ struct RemovalLinks {
 
     RemovalLinks(const Primary &primary,RemovalBank &bank,int rank,size_t maximum,
                  bool keep_block_ids,bool keep_reverse,size_t begin=0,Workers *workers=nullptr,
-                 bool parallel_postings=false) {
+                 bool parallel_postings=false,size_t reused_groups=0) {
         auto start=Clock::now();
         std::unique_ptr<CompactRemovalResidues> compact;
         if(primary.k<=64 && !keep_block_ids) {
@@ -752,7 +764,7 @@ struct RemovalLinks {
                     families.push_back({spin,m,primary.s==0 ? spin+1 : 1});
         }
         if(parallel_postings && compact && !keep_reverse && primary.s==0 && workers &&
-            compile_private_singlet(primary,bank,rank,maximum,*compact,*workers)) {
+            compile_private_singlet(primary,bank,rank,maximum,*compact,*workers,reused_groups)) {
             if(bytes()>maximum-compact_builder_bytes)throw BudgetError("removal links exceed metadata budget");
             construction["posting_compile_ns"]=ns(start);
             construction["removal_matrix_build_ns"]=bank.build_ns()-initial_build_ns;

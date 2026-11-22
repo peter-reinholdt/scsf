@@ -19,8 +19,9 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
     const auto &basis=*p.native;
     const auto start=structured::Clock::now();
     if (bounds) bounds->prepare_transfer_bounds(p.k,table_budget);
-    const bool ordered=bounds && bounds->prepare_ordered_transfers(p.k,table_budget);
+    const bool ordered=bounds && bounds->prepare_ordered_transfers(p.k,table_budget,workers);
     const bool ordered_singles=ordered && bounds->prepare_ordered_singles(p.k,p.n,table_budget);
+    const auto bounds_ns=structured::ns(start);
     struct Shard {
         std::mutex mutex;
         std::atomic<bool> ready{false};
@@ -46,38 +47,33 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
         return a.first>b.first || (a.first==b.first && a.second<b.second);
     });
 
-    struct Counts {
+    struct alignas(64) SearchWorker {
         size_t visits=0, screened=0, elements=0, candidates=0, single_suffix=0;
         std::array<size_t,3> rank_visits{};
+        Occupation key;
+        std::vector<int> occupied_sites;
     };
-    std::vector<Counts> counts(workers.count());
+    std::vector<SearchWorker> counts(workers.count());
+    const auto search_start=structured::Clock::now();
     workers.run(sources.size(),[&](size_t source,size_t worker) {
         auto [maximum,id]=sources[source];
         auto &stats=counts[worker];
         const auto &ket=*p.groups[id].cfg;
         const auto &block=basis.blocks()[id];
-        // A complete source has no missing ranks at transfer distance zero.
-        const auto [occupied,doubled]=block.key.first;
         std::vector<std::pair<double,Path>> parents;
-        parents.reserve(block.size());
-        for (size_t i=0;i<block.size();++i) {
-            const double weight=weights[block.offset+i];
-            if (weight==0.) continue;
-            parents.emplace_back(weight,Path(basis.spin(block.open).label(ket,block.rank(i)),p.k,p.s,2));
-        }
-        std::stable_sort(parents.begin(),parents.end(),[](const auto &a,const auto &b){return a.first>b.first;});
         Connection terms;
         auto visit=[&](const std::array<int,2> &holes,const std::array<int,2> &particles,int order) {
             ++stats.visits;
             ++stats.rank_visits[order];
             if(order==0 && block.complete())return;
             if (bounds && !(ordered && order==2)) {
-                const double bound=order==1 && p.k<=64
-                    ? bounds->single_bound(ket,particles[0],holes[0],p.k,occupied,doubled)
+                const double bound=order==1
+                    ? bounds->single_bound(ket,particles[0],holes[0],p.k,block.key)
                     : bounds->selection_bound(ket,holes,particles,order,p.k);
                 if (screened(bound,maximum,eps,p.k)) {++stats.screened;return;}
             }
-            Occupation key=block.key;
+            auto &key=stats.key;
+            key=block.key;
             key.transfer(holes,particles,order);
             const auto &spin=ranks[key.singles()];
             if (!spin || !spin->size()) return;
@@ -105,6 +101,16 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
             PairDescriptor pair(bra,ket,0,0,holes,particles,order);
             ranked_connection(pair,h,eri,true,terms);
             if(terms.generators.empty())return;
+            if(screened(terms.term_bound,maximum,eps,p.k)) {++stats.screened;return;}
+            if(parents.empty()) {
+                parents.reserve(block.size());
+                for(size_t i=0;i<block.size();++i) {
+                    const double weight=weights[block.offset+i];
+                    if(weight==0.)continue;
+                    parents.emplace_back(weight,Path(basis.spin(block.open).label(ket,block.rank(i)),p.k,p.s,2));
+                }
+                std::stable_sort(parents.begin(),parents.end(),[](const auto &a,const auto &b){return a.first>b.first;});
+            }
             // The prepared bound covers the *sum* of all generator paths.
             // Sort the source ranks once so one suffix rejection covers every
             // weaker parent, before any candidate path is unranked.
@@ -127,7 +133,7 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
             }
             if (additions.empty()) return;
             std::lock_guard<std::mutex> lock(shard.mutex);
-            auto &target=shard.targets.try_emplace(std::move(key)).first->second;
+            auto &target=shard.targets.try_emplace(key).first->second;
             shard.ready.store(true,std::memory_order_release);
             if (complete) return;
             std::vector<size_t> combined;
@@ -141,8 +147,11 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
             return;
         }
         visit({}, {},0);
-        for (int q=0;q<p.k;++q) {
-            if (!ket[q]) continue;
+        auto &occupied=stats.occupied_sites;
+        occupied.clear();
+        for(int q=0;q<p.k;++q)if(ket[q])occupied.push_back(q);
+        for(auto hole=occupied.begin();hole!=occupied.end();++hole) {
+            const int q=*hole;
             if (ordered_singles) {
                 auto [item,last]=bounds->ordered_singles(q,p.k);
                 for (;item!=last;++item) {
@@ -155,7 +164,8 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
             } else {
                 for (int a=0;a<p.k;++a) if (a!=q && ket[a]<2) visit({q,0},{a,0},1);
             }
-            for (int s=q;s<p.k;++s) {
+            for(auto second=hole;second!=occupied.end();++second) {
+                const int s=*second;
                 if (ket[s]<(q==s ? 2 : 1)) continue;
                 auto [item,last]=bounds->ordered_transfers(q,s,p.k);
                 for (;item!=last;++item) {
@@ -166,6 +176,7 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
             }
         }
     },4);
+    const auto search_ns=structured::ns(search_start);
     Basis::Additions result;
     size_t proposed=0;
     for (auto &shard:shards) for (auto &[cfg,selected]:shard.targets) {
@@ -174,6 +185,7 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
     }
     Stats stats{{"ordered_search",ordered},
                 {"ordered_singles",ordered_singles},
+                {"selection_bounds_ns",bounds_ns},{"selection_search_ns",search_ns},
                 {"proposed_csfs",proposed},
                 {"source_configurations",sources.size()},{"selection_ns",structured::ns(start)}};
     for (const auto &c:counts) {

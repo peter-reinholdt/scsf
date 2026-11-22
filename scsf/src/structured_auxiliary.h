@@ -41,7 +41,7 @@ class Auxiliary {
     std::vector<std::vector<double>> temporary_,mixed_,projected_;
     bool reused_topology_=false;
     bool reused_auxiliary_integrals_=false;
-    size_t incremental_groups_=0,overlap_bytes_=0;
+    size_t incremental_groups_=0,overlap_bytes_=0,reused_classes_=0;
     size_t removal_enumerate_ns_=0,removal_merge_ns_=0,folded_setup_ns_=0;
     size_t pair_channels_ns_=0,pair_integrals_ns_=0;
     Stats removal_detail_;
@@ -642,7 +642,10 @@ public:
         const bool incremental=before && p.k<=64 && added<=before/2;
         auto construct=[&](bool use_delta) {
             topology_=std::make_shared<Topology>(p,budget);
-            if(use_delta)topology_->bank=previous->topology_->bank;
+            if(before) {
+                topology_->bank.copy_classes(previous->topology_->bank);
+                reused_classes_=topology_->bank.matrices.size();
+            }
             auto collect=[&](const RemovalLinks &schedule) {
                 for(const auto &[name,value]:schedule.construction)removal_detail_[name]+=value;
             };
@@ -651,7 +654,7 @@ public:
                 const bool parallel_postings=mode_==1 && private_output_;
                 if(!use_delta) {
                     auto next=std::make_unique<RemovalLinks>(p_,topology_->bank,rank,allowance,mode_==0,
-                        !private_output_,0,&workers_,parallel_postings);
+                        !private_output_,0,&workers_,parallel_postings,before);
                     removal_enumerate_ns_+=ns(start);
                     collect(*next);
                     return next;
@@ -824,6 +827,7 @@ public:
     Stats info() const {
         Stats s={{"metadata_bytes",topology_->metadata_bytes},{"metadata_build_bytes",reused_topology_ ? 0 : topology_->build_bytes},{"reused_removal_topology",reused_topology_},{"incremental_removal_groups",incremental_groups_},{"removal_metadata_overlap_bytes",overlap_bytes_},{"coefficient_bytes",topology_->bank.bytes()},
             {"removal_enumerate_ns",removal_enumerate_ns_},{"removal_merge_ns",removal_merge_ns_},{"folded_setup_ns",folded_setup_ns_},
+            {"reused_removal_classes",reused_classes_},
             {"singlet_magnetic_reduction",p_.s==0},
             {"removal_classes",topology_->bank.matrices.size()},{"one_auxiliary_configurations",topology_->one_configs},
             {"one_auxiliary_blocks",topology_->one->blocks.size()},{"one_parent_channels",topology_->one->parents.size()},
