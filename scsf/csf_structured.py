@@ -206,6 +206,43 @@ class csf_structured_op:
                 self.last_product_stats = {}
         return remap, dict(stats)
 
+    @staticmethod
+    def _rdm_vector(coefficients):
+        if np.iscomplexobj(coefficients):
+            raise TypeError('density matrix coefficients must be real')
+        return np.asarray(coefficients, dtype=float, order='C')
+
+    def _rdm_budgets(self, output, links, workspace):
+        budgets = (output, self.max_mem if links is None else links,
+                   self.max_mem if workspace is None else workspace)
+        budgets = tuple(_integer(value, 'density matrix budget') for value in budgets)
+        if min(budgets) < 0:
+            raise ValueError('density matrix budgets must be nonnegative')
+        return budgets
+
+    def native_rdm1(self, coefficients):
+        """Return the spin-free 1-RDM of a real native-row coefficient vector."""
+        return self._state[1].rdm1(self._rdm_vector(coefficients))
+
+    def native_transition_rdm1(self, bra, ket):
+        """Return spin-free <bra|E_pq|ket> for real vectors in native row order."""
+        return self._state[1].transition_rdm1(self._rdm_vector(bra), self._rdm_vector(ket))
+
+    def native_rdm2(self, coefficients, *, max_output_bytes=256*1024**2,
+                    max_link_bytes=None, max_workspace_bytes=None):
+        """Return the spin-free 2-RDM in physicist order for a real native-row vector."""
+        budgets = self._rdm_budgets(max_output_bytes, max_link_bytes, max_workspace_bytes)
+        return self._state[1].rdm2(self._rdm_vector(coefficients), *budgets)
+
+    def native_transition_rdm2(self, bra, ket, *, max_output_bytes=256*1024**2,
+                               max_link_bytes=None, max_workspace_bytes=None):
+        """Return <bra|a†_p a†_r a_s a_q|ket>, spin-summed and indexed [p,r,q,s].
+
+        Both coefficient vectors must be real and use the operator's native row order.
+        """
+        budgets = self._rdm_budgets(max_output_bytes, max_link_bytes, max_workspace_bytes)
+        return self._state[1].transition_rdm2(self._rdm_vector(bra), self._rdm_vector(ket), *budgets)
+
     def native_rdms(self, coefficients, *, max_output_bytes=256*1024**2,
                     max_link_bytes=None, max_workspace_bytes=None, cache=False):
         """Return spin-free 1- and 2-RDMs of a real native-row vector and memory counters.
@@ -216,16 +253,8 @@ class csf_structured_op:
         With `cache=True` the last request for the current space is retained.
         Returned arrays can be modified independently of the cache.
         """
-        if np.iscomplexobj(coefficients):
-            raise TypeError('density matrix coefficients must be real')
-        x = np.asarray(coefficients, dtype=float, order='C')
-        budgets = (max_output_bytes,
-            self.max_mem if max_link_bytes is None else max_link_bytes,
-            self.max_mem if max_workspace_bytes is None else max_workspace_bytes,
-            self.max_mem)
-        budgets = tuple(_integer(value, 'density matrix budget') for value in budgets)
-        if min(budgets) < 0:
-            raise ValueError('density matrix budgets must be nonnegative')
+        x = self._rdm_vector(coefficients)
+        budgets = self._rdm_budgets(max_output_bytes, max_link_bytes, max_workspace_bytes)
         if not cache:
             return self._state[1].rdms(x, *budgets)
         with self._growth_lock:

@@ -212,8 +212,11 @@ public:
             if(ket[i]==1)++m;
             if(ket[i]==1 || i==p || i==q) { pi+=i<p;qi+=i<q; }
         }
-        int type=ket[p]==0 ? (ket[q]==1 ? 0 : 3) : (ket[q]==1 ? 2 : 1);
-        auto &table=tables_.at(address(m,type,pi,qi));
+        return get(m,ket[p],ket[q],pi,qi);
+    }
+    const Matrix &get(int open,int create_occupation,int destroy_occupation,int pi,int qi) const {
+        int type=create_occupation==0 ? (destroy_occupation==1 ? 0 : 3) : (destroy_occupation==1 ? 2 : 1);
+        const auto &table=tables_.at(address(open,type,pi,qi));
         if(!table)throw std::logic_error("missing canonical one-electron matrix");
         return *table;
     }

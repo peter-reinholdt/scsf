@@ -4,6 +4,7 @@
 Examples (run from the repository with SCSF importable)::
 
     python -m scsf --integrals scsf/test/data/lih_sto3g.npz --eps 1e-4
+    python -m scsf --integrals scsf/test/data/lih_sto3g.npz --natorb sci
     python -m scsf --xyz examples/water.xyz --basis sto-3g --eps 1e-4
     python -m scsf --xyz examples/water.xyz --basis cc-pvdz --ncore 1 --kernel nminus2
 
@@ -19,7 +20,8 @@ import numpy as np
 import scsf
 from ..config import default_cli_threads
 from ..csf import _configuration
-from .molecular import integrals_from_scf, run_scf
+from ..integrals import rotate_hamiltonian
+from .molecular import correlated_density, integrals_from_scf, run_scf
 from .solvers import solve_ci
 
 
@@ -37,6 +39,8 @@ def memory_bytes(value):
 
 def integrals(args, parser):
     if args.integrals:
+        if args.natorb in ('mp2', 'ccsd'):
+            parser.error(f'--natorb {args.natorb} requires --xyz')
         if args.ncore:
             parser.error('--ncore applies to XYZ input; snapshots must already contain active integrals')
         with np.load(args.integrals, allow_pickle=False) as data:
@@ -58,8 +62,25 @@ def integrals(args, parser):
     if args.nelec is not None:
         parser.error('--nelec applies to array snapshot input; XYZ uses the molecular charge')
     mf = run_scf(args.xyz, args.basis, args.charge, args.two_s, args.ncore, parser)
-    ham, nelec, _ = integrals_from_scf(mf, args.ncore)
-    return (ham, nelec)
+    mo_coeff = None
+    if args.natorb in ('mp2', 'ccsd'):
+        method = args.natorb.upper()
+        print(f'Generating natural orbitals from {method}', flush=True)
+        rotation = natural_orbitals(correlated_density(mf, args.ncore, args.natorb), method)
+        mo_coeff = mf.mo_coeff.copy()
+        mo_coeff[:, args.ncore:] = mo_coeff[:, args.ncore:] @ rotation
+    ham, nelec, _ = integrals_from_scf(mf, args.ncore, mo_coeff=mo_coeff)
+    return ham, nelec
+
+
+def natural_orbitals(density, method):
+    if not np.all(np.isfinite(density)):
+        raise RuntimeError(f'{method} produced a nonfinite 1-RDM')
+    occupations, orbitals = np.linalg.eigh((density + density.T) * .5)
+    order = np.argsort(-occupations, kind='stable')
+    values = ' '.join(f'{occupation:.8f}' for occupation in occupations[order])
+    print(f'{method} natural occupations=[{values}]', flush=True)
+    return orbitals[:, order]
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -76,6 +97,9 @@ def build_parser():
     space.add_argument('--nelec', type=int)
     space.add_argument('--two-s', type=int, default=0, help='twice the target total spin')
     space.add_argument('--reference', help='initial CSF path, right-padded with zeros (e.g. 2222 or 22ud)')
+    space.add_argument('--natorb', nargs='?', const='sci', type=str.lower, choices=('sci', 'mp2', 'ccsd'),
+                       help='use natural orbitals from a pilot SCI run (sci) or XYZ with PySCF (mp2, ccsd); '
+                            'bare --natorb selects sci')
     davidson.add_argument('--nroots', type=int, default=1)
     selection.add_argument('--eps', type=float, default=0.0001, help='HCI selection threshold')
     selection.add_argument('--stop-growth-fraction', type=float, default=0.01,
@@ -235,8 +259,10 @@ def grow_guess(vectors, size, remap=None):
 
 
 def print_timings(timing, wall):
-    rows = [
-        ('Integrals', timing['integrals']),
+    rows = [('Integrals', timing['integrals'])]
+    if 'natural_orbitals' in timing:
+        rows.append(('SCI density and orbital rotation', timing['natural_orbitals']))
+    rows += [
         ('Initial operator setup', timing['initial_setup']),
         ('Hamiltonian diagonal', timing['diagonal']),
         ('Davidson preconditioner setup', timing['preconditioner']),
@@ -273,19 +299,48 @@ def main(argv=None):
 
 
 def run_hci(args, parser, started):
-    progress = not args.quiet
     timing = Counter()
-    preconditioner_memory_peak = 0
-    if progress:
+    if not args.quiet:
         print(f'Loading integrals from {args.integrals or args.xyz}', flush=True)
     start = perf_counter()
     ham, nelec = integrals(args, parser)
     timing['integrals'] = perf_counter()-start
+
+    pilot_peak = 0
+    if args.natorb == 'sci':
+        print('Pilot SCI run for natural orbitals', flush=True)
+        _, vectors, op, pilot_peak = hci_pass(args, parser, ham, nelec, timing, started=started)
+        start = perf_counter()
+        density = np.zeros((ham.nbasis, ham.nbasis))
+        for root in range(vectors.shape[1]):
+            density += op.native_rdm1(vectors[:, root])
+        pilot_peak = max(pilot_peak, op.product_info['peak_tracked_memory_bytes'])
+        del vectors, op
+        rotation = natural_orbitals(density / args.nroots, 'SCI')
+        ham = rotate_hamiltonian(ham, rotation)
+        timing['natural_orbitals'] = perf_counter()-start
+    if args.natorb is not None:
+        print('HCI run in natural orbitals', flush=True)
+    energies, _, _, peak_memory = hci_pass(
+        args, parser, ham, nelec, timing, started=None if args.natorb == 'sci' else started)
+    for root, energy in enumerate(energies):
+        print(f'root={root} energy={energy:.12f} hartree')
+    wall = perf_counter()-started
+    print_timings(timing, wall)
+    print(f'Tracked native peak memory {max(peak_memory, pilot_peak)/1024**2:.2f} MiB')
+    if args.sci_stats:
+        print('timing_seconds ' + ' '.join(f'{phase}={seconds:.6f}' for phase, seconds in timing.items()))
+        print(f'driver_wall_seconds={wall:.6f}')
+
+
+def hci_pass(args, parser, ham, nelec, timing, *, started=None):
+    progress = not args.quiet
+    preconditioner_memory_peak = 0
     start = perf_counter()
     wfn, dimension = initial_space(args, parser, ham, nelec)
     op = make_operator(args, ham, wfn)
-    timing['initial_setup'] = perf_counter()-start
-    if args.sci_stats:
+    timing['initial_setup'] += perf_counter()-start
+    if args.sci_stats and started is not None:
         print(f'driver_startup_seconds={perf_counter()-started:.6f} cpus={args.worker_cpus}')
     print(f'{op.strategy}, {args.selection_unit} HCI selection, Davidson: '
           f'N={nelec}, 2S={args.two_s}, orbitals={ham.nbasis}, full dimension={dimension}')
@@ -361,15 +416,8 @@ def run_hci(args, parser, started):
         energies, vectors = solve_step(iteration, added, guess, final=final)
         if final:
             break
-    for root, energy in enumerate(energies):
-        print(f'root={root} energy={energy:.12f} hartree')
-    wall = perf_counter()-started
-    print_timings(timing, wall)
     peak_memory = max(op.product_info['peak_tracked_memory_bytes'], preconditioner_memory_peak)
-    print(f'Tracked native peak memory {peak_memory/1024**2:.2f} MiB')
-    if args.sci_stats:
-        print('timing_seconds ' + ' '.join(f'{phase}={seconds:.6f}' for phase, seconds in timing.items()))
-        print(f'driver_wall_seconds={wall:.6f}')
+    return energies, vectors, op, peak_memory
 
 
 if __name__ == '__main__':

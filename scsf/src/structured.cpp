@@ -7,6 +7,7 @@
 #include "selection.h"
 #include "shared_generator.h"
 #include <optional>
+#include <tuple>
 #include <pybind11/stl.h>
 
 namespace scsf {
@@ -45,6 +46,48 @@ class StructuredHamiltonian {
     void record_peak(size_t bytes,const char *phase) {
         memory_left(memory_limit_,bytes,phase);
         peak_memory_=std::max(peak_memory_,bytes);
+    }
+    bool validate_rdm_vectors(const Array &bra,const Array &ket) const {
+        if(bra.ndim()!=1 || ket.ndim()!=1 || size_t(bra.size())!=primary_.size() || ket.size()!=bra.size())
+            throw std::invalid_argument("density matrices need native-row coefficient vectors");
+        const bool transition=bra.data()!=ket.data();
+        const auto finite=[](const Array &x) {
+            return std::all_of(x.data(),x.data()+x.size(),[](double value){return std::isfinite(value);});
+        };
+        if(!finite(bra) || (transition && !finite(ket)))
+            throw std::invalid_argument("density matrix coefficients must be finite");
+        return transition;
+    }
+    size_t rdm_storage() const {
+        const auto kernel=kernel_info();
+        return checked_add(bound_bytes(),checked_add(kernel.at("metadata_bytes"),kernel.at("coefficient_bytes")));
+    }
+    std::tuple<Array,Array,Stats> build_rdm2(const Array &bra,const Array &ket,bool return_one,
+            size_t output_bytes,size_t link_bytes,size_t workspace_bytes) {
+        const size_t k=primary_.k,kk=k*k,cells=output_bytes/sizeof(double);
+        const size_t one_cells=return_one ? kk : 0;
+        if(one_cells>cells || (kk && kk>(cells-one_cells)/kk))
+            throw BudgetError("density matrices exceed output budget");
+        const bool transition=validate_rdm_vectors(bra,ket);
+        const pybind11::ssize_t dim=k;
+        Array one({dim,dim}),two({dim,dim,dim,dim});
+        Stats stats;
+        {
+            pybind11::gil_scoped_release release;
+            std::lock_guard<std::mutex> lock(mutex_);
+            drop_workspace();
+            const size_t working=checked_add(rdm_storage(),checked_add(one.nbytes(),two.nbytes()));
+            const size_t budget=memory_left(memory_limit_,working,"two-particle density matrix");
+            std::fill_n(one.mutable_data(),one.size(),0.);
+            std::fill_n(two.mutable_data(),two.size(),0.);
+            const auto build=transition ? structured::occupation_rdm2<true> : structured::occupation_rdm2<false>;
+            stats=build(primary_,bra.data(),ket.data(),one.mutable_data(),two.mutable_data(),
+                workers_,link_bytes,workspace_bytes,budget);
+            const size_t scratch=checked_add(stats.at("posting_bytes"),stats.at("workspace_bytes"));
+            record_peak(checked_add(working,checked_add(scratch,stats.at("coefficient_bytes"))),
+                        "two-particle density matrix");
+        }
+        return {std::move(one),std::move(two),std::move(stats)};
     }
 public:
     StructuredHamiltonian(const Array &one,const Array &two,std::optional<Array> core,std::shared_ptr<const Basis> basis,int mode,size_t threads,
@@ -218,29 +261,35 @@ public:
         }
         return pybind11::make_tuple(y,stats);
     }
-    pybind11::tuple rdms(const Array &x,size_t output_bytes,size_t link_bytes,
-                        size_t workspace_bytes,size_t coefficient_bytes) const {
-        if(x.ndim()!=1 || size_t(x.size())!=primary_.size())
-            throw std::invalid_argument("density matrices need a native-row coefficient vector");
-        const size_t k=primary_.k,kk=k*k;
-        if(k && (kk>output_bytes/sizeof(double) || kk>(output_bytes/sizeof(double)-kk)/kk))
-            throw BudgetError("density matrices exceed output budget");
-        if(!std::all_of(x.data(),x.data()+x.size(),[](double value){return std::isfinite(value);}))
-            throw std::invalid_argument("density matrix coefficients must be finite");
-        const pybind11::ssize_t dim=k;
-        Array one({dim,dim}),two({dim,dim,dim,dim});
-        Stats stats;
+    Array transition_rdm1(const Array &bra,const Array &ket) {
+        const bool transition=validate_rdm_vectors(bra,ket);
+        const pybind11::ssize_t dim=primary_.k;
+        Array one({dim,dim});
         {
             pybind11::gil_scoped_release release;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                drop_workspace();
-            }
+            std::lock_guard<std::mutex> lock(mutex_);
+            drop_workspace();
+            const size_t working=checked_add(rdm_storage(),one.nbytes());
+            const size_t budget=memory_left(memory_limit_,working,"one-particle density matrix");
             std::fill_n(one.mutable_data(),one.size(),0.);
-            std::fill_n(two.mutable_data(),two.size(),0.);
-            stats=structured::occupation_rdms(primary_,x.data(),one.mutable_data(),two.mutable_data(),
-                link_bytes,workspace_bytes,coefficient_bytes);
+            const auto build=transition ? structured::occupation_rdm1<true> : structured::occupation_rdm1<false>;
+            const size_t scratch=build(primary_,bra.data(),ket.data(),one.mutable_data(),workers_,budget);
+            record_peak(checked_add(working,scratch),"one-particle density matrix");
         }
+        return one;
+    }
+    Array rdm1(const Array &x) {
+        return transition_rdm1(x,x);
+    }
+    Array transition_rdm2(const Array &bra,const Array &ket,size_t output_bytes,size_t link_bytes,
+                         size_t workspace_bytes) {
+        return std::get<1>(build_rdm2(bra,ket,false,output_bytes,link_bytes,workspace_bytes));
+    }
+    Array rdm2(const Array &x,size_t output_bytes,size_t link_bytes,size_t workspace_bytes) {
+        return transition_rdm2(x,x,output_bytes,link_bytes,workspace_bytes);
+    }
+    pybind11::tuple rdms(const Array &x,size_t output_bytes,size_t link_bytes,size_t workspace_bytes) {
+        auto [one,two,stats]=build_rdm2(x,x,true,output_bytes,link_bytes,workspace_bytes);
         return pybind11::make_tuple(one,two,stats);
     }
     void reuse_diagonal(StructuredHamiltonian &old,const pybind11::array_t<size_t,pybind11::array::c_style> &map) {
@@ -384,6 +433,10 @@ void bind_structured(pybind11::module_ &m) {
         }))
         .def("select_hci",&StructuredHamiltonian::select_hci,pybind11::arg("weights"),
              pybind11::arg("eps"),pybind11::arg("complete"),pybind11::arg("stop_growth_fraction")=0.)
+        .def("rdm1",&StructuredHamiltonian::rdm1)
+        .def("rdm2",&StructuredHamiltonian::rdm2)
+        .def("transition_rdm1",&StructuredHamiltonian::transition_rdm1)
+        .def("transition_rdm2",&StructuredHamiltonian::transition_rdm2)
         .def("rdms",&StructuredHamiltonian::rdms)
         .def("_generator_probe",&StructuredHamiltonian::generator_probe)
         .def("reuse_diagonal",&StructuredHamiltonian::reuse_diagonal)

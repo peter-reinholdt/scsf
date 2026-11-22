@@ -36,9 +36,9 @@ class Workers {
     ThreadTeam team_;
 public:
     Workers(size_t count,std::vector<int> cpus):count_(count),team_(count,std::move(cpus)){}
-    template<class F>void run(size_t tasks,F callback,size_t chunk=1) {
+    template<class F>void run(size_t tasks,F callback,size_t chunk=1,size_t active=0) {
         std::atomic<size_t> next{0};
-        team_.apply_workers(count_,[&](size_t w) {
+        team_.apply_workers(active ? active : count_,[&](size_t w) {
             for(;;) {
                 size_t begin=next.fetch_add(chunk,std::memory_order_relaxed);if(begin>=tasks)break;
                 for(size_t i=begin;i<std::min(tasks,begin+chunk);++i)callback(i,w);
@@ -46,8 +46,8 @@ public:
         });
     }
     size_t count() const { return count_; }
-    template<class F>void each_worker(F callback) {
-        team_.apply_workers(count_,std::move(callback));
+    template<class F>void each_worker(F callback,size_t active=0) {
+        team_.apply_workers(active ? active : count_,std::move(callback));
     }
 };
 

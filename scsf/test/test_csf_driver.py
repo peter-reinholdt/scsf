@@ -5,6 +5,7 @@ import scsf
 from scsf import config
 from scsf.csf import _configuration
 from scsf.drivers import csf_driver, polarizability
+from scsf.integrals import rotate_hamiltonian
 
 
 LIH = 'scsf/test/data/lih_sto3g.npz'
@@ -171,3 +172,71 @@ def test_compact_snapshot_and_exact_leading_block(tmp_path, capsys):
     csf_driver.main(['--integrals', str(snapshot), '--kernel', 'nminus2', '--davidson-block-size', '4'])
     ground = next(line for line in capsys.readouterr().out.splitlines() if line.startswith('root=0 '))
     assert float(ground.split('energy=')[1].split()[0]) == pytest.approx(-7.882324378883, abs=1e-11)
+
+
+def test_sci_natural_orbitals_rotate_the_final_reference(tmp_path, capsys):
+    one = np.array([[0., .25], [.25, 1.]])
+    snapshot = tmp_path / 'one-electron.npz'
+    np.savez(snapshot, ecore=0., nelec=1, one=one, two=np.zeros((2,) * 4))
+    csf_driver.main(['--integrals', str(snapshot), '--two-s', '1', '--natorb',
+                     '--nthreads', '1', '--quiet'])
+    pilot, final = capsys.readouterr().out.split('HCI run in natural orbitals')
+    energy = np.linalg.eigvalsh(one)[0]
+    assert 'iteration=1 added=1 ncsf=2' in pilot
+    occupations = pilot.split('SCI natural occupations=[')[1].split(']')[0]
+    np.testing.assert_allclose(np.fromstring(occupations, sep=' '), [1., 0.], atol=1e-8)
+    assert f'iteration=0 ncsf=1 energies=[{energy:.12f}]' in final
+    assert f'root=0 energy={energy:.12f}' in final
+
+
+@pytest.mark.parametrize('compact', ['packed', 'cholesky', 'thc'])
+def test_natural_orbital_rotation_preserves_compact_eris(compact):
+    rng = np.random.default_rng(59)
+    x = rng.normal(size=(4, 6))
+    a = rng.normal(size=(6, 6))
+    core = a @ a.T
+    two = np.einsum('pu,qu,uv,rv,sv->prqs', x, x, core, x, x, optimize=True)
+    one = np.diag([-.6, 1., 2., 3.])
+    dense = scsf.Hamiltonian(.5, one, two)
+    if compact == 'packed':
+        ham = scsf.PackedHamiltonian.from_dense(dense)
+    elif compact == 'cholesky':
+        ham = scsf.CholeskyHamiltonian.from_dense(dense, tolerance=1e-9)
+    else:
+        ham = scsf.THCHamiltonian(dense.ecore, one, x, core)
+    rotation, _ = np.linalg.qr(rng.normal(size=(4, 4)))
+    transformed = rotate_hamiltonian(ham, rotation)
+    assert type(transformed) is type(ham)
+    assert transformed.ecore == ham.ecore
+    wfn = scsf.csf_wfn(4, 4, 0)
+    wfn.add_all_csfs()
+    basis = np.eye(len(wfn))
+    actual = scsf.csf_structured_op(transformed, wfn, nthreads=1).matmat(basis)
+    expected = scsf.csf_structured_op(rotate_hamiltonian(dense, rotation), wfn, nthreads=1).matmat(basis)
+    np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-9)
+    original = scsf.csf_structured_op(dense, wfn, nthreads=1).matmat(basis)
+    np.testing.assert_allclose(np.linalg.eigvalsh(actual), np.linalg.eigvalsh(original), rtol=0, atol=1e-9)
+
+
+@pytest.mark.parametrize('method', ['mp2', 'ccsd'])
+def test_molecular_natural_orbitals_honor_frozen_core(method, capsys):
+    pytest.importorskip('pyscf')
+    csf_driver.main(['--xyz', 'examples/water.xyz', '--basis', 'sto-3g', '--ncore', '1',
+                     '--natorb', method, '--nthreads', '1', '--eps', '0', '--davidson-tol', '1e-10', '--quiet'])
+    output = capsys.readouterr().out
+    occupations = next(line.split('[')[1].rstrip(']') for line in output.splitlines()
+                       if line.startswith(f'{method.upper()} natural occupations='))
+    values = list(map(float, occupations.split()))
+    assert len(values) == 6
+    assert values == sorted(values, reverse=True)
+    assert sum(values) == pytest.approx(8., abs=1e-7, rel=0)
+    assert 0. < values[-1] < .1
+    ground = next(line for line in output.splitlines() if line.startswith('root=0 '))
+    assert float(ground.split('energy=')[1].split()[0]) == pytest.approx(-75.012870400157, abs=1e-10, rel=0)
+
+
+@pytest.mark.parametrize('method', ['mp2', 'ccsd'])
+def test_correlated_natural_orbitals_require_xyz(method, capsys):
+    with pytest.raises(SystemExit, match='2'):
+        csf_driver.main(['--integrals', LIH, '--natorb', method])
+    assert f'--natorb {method} requires --xyz' in capsys.readouterr().err

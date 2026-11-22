@@ -205,3 +205,45 @@ class THCHamiltonian(_StructuredIntegrals):
 
     def _structured_eri(self):
         return self.collocation, self.core
+
+
+def rotate_hamiltonian(ham, rotation):
+    """Transform the active orbitals by a square orthogonal matrix of column vectors."""
+    one = rotation.T @ ham.one_mo @ rotation
+    one = (one + one.T) * .5
+    if isinstance(ham, Hamiltonian):
+        two = np.einsum('pi,rj,qk,sl,prqs->ijkl', rotation, rotation, rotation, rotation,
+                        ham.two_mo, optimize=True)
+        two = (two + two.swapaxes(0, 2)) * .5
+        two = (two + two.swapaxes(1, 3)) * .5
+        two = (two + two.transpose(1, 0, 3, 2)) * .5
+        return Hamiltonian(ham.ecore, one, two)
+    if isinstance(ham, THCHamiltonian):
+        return THCHamiltonian(ham.ecore, one, rotation.T @ ham.collocation, ham.core)
+
+    p, q = np.tril_indices(ham.nbasis)
+    pair_index = np.empty((ham.nbasis, ham.nbasis), dtype=int)
+    pair_index[p, q] = pair_index[q, p] = np.arange(len(p))
+
+    def rotate_pair(values):
+        matrix = rotation.T @ values[pair_index] @ rotation
+        return (matrix[p, q] + matrix[q, p]) * .5
+
+    if isinstance(ham, CholeskyHamiltonian):
+        rotated = np.empty(ham.pair_factors.T.shape)
+        for result, factors in zip(rotated, ham.pair_factors.T):
+            result[:] = rotate_pair(factors)
+        return CholeskyHamiltonian(ham.ecore, one, rotated)
+    if isinstance(ham, PackedHamiltonian):
+        pairs = np.arange(len(p))
+        offsets = pairs * (pairs + 1) // 2
+        half = np.empty((len(p), len(p)), order='F')
+        # Rotate one pair at a time in each index of the ERI pair matrix.
+        for i in pairs:
+            indices = offsets[np.maximum(i, pairs)] + np.minimum(i, pairs)
+            half[:, i] = rotate_pair(ham.packed_eri[indices])
+        packed = np.empty_like(ham.packed_eri)
+        for i, row in enumerate(half):
+            packed[offsets[i]:offsets[i] + i + 1] = rotate_pair(row)[:i + 1]
+        return PackedHamiltonian(ham.ecore, one, packed)
+    raise TypeError('expected dense, packed, Cholesky or THC integrals')

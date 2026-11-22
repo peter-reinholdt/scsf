@@ -98,6 +98,16 @@ struct Occupation {
             dst[0]|=add;
         }
     }
+    int singles_before(int orbital) const {
+        const int last=orbital/64;
+        int count=0;
+        for(int i=0;i<last;++i) {
+            const auto &limb=i ? high[i-1] : first;
+            count+=__builtin_popcountll(limb[0]^limb[1]);
+        }
+        const auto &limb=last ? high[last-1] : first;
+        return count+__builtin_popcountll((limb[0]^limb[1])&((std::uint64_t(1)<<(orbital%64))-1));
+    }
     int singles() const {
         int open=__builtin_popcountll(first[0]^first[1]);
         for(const auto &limb:high)open+=__builtin_popcountll(limb[0]^limb[1]);

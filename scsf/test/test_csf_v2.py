@@ -1,12 +1,12 @@
 """Signed native occupation-block, growth and CIH cross-checks."""
-from itertools import combinations, islice
+from itertools import combinations, islice, product
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 import scsf
-from .reference.oracle import hamiltonian_block, random_hamiltonian
+from .reference.oracle import fock_operators, hamiltonian_block, random_hamiltonian
 
 
 def wavefunction(k, n, s, labels):
@@ -472,6 +472,7 @@ def test_configuration_batched_rdms_energy_and_trace(spin, labels):
     x = np.random.default_rng(561).normal(size=len(w))
     x /= np.linalg.norm(x)
     d1, d2, stats = op.native_rdms(x)
+    np.testing.assert_allclose(op.native_rdm1(x), d1, atol=1e-13)
     np.testing.assert_allclose(d1, d1.T, atol=1e-13)
     np.testing.assert_allclose(d2, d2.transpose(2, 3, 0, 1), atol=1e-13)
     np.testing.assert_allclose(np.einsum('prqr->pq',d2), 3*d1, atol=1e-12)
@@ -482,6 +483,62 @@ def test_configuration_batched_rdms_energy_and_trace(spin, labels):
     assert h_rdm == pytest.approx(expected, abs=1e-12)
     with pytest.raises(MemoryError):
         op.native_rdms(x, max_output_bytes=8)
+
+
+@pytest.mark.parametrize('nthreads', [1, 4])
+def test_transition_rdms_against_determinants(nthreads):
+    k, n, spin = 4, 4, 0
+    h = random_hamiltonian(k, seed=67)
+    # Include a partial spin block and disjoint bra/ket support.
+    w = wavefunction(k, n, spin, ['2200', 'udud', 'ud20', '2u0d', '0022', 'u0d2'])
+    op = scsf.csf_structured_op(h, w, strategy='cih', nthreads=nthreads)
+    bra = np.array([.3, -.2, .7, 0., 0., 0.])
+    ket = np.array([0., 0., 0., -.5, .6, .4])
+    x, y = map(op.to_native_order, (bra, ket))
+    matrix = fock_operators(w)
+
+    one = op.native_transition_rdm1(x, y)
+    two = op.native_transition_rdm2(x, y, max_output_bytes=k**4*8)
+    expected_one = np.empty_like(one)
+    expected_two = np.empty_like(two)
+    for p, q in product(range(k), repeat=2):
+        expected_one[p, q] = bra @ matrix((p, q)) @ ket
+    for p, r, q, s in product(range(k), repeat=4):
+        expected_two[p, r, q, s] = bra @ matrix((p, q, r, s)) @ ket
+    np.testing.assert_allclose(one, expected_one, atol=1e-13)
+    np.testing.assert_allclose(two, expected_two, atol=1e-13)
+    np.testing.assert_allclose(op.native_transition_rdm1(y, x), one.T, atol=1e-13)
+    np.testing.assert_allclose(op.native_transition_rdm2(y, x), two.transpose(2, 3, 0, 1), atol=1e-13)
+    np.testing.assert_allclose(np.einsum('prqr->pq', two), (n-1)*one, atol=1e-13)
+
+    one, two, _ = op.native_rdms(x)
+    np.testing.assert_allclose(op.native_transition_rdm1(x.copy(), x), one, atol=1e-13)
+    np.testing.assert_allclose(op.native_rdm2(x), two, atol=1e-13)
+    np.testing.assert_allclose(op.native_transition_rdm2(x.copy(), x), two, atol=1e-13)
+    with pytest.raises(MemoryError, match='output budget'):
+        op.native_rdm2(x, max_output_bytes=k**4*8-1)
+    with pytest.raises(MemoryError, match='workspace budget'):
+        op.native_transition_rdm2(x, y, max_workspace_bytes=0)
+    with pytest.raises(ValueError, match='native-row'):
+        op.native_transition_rdm1(x, y[:-1])
+    with pytest.raises(TypeError, match='real'):
+        op.native_transition_rdm2(x, y.astype(complex))
+
+
+def test_parallel_rdm1_with_wide_occupations():
+    k = 130
+    h = scsf.CholeskyHamiltonian(0., np.zeros((k, k)), np.zeros((1, k*(k+1)//2)))
+    w = scsf.csf_wfn(k, 1, 1)
+    w.add_all_csfs()
+    op = scsf.csf_structured_op(h, w, strategy='nminus2', nthreads=4)
+    orbitals = [label.index('u') for label in op.labels(native=True)]
+    bra = np.linspace(-.5, 1., k)
+    ket = np.linspace(1.5, -.6, k)**2
+    expected = np.outer(bra, ket)
+    actual = op.native_transition_rdm1(bra[orbitals], ket[orbitals])
+    np.testing.assert_allclose(actual, expected, atol=1e-13)
+    actual = op.native_rdm1(ket[orbitals])
+    np.testing.assert_allclose(actual, np.outer(ket, ket), atol=1e-13)
 
 
 @pytest.mark.parametrize('accumulation', ['private', 'gather'])

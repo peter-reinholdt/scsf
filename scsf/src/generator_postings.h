@@ -9,13 +9,22 @@ class GeneratorPostings {
     OneBank bank_;
     size_t allocated_=0,records_=0;
 
+    const Matrix &coupling(const Primary::Group &group,int create,int destroy) const {
+        const auto &cfg=*group.cfg;
+        const auto &key=group.block->key;
+        const int pi=key.singles_before(create)+(destroy<create && cfg[destroy]!=1);
+        const int qi=key.singles_before(destroy)+(create<destroy && cfg[create]!=1);
+        return bank_.get(group.block->open,cfg[create],cfg[destroy],pi,qi);
+    }
+
 public:
     struct Channel {size_t source;int create,destroy;};
     std::map<Config,std::vector<Channel>> groups;
 
     GeneratorPostings(const Primary &p,size_t link_bytes,size_t coefficient_bytes,
-                      const double *active=nullptr)
-        :primary_(p),bank_(cih_template_electrons(p),p.s,coefficient_bytes) {
+                      const double *active=nullptr,const double *other=nullptr,size_t total_bytes=no_row)
+        :primary_(p),bank_(cih_template_electrons(p),p.s,std::min(coefficient_bytes,total_bytes)) {
+        link_bytes=std::min(link_bytes,memory_left(total_bytes,bank_.bytes(),"generator coefficients"));
         auto stash=[&](const Config &cfg,Channel c) {
             auto [it,inserted]=groups.try_emplace(cfg);
             if(inserted)allocated_=checked_add(allocated_,sizeof(decltype(groups)::value_type)
@@ -31,15 +40,18 @@ public:
             const auto &group=p.groups[src];
             const auto &ket=*group.cfg;
             if(active) {
-                const double *values=active+group.block->offset;
-                if(std::none_of(values,values+group.size(),[](double c){return c!=0.;}))continue;
+                const auto nonzero=[&](const double *values) {
+                    values+=group.block->offset;
+                    return std::any_of(values,values+group.size(),[](double c){return c!=0.;});
+                };
+                if(!nonzero(active) && (!other || !nonzero(other)))continue;
             }
             Config mid=ket;
             for(int q=0;q<p.k;++q)if(ket[q]) {
                 stash(ket,{src,q,q});
                 --mid[q];
                 for(int r=0;r<p.k;++r)if(r!=q && ket[r]<2) {
-                    if(bank_.get(ket,r,q).data.empty())continue;
+                    if(coupling(group,r,q).data.empty())continue;
                     ++mid[r];
                     stash(mid,{src,r,q});
                     --mid[r];
@@ -51,8 +63,7 @@ public:
 
     size_t rows(const Channel &c) const {
         const auto &source=primary_.groups[c.source];
-        if(c.create==c.destroy)return source.block->dimension;
-        return bank_.get(*source.cfg,c.create,c.destroy).rows;
+        return c.create==c.destroy ? source.block->dimension : coupling(source,c.create,c.destroy).rows;
     }
 
     template<bool Adjoint>
@@ -65,8 +76,13 @@ public:
         };
         if(c.create==c.destroy) {
             for(size_t j=0;j<source.size();++j)add(source.rank(j),j,(*source.cfg)[c.create]);
+            return;
+        }
+        const auto &matrix=coupling(source,c.create,c.destroy);
+        if(source.canonical_full()) {
+            for(size_t row=0;row<matrix.rows;++row)
+                for(size_t j=matrix.ptr[row];j<matrix.ptr[row+1];++j)add(row,matrix.indices[j],matrix.data[j]);
         } else {
-            const auto &matrix=bank_.get(*source.cfg,c.create,c.destroy);
             for(size_t row=0;row<matrix.rows;++row)
                 for(size_t j=0;j<source.size();++j)add(row,j,matrix.at(row,source.rank(j)));
         }
