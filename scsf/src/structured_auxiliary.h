@@ -29,16 +29,15 @@ class Auxiliary {
         std::vector<std::pair<int,int>> orbital_pairs;
         std::vector<double> pair_integrals;
         std::vector<size_t> pair_rows,pair_columns;
-        std::vector<double> pair_features;
         std::vector<FoldedPair> folded_pairs;
         std::vector<size_t> folded_offsets;
         std::vector<unsigned> mixed_pairs;
-        size_t feature_count=0,metadata_bytes=0,build_bytes=0,one_configs=0,two_configs=0;
+        size_t metadata_bytes=0,build_bytes=0,one_configs=0,two_configs=0;
         Topology(const Primary &primary,size_t budget):bank(primary,budget){}
     };
     std::shared_ptr<Topology> topology_;
     std::unique_ptr<double[]> vector_workspace_;
-    std::vector<std::vector<double>> temporary_,mixed_,projected_;
+    std::vector<std::vector<double>> temporary_,mixed_;
     bool reused_topology_=false;
     bool reused_auxiliary_integrals_=false;
     size_t incremental_groups_=0,overlap_bytes_=0,reused_classes_=0;
@@ -55,47 +54,22 @@ class Auxiliary {
     double eri(int p,int q,int r,int s) const {
         return integrals_(p,r,q,s);
     }
-    double pair_value(size_t a,size_t b,const SpatialERI &integrals) const {
+    double pair_value(size_t a,size_t b) const {
         auto x=topology_->orbital_pairs[a],y=topology_->orbital_pairs[b];
         int p=x.first%p_.k,q=x.second%p_.k,r=y.first%p_.k,s=y.second%p_.k;
         if(p_.s==0 && x.first<p_.k && y.first<p_.k) {
             // Fold the equal, omitted alpha-beta orientation at both ends.
-            double direct=integrals(p,r,q,s);
+            double direct=integrals_(p,r,q,s);
             if(p==q && r==s)return direct;
             if(p==q || r==s)return 2*direct;
-            return 2*(direct+integrals(p,s,q,r));
+            return 2*(direct+integrals_(p,s,q,r));
         }
-        return ((x.first/p_.k==y.first/p_.k && x.second/p_.k==y.second/p_.k) ? integrals(p,r,q,s) : 0.)-
-               ((x.first/p_.k==y.second/p_.k && x.second/p_.k==y.first/p_.k) ? integrals(p,s,q,r) : 0.);
-    }
-    bool same_spin(size_t channel) const {
-        auto pair=topology_->orbital_pairs[channel];
-        return pair.first/p_.k==pair.second/p_.k;
+        return ((x.first/p_.k==y.first/p_.k && x.second/p_.k==y.second/p_.k) ? integrals_(p,r,q,s) : 0.)-
+               ((x.first/p_.k==y.second/p_.k && x.second/p_.k==y.first/p_.k) ? integrals_(p,s,q,r) : 0.);
     }
     void prepare_pair_integrals(size_t bytes) {
         const size_t m=topology_->orbital_pairs.size();
         if(!m)return;
-        if(integrals_.format==ERIFormat::thc && integrals_.rank) {
-            const size_t rank=integrals_.rank;
-            const size_t average=topology_->two->parents.size()/topology_->two->blocks.size();
-            // The pair contraction uses two applications of the Khatri–Rao
-            // features. Only keep them if they reduce the typical block width.
-            if(rank<=average/2/rank) {
-                if(rank>bytes/8/m/rank)throw BudgetError("N−2 THC features exceed --max-mem");
-                topology_->feature_count=rank*rank;
-                topology_->pair_features.resize(m*topology_->feature_count);
-                workers_.run(m,[&](size_t a,size_t) {
-                    auto [i,j]=topology_->orbital_pairs[a];
-                    int p=i%p_.k,q=j%p_.k;
-                    int exchange=same_spin(a) ? -1 : p_.s==0 && p!=q ? 1 : 0;
-                    const double *x=integrals_.data+p*rank,*y=integrals_.data+q*rank;
-                    double *row=topology_->pair_features.data()+a*topology_->feature_count;
-                    for(size_t u=0;u<rank;++u)for(size_t v=0;v<rank;++v)
-                        row[u*rank+v]=x[u]*y[v]+exchange*y[u]*x[v];
-                },8);
-                return;
-            }
-        }
         // Each auxiliary magnetic family conserves the removed spin
         // projection. Cross-sector rows would only store structural zeros.
         std::array<std::vector<size_t>,3> sectors;
@@ -112,20 +86,6 @@ class Auxiliary {
         const size_t table_bytes=elements*8;
         const size_t index_bytes=2*m*sizeof(size_t);
         memory_left(bytes-table_bytes,index_bytes,"N−2 pair integral index");
-        SpatialERI setup_integrals=integrals_;
-        std::vector<double> transformed;
-        const size_t pairs=integrals_.k*(integrals_.k+1)/2;
-        if(integrals_.format==ERIFormat::thc && integrals_.rank) {
-            if(integrals_.rank>(bytes-table_bytes-index_bytes)/8/pairs)
-                throw BudgetError("N−2 THC setup exceeds --max-mem");
-            transformed.resize(pairs*integrals_.rank);
-            workers_.run(integrals_.k,[&](size_t p,size_t) {
-                for(size_t q=0;q<=p;++q)
-                    integrals_.transform_density(p,q,transformed.data()+orbital_pair(p,q)*integrals_.rank);
-            });
-            setup_integrals.transformed=transformed.data();
-            topology_->build_bytes=std::max(topology_->build_bytes,topology_->metadata_bytes+table_bytes+index_bytes+transformed.size()*8);
-        }
         topology_->pair_integrals.resize(elements);
         topology_->pair_rows.resize(m);
         topology_->pair_columns.resize(m);
@@ -136,7 +96,7 @@ class Auxiliary {
                 size_t a=sector[local],row=offset+local*width;
                 topology_->pair_rows[a]=row;
                 topology_->pair_columns[a]=local;
-                for(size_t b=0;b<width;++b)topology_->pair_integrals[row+b]=pair_value(a,sector[b],setup_integrals);
+                for(size_t b=0;b<width;++b)topology_->pair_integrals[row+b]=pair_value(a,sector[b]);
             });
             offset+=width*width;
         }
@@ -437,40 +397,17 @@ class Auxiliary {
         }
     }
     void pair_middle(const RemovalLinks::Block &block,size_t width,const double *t,
-                     double *target,size_t worker) {
+                     double *target) {
         const size_t count=block.end-block.begin;
         std::fill_n(target,count*width,0.);
-        if(!topology_->pair_integrals.empty()) {
-            switch(width) {
-                case 1: return pair_contract<1>(block,width,t,target);
-                case 2: return pair_contract<2>(block,width,t,target);
-                case 3: return pair_contract<3>(block,width,t,target);
-                case 5: return pair_contract<5>(block,width,t,target);
-                case 9: return pair_contract<9>(block,width,t,target);
-                default: return pair_contract<0>(block,width,t,target);
-            }
+        switch(width) {
+            case 1: return pair_contract<1>(block,width,t,target);
+            case 2: return pair_contract<2>(block,width,t,target);
+            case 3: return pair_contract<3>(block,width,t,target);
+            case 5: return pair_contract<5>(block,width,t,target);
+            case 9: return pair_contract<9>(block,width,t,target);
+            default: return pair_contract<0>(block,width,t,target);
         }
-        if(topology_->feature_count) {
-            auto &projected=projected_[worker];
-            projected.assign(topology_->feature_count*width,0.);
-            for(size_t a=0;a<count;++a) {
-                const double *feature=topology_->pair_features.data()+topology_->two->parents[block.begin+a].channel*topology_->feature_count;
-                for(size_t f=0;f<topology_->feature_count;++f)for(size_t i=0;i<width;++i)
-                    projected[f*width+i]+=feature[f]*t[a*width+i];
-            }
-            // Antisymmetrizing both ends duplicates the direct-minus-exchange
-            // value in the ordered grid-pair sum. Other spin families use Z.
-            const double scale=same_spin(topology_->two->parents[block.begin].channel) ? .5 : 1.;
-            for(size_t f=0;f<topology_->feature_count;++f)for(size_t i=0;i<width;++i)
-                projected[f*width+i]*=scale*integrals_.core[f];
-            for(size_t a=0;a<count;++a) {
-                const double *feature=topology_->pair_features.data()+topology_->two->parents[block.begin+a].channel*topology_->feature_count;
-                for(size_t f=0;f<topology_->feature_count;++f)for(size_t i=0;i<width;++i)
-                    target[a*width+i]+=feature[f]*projected[f*width+i];
-            }
-            return;
-        }
-        throw std::logic_error("N−2 pair contraction has no integral representation");
     }
     void pair_forward_middle(const double *input,size_t cols,double *u) {
         workers_.run(topology_->two->blocks.size(),[&](size_t b,size_t worker) {
@@ -479,7 +416,7 @@ class Auxiliary {
             auto &t=temporary_[worker];
             if(t.size()<block_size)t.resize(block_size);
             forward_block(*topology_->two,block,input,cols,t.data());
-            pair_middle(block,width,t.data(),u+topology_->two->offset(block)*cols,worker);
+            pair_middle(block,width,t.data(),u+topology_->two->offset(block)*cols);
         },4);
     }
     template<size_t Columns=0>
@@ -594,7 +531,7 @@ class Auxiliary {
                         if(t.size()<count*width)t.resize(count*width);
                         if(u.size()<count*width)u.resize(count*width);
                         forward_block<Columns>(links,block,input,cols,t.data());
-                        if(pair)pair_middle(block,width,t.data(),u.data(),worker);
+                        if(pair)pair_middle(block,width,t.data(),u.data());
                         else {
                             std::fill_n(u.data(),count*width,0.);
                             for(size_t a=0;a<count;++a)for(size_t r=0;r<count;++r) {
@@ -628,7 +565,7 @@ public:
     Auxiliary(const Primary &p,const double *h,SpatialERI integrals,int mode,Workers &workers,
               size_t budget,bool private_output,const Auxiliary *previous=nullptr):
         p_(p),h_(h),integrals_(integrals),mode_(mode),private_output_(private_output),workers_(workers),
-        temporary_(workers.count()),mixed_(workers.count()),projected_(workers.count()) {
+        temporary_(workers.count()),mixed_(workers.count()) {
         const bool append=mode==1 && append_prefix(p,previous) && private_output==previous->private_output_;
         const size_t before=append ? previous->p_.groups.size() : 0;
         if(append && before==p.groups.size()) {
@@ -741,7 +678,7 @@ public:
                 if(topology_->two->parents.empty())return;
                 // Only parent channels enter either end of the pair contraction.
                 // Compact their orbital-pair directory before constructing the
-                // optional integral table (important for sparse, wide orbital sets).
+                // integral table (important for sparse, wide orbital sets).
                 auto start=Clock::now();
                 size_t modes=2*size_t(p_.k),all_pairs=modes*(modes-1)/2;
                 if(all_pairs>(metadata-topology_->metadata_bytes)/sizeof(size_t))
@@ -772,7 +709,7 @@ public:
                 start=Clock::now();
                 prepare_pair_integrals(metadata-topology_->metadata_bytes);
                 pair_integrals_ns_=ns(start);
-                topology_->metadata_bytes+=(topology_->pair_integrals.capacity()+topology_->pair_features.capacity())*8
+                topology_->metadata_bytes+=topology_->pair_integrals.capacity()*8
                     +(topology_->pair_rows.capacity()+topology_->pair_columns.capacity())*sizeof(size_t);
                 if(private_output_) {
                     start=Clock::now();
@@ -803,7 +740,7 @@ public:
             else apply_private<0>(input,cols,output,stats);
         } else apply_gather(input,cols,output,stats);
         size_t scratch=0;
-        for(auto *bank:{&temporary_,&mixed_,&projected_})for(auto &a:*bank)scratch+=a.capacity()*8;
+        for(auto *bank:{&temporary_,&mixed_})for(auto &a:*bank)scratch+=a.capacity()*8;
         stats["worker_workspace_bytes"]=scratch;
     }
     void apply_gather(const double *input,size_t cols,double *output,Stats &stats) {
@@ -833,7 +770,6 @@ public:
             {"one_auxiliary_blocks",topology_->one->blocks.size()},{"one_parent_channels",topology_->one->parents.size()},
             {"one_weighted_links",topology_->one->weighted_links},{"one_intermediate_entries",topology_->one->entries},
             {"product_array_bytes_per_rhs",entries()*8},{"pair_integral_bytes",topology_->pair_integrals.capacity()*8},
-            {"pair_factor_bytes",topology_->pair_features.capacity()*8},{"pair_factor_columns",topology_->feature_count},
             {"private_residue_output",private_output_}};
         s.insert(removal_detail_.begin(),removal_detail_.end());
         for(auto &entry:topology_->one_banks)s["coefficient_bytes"]+=entry.second->bytes();

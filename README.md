@@ -81,11 +81,9 @@ For fixed-space calculations, construct the operator with a saved basis
 from `csf_wfn.from_file()` or enumerate the spin sector with `add_all_csfs()`.
 
 `csf_one_electron_product` applies spin-scalar spatial operators, including
-complex nonsymmetric matrices. The energy operator consumes dense, packed,
-Cholesky and THC integrals directly. Dense ERIs use `two[p,r,q,s] = (pq|rs)`.
-Driver snapshots contain `ecore`, `one` and optionally `nelec), together with
-one of `two`, `packed_eri`, `cholesky_factors` (rank first) or
-`thc_collocation` and `thc_core`.
+complex nonsymmetric matrices. The energy operator consumes dense or eightfold-packed
+integrals directly. Dense ERIs use `two[p,r,q,s] = (pq|rs)`. Driver snapshots
+contain `ecore`, `one`, and optionally `nelec`, together with either `two` or `packed_eri`.
 
 [Water growth and fixed-space timings](docs/scsf-v2-million-solves-2026-11-20.md).
 

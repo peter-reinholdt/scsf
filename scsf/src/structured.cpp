@@ -6,7 +6,6 @@
 #include "rdm.h"
 #include "selection.h"
 #include "shared_generator.h"
-#include <optional>
 #include <tuple>
 #include <pybind11/stl.h>
 
@@ -20,7 +19,6 @@ enum class Kernel { nminus2, cih, nminus1, particle_hole };
 
 class StructuredHamiltonian {
     Array one_,two_;
-    std::optional<Array> core_;
     structured::Primary primary_;
     structured::Workers workers_;
     std::unique_ptr<structured::Auxiliary> auxiliary_;
@@ -90,10 +88,10 @@ class StructuredHamiltonian {
         return {std::move(one),std::move(two),std::move(stats)};
     }
 public:
-    StructuredHamiltonian(const Array &one,const Array &two,std::optional<Array> core,std::shared_ptr<const Basis> basis,int mode,size_t threads,
+    StructuredHamiltonian(const Array &one,const Array &two,std::shared_ptr<const Basis> basis,int mode,size_t threads,
         size_t memory,std::vector<int> cpus,bool private_output,std::shared_ptr<HCITransferBounds> bounds,
         const StructuredHamiltonian *previous,bool reuse,bool slot_sweep):
-        one_(one),two_(two),core_(std::move(core)),primary_([&] {
+        one_(one),two_(two),primary_([&] {
             pybind11::gil_scoped_release release;
             return structured::Primary(std::move(basis));
         }()),
@@ -102,27 +100,13 @@ public:
         int k=primary_.k;
         size_t pairs=structured::orbital_pair(k,0);
         using structured::ERIFormat;
-        auto format=core_ ? ERIFormat::thc : two.ndim()==1 ? ERIFormat::packed :
-            two.ndim()==2 ? ERIFormat::cholesky : ERIFormat::dense;
-        bool eri_shape=false;
-        size_t rank=two.ndim()==2 ? size_t(two.shape(1)) : 0;
-        switch(format) {
-            case ERIFormat::dense:
-                eri_shape=two.ndim()==4 && two.shape(0)==k && two.shape(1)==k && two.shape(2)==k && two.shape(3)==k;
-                break;
-            case ERIFormat::packed:
-                eri_shape=size_t(two.shape(0))==structured::orbital_pair(pairs,0);
-                break;
-            case ERIFormat::cholesky:
-                eri_shape=size_t(two.shape(0))==pairs;
-                break;
-            case ERIFormat::thc:
-                eri_shape=two.ndim()==2 && two.shape(0)==k && core_->ndim()==2 &&
-                    size_t(core_->shape(0))==rank && size_t(core_->shape(1))==rank;
-        }
+        const bool packed=two.ndim()==1;
+        const bool eri_shape=packed
+            ? size_t(two.shape(0))==structured::orbital_pair(pairs,0)
+            : two.ndim()==4 && two.shape(0)==k && two.shape(1)==k && two.shape(2)==k && two.shape(3)==k;
         if(one.ndim()!=2 || one.shape(0)!=k || one.shape(1)!=k || !eri_shape || (private_output && kernel_!=Kernel::nminus2))
             throw std::invalid_argument("invalid structured integral dimensions");
-        integrals_={two.data(),core_ ? core_->data() : nullptr,size_t(k),rank,format};
+        integrals_={two.data(),size_t(k),packed ? ERIFormat::packed : ERIFormat::dense};
         auto start=structured::Clock::now();pybind11::gil_scoped_release release;
         std::unique_lock<std::mutex> previous_lock;
         size_t old_metadata=0,old_coefficients=0;
@@ -134,8 +118,7 @@ public:
             old_coefficients=old.at("coefficient_bytes");
             peak_memory_=previous->peak_memory_;
             if(previous->kernel_!=kernel_ || previous->one_.data()!=one_.data() ||
-                previous->two_.data()!=two_.data() || previous->core_.has_value()!=core_.has_value() ||
-                (core_ && previous->core_->data()!=core_->data()) || previous->primary_.s!=primary_.s ||
+                previous->two_.data()!=two_.data() || previous->primary_.s!=primary_.s ||
                 previous->primary_.n!=primary_.n)reuse=false;
         }
         const size_t tables=bound_bytes(), available=memory_left(memory_limit_,tables,"HCI transfer tables");
@@ -194,10 +177,7 @@ public:
         }
         s["peak_tracked_memory_bytes"]=std::max(peak_memory_,s["tracked_memory_bytes"]);
         s["hamiltonian_offdiagonal_bytes"]=0;s["exact_product"]=1;
-        using structured::ERIFormat;
-        s["factored_eri"]=integrals_.format==ERIFormat::cholesky || integrals_.format==ERIFormat::thc;
-        s["eri_storage_bytes"]=size_t(two_.nbytes())+(core_ ? core_->nbytes() : 0);
-        if(s["factored_eri"])s["eri_factor_rank"]=integrals_.rank;
+        s["eri_storage_bytes"]=size_t(two_.nbytes());
         const auto data=primary_.native->info();
         s.insert(data.begin(),data.end());
         s["basis_snapshot_bytes"]=data.at("rank_map_bytes")+data.at("occupation_bytes")
@@ -423,12 +403,12 @@ void bind_structured(pybind11::module_ &m) {
             return a;
         });
     py::class_<StructuredHamiltonian>(m,"_StructuredHamiltonian")
-        .def(py::init([](const Array &one,const Array &two,std::optional<Array> core,
+        .def(py::init([](const Array &one,const Array &two,
                 std::shared_ptr<const Basis> basis,int mode,size_t threads,size_t memory,
                 std::vector<int> cpus,bool private_output,std::shared_ptr<HCITransferBounds> bounds,
                 const StructuredHamiltonian *previous,bool reuse,bool slot_sweep) {
             if(!basis)throw std::invalid_argument("native occupation basis is required");
-            return std::make_unique<StructuredHamiltonian>(one,two,std::move(core),std::move(basis),mode,threads,
+            return std::make_unique<StructuredHamiltonian>(one,two,std::move(basis),mode,threads,
                 memory,std::move(cpus),private_output,std::move(bounds),previous,reuse,slot_sweep);
         }))
         .def("select_hci",&StructuredHamiltonian::select_hci,pybind11::arg("weights"),

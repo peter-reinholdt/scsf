@@ -23,8 +23,7 @@ inline Stats shared_generator_product(const Primary &p,const double *h,
     }
     for(const auto &[cfg,channels]:postings.groups) {
         const size_t count=channels.size(),dim=postings.rows(channels.front());
-        const bool factored=eri.format==ERIFormat::cholesky && eri.rank<count/2;
-        size_t stride=checked_add(2*count,factored ? eri.rank : 0);
+        const size_t stride=checked_add(count,count);
         if(dim>(capacity-shifted.size())/stride)
             throw BudgetError("one shared intermediate occupation exceeds product workspace");
         const size_t size=stride*dim;
@@ -43,28 +42,11 @@ inline Stats shared_generator_product(const Primary &p,const double *h,
                 for(size_t i=0;i<g.size();++i)y[g.row(i)]+=value*amp[g.rank(i)];
             }
         }
-        if(factored) {
-            ++stats["cholesky_blocks"];
-            double *projection=mixed+count*dim;
-            for(size_t a=0;a<count;++a) {
-                const auto &c=channels[a];
-                const double *v=eri.data+orbital_pair(c.create,c.destroy)*eri.rank;
-                for(size_t l=0;l<eri.rank;++l)for(size_t i=0;i<dim;++i)
-                    projection[l*dim+i]+=v[l]*forward[a*dim+i];
-            }
-            for(size_t a=0;a<count;++a) {
-                const auto &c=channels[a];
-                const double *v=eri.data+orbital_pair(c.create,c.destroy)*eri.rank;
-                for(size_t l=0;l<eri.rank;++l)for(size_t i=0;i<dim;++i)
-                    mixed[a*dim+i]+=.5*v[l]*projection[l*dim+i];
-            }
-        } else {
-            for(size_t a=0;a<count;++a)for(size_t b=0;b<count;++b) {
-                const auto &left=channels[a],&right=channels[b];
-                // The adjoint of the channel E_qp represents the left E_pq.
-                const double scale=.5*eri(left.destroy,left.create,right.create,right.destroy);
-                for(size_t i=0;i<dim;++i)mixed[a*dim+i]+=scale*forward[b*dim+i];
-            }
+        for(size_t a=0;a<count;++a)for(size_t b=0;b<count;++b) {
+            const auto &left=channels[a],&right=channels[b];
+            // The adjoint of the channel E_qp represents the left E_pq.
+            const double scale=.5*eri(left.destroy,left.create,right.create,right.destroy);
+            for(size_t i=0;i<dim;++i)mixed[a*dim+i]+=scale*forward[b*dim+i];
         }
         for(size_t a=0;a<count;++a)postings.contract<true>(channels[a],mixed+a*dim,y);
     }

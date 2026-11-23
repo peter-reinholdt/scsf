@@ -43,7 +43,8 @@ def test_native_layout_against_fock_space(k, n, s, partial, kernel):
 def test_wide_occupations_and_empty_space():
     k = 66
     one = np.diag(np.arange(k, dtype=float))
-    ham = scsf.CholeskyHamiltonian(0., one, np.zeros((1, k*(k+1)//2)))
+    pairs = k * (k + 1) // 2
+    ham = scsf.PackedHamiltonian(0., one, np.zeros(pairs * (pairs + 1) // 2))
     w = scsf.csf_wfn(k, 2, 0)
     op = scsf.csf_structured_op(ham, w)
     assert op.matmat(np.empty((0, 1))).shape == (0, 1)
@@ -358,33 +359,6 @@ def test_wide_grouped_cih():
     assert op.last_product_stats['generator_groups'] > 0
 
 
-def test_factor_only_native_selection_and_solve():
-    from scsf.drivers.solvers import solve_ci
-    k = 4
-    factor = np.random.default_rng(71).normal(size=(2,k,k))
-    factor = factor+factor.swapaxes(1,2)
-    dense = scsf.Hamiltonian(0., np.diag([-.6,.1,.2,.3]),
-                            np.einsum('lpq,lrs->prqs',factor,factor))
-    compact = scsf.CholeskyHamiltonian(0., dense.one_mo, factor)
-    w = wavefunction(k, 4, 0, ['2200'])
-    old = scsf.csf_structured_op(dense, w, strategy='nminus2')
-    new = scsf.csf_structured_op(compact, w, strategy='nminus2')
-    for iteration in range(10):
-        a, x, ok1 = solve_ci(old.native_matmat, old.native_diagonal(), 1, tol=1e-10)
-        b, y, ok2 = solve_ci(new.native_matmat, new.native_diagonal(), 1, tol=1e-10)
-        assert ok1 and ok2
-        np.testing.assert_allclose(a, b, atol=1e-11)
-        _, s = old.select_hci(abs(x[:,0]), 1e-4)
-        _, t = new.select_hci(abs(y[:,0]), 1e-4)
-        assert s['added'] == t['added']
-        assert set(old.labels()) == set(new.labels())
-        if not s['added']:
-            break
-    else:
-        pytest.fail('growth did not converge')
-    assert new.product_info['eri_storage_bytes'] < old.product_info['eri_storage_bytes']
-
-
 def test_nminus2_owner_gather_requires_space_for_full_trial_block():
     h = random_hamiltonian(5, seed=19)
     w = scsf.csf_wfn(5, 4, 0)
@@ -420,7 +394,7 @@ def test_nminus2_rank_only_replacement_shares_immutable_topology():
 
 
 @pytest.mark.parametrize('kernel', scsf.csf_structured_op.kernels)
-def test_factor_providers_all_kernels(kernel):
+def test_packed_integrals_all_kernels(kernel):
     k = 4
     tensor = np.random.default_rng(57).normal(size=(k, 2))
     core = np.array([[1., .4], [.4, .8]])
@@ -430,13 +404,12 @@ def test_factor_providers_all_kernels(kernel):
     w = wavefunction(k, 4, 0, ['udud', '2200', 'ud02', '2u0d'])
     x = np.random.default_rng(56).normal(size=(len(w), 4))
     ref = hamiltonian_block(exact, tuple(w), tuple(w), 0)
-    for ham in (scsf.PackedHamiltonian.from_dense(exact), scsf.CholeskyHamiltonian.from_dense(exact),
-                scsf.THCHamiltonian(.1, one, tensor, core)):
-        op = scsf.csf_structured_op(ham, w, strategy=kernel, nthreads=2)
-        np.testing.assert_allclose(op.matmat(x), ref@x, atol=2e-12)
-        np.testing.assert_allclose(op.diagonal(), np.diag(ref), atol=2e-12)
-        if kernel == 'cih':
-            assert op.product_info['grouped_dense_eri_bytes'] == 0
+    ham = scsf.PackedHamiltonian.from_dense(exact)
+    op = scsf.csf_structured_op(ham, w, strategy=kernel, nthreads=2)
+    np.testing.assert_allclose(op.matmat(x), ref@x, atol=2e-12)
+    np.testing.assert_allclose(op.diagonal(), np.diag(ref), atol=2e-12)
+    if kernel == 'cih':
+        assert op.product_info['grouped_dense_eri_bytes'] == 0
 
 
 @pytest.mark.parametrize('kernel', ['cih', 'particle-hole', 'nminus1', 'nminus2'])
@@ -527,7 +500,8 @@ def test_transition_rdms_against_determinants(nthreads):
 
 def test_parallel_rdm1_with_wide_occupations():
     k = 130
-    h = scsf.CholeskyHamiltonian(0., np.zeros((k, k)), np.zeros((1, k*(k+1)//2)))
+    pairs = k * (k + 1) // 2
+    h = scsf.PackedHamiltonian(0., np.zeros((k, k)), np.zeros(pairs * (pairs + 1) // 2))
     w = scsf.csf_wfn(k, 1, 1)
     w.add_all_csfs()
     op = scsf.csf_structured_op(h, w, strategy='nminus2', nthreads=4)
@@ -604,7 +578,7 @@ def test_parallel_private_nminus2_postings_match_serial_and_append():
     compare_with_serial()
 
 
-@pytest.mark.parametrize('k', [32, 33, 64, 65, 138, 193, 256, 257])
+@pytest.mark.parametrize('k', [32, 33, 64, 65, 138])
 def test_nminus2_removal_classes_at_occupation_boundaries(k):
     rng = np.random.default_rng(104)
     sites = [0, k//2, k-2, k-1]
@@ -612,17 +586,21 @@ def test_nminus2_removal_classes_at_occupation_boundaries(k):
     one = rng.normal(size=(4, 4))
     one = (one + one.T) / 2
     factors = rng.normal(size=(3, 10)) * .1
-    small_h = scsf.CholeskyHamiltonian(0., one, factors)
+    pair_matrix = factors.T @ factors
+    row, col = np.tril_indices(pair_matrix.shape[0])
+    small_h = scsf.PackedHamiltonian(0., one, pair_matrix[row, col])
     small_w = wavefunction(4, 4, 0, labels)
     reference = scsf.csf_structured_op(small_h, small_w, strategy='cih')
 
     large_one = np.zeros((k, k))
     large_one[np.ix_(sites, sites)] = one
-    large_factors = np.zeros((3, k*(k+1)//2))
-    for column, (i, j) in enumerate(zip(*np.tril_indices(4))):
-        p, q = sites[i], sites[j]
-        large_factors[:, p*(p+1)//2+q] = factors[:, column]
-    large_h = scsf.CholeskyHamiltonian(0., large_one, large_factors)
+    pairs = k * (k + 1) // 2
+    large_packed = np.zeros(pairs * (pairs + 1) // 2)
+    p, q = np.take(sites, np.tril_indices(4))
+    pair_ids = p * (p + 1) // 2 + q
+    packed_rows = pair_ids[row]
+    large_packed[packed_rows * (packed_rows + 1) // 2 + pair_ids[col]] = pair_matrix[row, col]
+    large_h = scsf.PackedHamiltonian(0., large_one, large_packed)
     wide_labels = []
     for compact in labels:
         label = ['0'] * k
@@ -691,22 +669,18 @@ def test_damped_complex_response_davidson():
     np.testing.assert_allclose(answer, np.linalg.solve(h, rhs), atol=1e-12)
 
 
-@pytest.mark.parametrize('factored', [False, True])
-def test_shared_generator_probe_matches_nminus2(factored):
+def test_shared_generator_probe_matches_nminus2():
     k = 5
     factors = np.random.default_rng(23).normal(size=(2,k,k))
     factors += factors.swapaxes(1,2).copy()
     h = np.diag(np.linspace(-2.,2.,k))
-    ham = scsf.CholeskyHamiltonian(0.,h,factors) if factored else scsf.Hamiltonian(
-        0.,h,np.einsum('lpq,lrs->prqs',factors,factors))
+    ham = scsf.Hamiltonian(0.,h,np.einsum('lpq,lrs->prqs',factors,factors))
     w = scsf.csf_wfn(k,4,0)
     w.add_all_csfs()
     op = scsf.csf_structured_op(ham, w)
     x = np.random.default_rng(8).normal(size=len(w))
     x[::3] = 0.
-    actual, stats = op._state[1]._generator_probe(x, 8*1024**2, 8192, 1024**2)
+    actual, _ = op._state[1]._generator_probe(x, 8*1024**2, 8192, 1024**2)
     np.testing.assert_allclose(actual, op.native_matmat(x[:,None])[:,0], atol=6e-12)
-    if factored:
-        assert stats['cholesky_blocks']>0
     with pytest.raises(MemoryError):
         op._state[1]._generator_probe(x, 64, 8192, 1024**2)

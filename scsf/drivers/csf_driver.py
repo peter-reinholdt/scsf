@@ -52,11 +52,7 @@ def integrals(args, parser):
                 return scsf.Hamiltonian(ecore, one, data['two']), nelec
             if 'packed_eri' in data:
                 return scsf.PackedHamiltonian(ecore, one, data['packed_eri']), nelec
-            if 'cholesky_factors' in data:
-                return scsf.CholeskyHamiltonian(ecore, one, data['cholesky_factors']), nelec
-            if 'thc_collocation' in data and 'thc_core' in data:
-                return scsf.THCHamiltonian(ecore, one, data['thc_collocation'], data['thc_core']), nelec
-            parser.error('snapshot needs two, packed_eri, cholesky_factors, or thc_collocation and thc_core')
+            parser.error('snapshot needs two or packed_eri')
     if not args.basis:
         parser.error('--basis is required with --xyz')
     if args.nelec is not None:

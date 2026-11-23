@@ -189,8 +189,7 @@ def test_sci_natural_orbitals_rotate_the_final_reference(tmp_path, capsys):
     assert f'root=0 energy={energy:.12f}' in final
 
 
-@pytest.mark.parametrize('compact', ['packed', 'cholesky', 'thc'])
-def test_natural_orbital_rotation_preserves_compact_eris(compact):
+def test_natural_orbital_rotation_preserves_packed_eris():
     rng = np.random.default_rng(59)
     x = rng.normal(size=(4, 6))
     a = rng.normal(size=(6, 6))
@@ -198,12 +197,7 @@ def test_natural_orbital_rotation_preserves_compact_eris(compact):
     two = np.einsum('pu,qu,uv,rv,sv->prqs', x, x, core, x, x, optimize=True)
     one = np.diag([-.6, 1., 2., 3.])
     dense = scsf.Hamiltonian(.5, one, two)
-    if compact == 'packed':
-        ham = scsf.PackedHamiltonian.from_dense(dense)
-    elif compact == 'cholesky':
-        ham = scsf.CholeskyHamiltonian.from_dense(dense, tolerance=1e-9)
-    else:
-        ham = scsf.THCHamiltonian(dense.ecore, one, x, core)
+    ham = scsf.PackedHamiltonian.from_dense(dense)
     rotation, _ = np.linalg.qr(rng.normal(size=(4, 4)))
     transformed = rotate_hamiltonian(ham, rotation)
     assert type(transformed) is type(ham)

@@ -5,7 +5,7 @@ from time import perf_counter
 import numpy as np
 from .csf import csf_wfn, _integer, _limit
 from .config import get_num_threads
-from .integrals import Hamiltonian, _StructuredIntegrals
+from .integrals import Hamiltonian, PackedHamiltonian
 
 
 class csf_structured_op:
@@ -13,8 +13,8 @@ class csf_structured_op:
 
     The available kernels are N−2, CIH, N−1 and particle–hole. The
     operator stores selected occupation blocks and applies the electronic
-    Hamiltonian without assembling its off-diagonal matrix. Dense, packed,
-    Cholesky and THC integrals use the same interface.
+    Hamiltonian without assembling its off-diagonal matrix. Dense and eightfold-packed
+    integrals use the same interface.
 
     The shared memory budget covers native kernel metadata, coefficients,
     caches, HCI transfer tables and product arrays. N−2 supports private
@@ -37,9 +37,9 @@ class csf_structured_op:
             pair_accumulation = 'private' if strategy == 'nminus2' else 'gather'
         if pair_accumulation not in ('gather', 'private') or (pair_accumulation == 'private' and strategy != 'nminus2'):
             raise ValueError("pair_accumulation must be 'gather', or 'private' for nminus2")
-        compact = isinstance(ham, _StructuredIntegrals)
+        compact = isinstance(ham, PackedHamiltonian)
         if not compact and not isinstance(ham, Hamiltonian):
-            raise TypeError('expected dense or factored Hamiltonian integrals')
+            raise TypeError('expected dense or packed Hamiltonian integrals')
         if ham.nbasis != wfn.nbasis:
             raise ValueError('Hamiltonian and CSF orbital counts must match')
         self.nthreads = get_num_threads() if nthreads is None else _integer(nthreads, 'nthreads')
@@ -56,8 +56,7 @@ class csf_structured_op:
         self.strategy, self._ham = strategy, ham
         self.pair_accumulation = pair_accumulation
         self.ecore = ham.ecore
-        self._integrals = ((ham.one_mo, *ham._structured_eri()) if compact
-                           else (ham.one_mo, ham.two_mo, None))
+        self._integrals = (ham.one_mo, ham.packed_eri if compact else ham.two_mo)
         from . import _csf
         self._transfer_bounds = None if compact else _csf._HCITransferBounds(
             ham.one_mo, ham.two_mo)
