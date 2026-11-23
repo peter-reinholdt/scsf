@@ -18,9 +18,22 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
         HCITransferBounds *bounds,size_t table_budget) {
     const auto &basis=*p.native;
     const auto start=structured::Clock::now();
-    if (bounds) bounds->prepare_transfer_bounds(p.k,table_budget);
-    const bool ordered=bounds && bounds->prepare_ordered_transfers(p.k,table_budget,workers);
-    const bool ordered_singles=ordered && bounds->prepare_ordered_singles(p.k,p.n,table_budget);
+    // A replacement generation can share these caches with its predecessor.
+    // Keep table creation and reads in one lifetime across both generations.
+    const auto table_lock=bounds ? bounds->lock_tables() : std::unique_lock<std::recursive_mutex>();
+    bool ordered=false,ordered_singles=false;
+    if(bounds) {
+        auto prepare=[&](auto build) {
+            try {return build();}
+            catch(const BudgetError &) {
+                if(!bounds->optional_tables())throw;
+                return false;
+            }
+        };
+        prepare([&] {bounds->prepare_transfer_bounds(p.k,table_budget);return true;});
+        ordered=prepare([&] {return bounds->prepare_ordered_transfers(p.k,table_budget,workers);});
+        if(ordered)ordered_singles=prepare([&] {return bounds->prepare_ordered_singles(p.k,p.n,table_budget);});
+    }
     const auto bounds_ns=structured::ns(start);
     struct Shard {
         std::mutex mutex;
@@ -143,7 +156,7 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
         };
 
         if (!ordered) {
-            transfers(ket,visit);
+            transfers(ket,basis.symmetry(),visit);
             return;
         }
         visit({}, {},0);
@@ -162,7 +175,9 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
                     if (ket[item->p]<2) visit({q,0},{item->p,0},1);
                 }
             } else {
-                for (int a=0;a<p.k;++a) if (a!=q && ket[a]<2) visit({q,0},{a,0},1);
+                same_irrep_orbitals(basis.symmetry(),p.k,q,[&](int a) {
+                    if(a!=q && ket[a]<2)visit({q,0},{a,0},1);
+                });
             }
             for(auto second=hole;second!=occupied.end();++second) {
                 const int s=*second;
@@ -185,6 +200,8 @@ inline std::pair<Basis::Additions,Stats> hci(const structured::Primary &p,struct
     }
     Stats stats{{"ordered_search",ordered},
                 {"ordered_singles",ordered_singles},
+                {"ordered_double_entries",ordered ? bounds->ordered_double_count() : 0},
+                {"ordered_single_entries",ordered_singles ? bounds->ordered_single_count() : 0},
                 {"selection_bounds_ns",bounds_ns},{"selection_search_ns",search_ns},
                 {"proposed_csfs",proposed},
                 {"source_configurations",sources.size()},{"selection_ns",structured::ns(start)}};

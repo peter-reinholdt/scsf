@@ -5,9 +5,11 @@ Orbitals are coupled in their supplied order. Steps ``0,u,d,2`` denote empty, sp
 spin-down-coupled, and doubly occupied orbitals; ``u/d`` are not alpha/beta spins.
 """
 import json
+from functools import lru_cache
 from math import comb
 from operator import index
 import numpy as np
+from .symmetry import PointGroup, check_symmetry
 
 def _integer(value, name):
     try:
@@ -30,10 +32,29 @@ def _sector(nbasis, nelec, two_s):
         raise ValueError('two_s is incompatible with the electron/orbital counts')
     return (nbasis, nelec, two_s)
 
-def csf_dimension(nbasis, nelec, two_s):
+def csf_dimension(nbasis, nelec, two_s, *, symmetry=None, target_irrep=None):
     """Return the exact fixed-spin dimension, using Python's unbounded integers."""
     nbasis, nelec, two_s = _sector(nbasis, nelec, two_s)
     a, b = ((nelec + two_s) // 2, (nelec - two_s) // 2)
+    symmetry = check_symmetry(symmetry, nbasis)
+    if target_irrep is not None:
+        if symmetry is None:
+            raise ValueError('target_irrep requires a PointGroup')
+        target = symmetry.irrep(target_irrep)
+        extent = len(symmetry.names)
+        counts = [[0]*extent for _ in range(min(nbasis, a + 1) + 1)]
+        counts[0][0] = 1
+        for p, label in enumerate(symmetry.orbital_irreps, start=1):
+            for electrons in range(min(p, len(counts) - 1), 0, -1):
+                for code, count in enumerate(counts[electrons - 1]):
+                    counts[electrons][code ^ label] += count
+
+        def determinants(up, down):
+            if down < 0 or up >= len(counts):
+                return 0
+            return sum(count * counts[down][target ^ code] for code, count in enumerate(counts[up]))
+
+        return determinants(a, b) - determinants(a + 1, b - 1)
     return _choose(nbasis, a) * _choose(nbasis, b) - _choose(nbasis, a + 1) * _choose(nbasis, b - 1)
 
 def _configuration(label):
@@ -66,17 +87,24 @@ class csf_wfn:
     are immutable. Basis files contain the sector and ordered labels.
     """
 
-    def __init__(self, nbasis, nelec, two_s):
+    def __init__(self, nbasis, nelec, two_s, *, symmetry=None, target_irrep=None):
         self._nbasis, self._nelec, self._two_s = _sector(nbasis, nelec, two_s)
+        self._symmetry = check_symmetry(symmetry, self.nbasis)
+        if target_irrep is not None and self._symmetry is None:
+            raise ValueError('target_irrep requires a PointGroup')
+        self._target_irrep = None if target_irrep is None else self._symmetry.irrep(target_irrep)
         self._labels = []
         self._indices = {}
         self._configs = {}
         self._occupation_snapshot = None
+        self._occupation_symmetry = None
     nbasis = property(lambda self: self._nbasis)
     nelec = property(lambda self: self._nelec)
     two_s = property(lambda self: self._two_s)
     ncsf = property(lambda self: len(self))
     nconfig = property(lambda self: len(self._configs))
+    symmetry = property(lambda self: self._symmetry)
+    target_irrep = property(lambda self: self._target_irrep)
 
     def __len__(self):
         return len(self._labels)
@@ -88,7 +116,8 @@ class csf_wfn:
         return self._labels[item] if not isinstance(item, slice) else tuple(self._labels[item])
 
     def __copy__(self):
-        duplicate = type(self)(self.nbasis, self.nelec, self.two_s)
+        duplicate = type(self)(self.nbasis, self.nelec, self.two_s, symmetry=self.symmetry,
+                               target_irrep=self.target_irrep)
         for label in self:
             duplicate.add_csf(label)
         return duplicate
@@ -109,7 +138,12 @@ class csf_wfn:
                 raise ValueError('negative intermediate spin in CSF path')
         if spin != self.two_s or sum(_configuration(label)) != self.nelec:
             raise ValueError('CSF has the wrong electron number or final spin')
+        self._validate_irrep(label)
         return label
+
+    def _validate_irrep(self, occupation):
+        if self.target_irrep is not None and self.symmetry.configuration_irrep(occupation) != self.target_irrep:
+            raise ValueError('configuration lies outside the target irrep')
 
     def add_csf(self, steps):
         """Append one validated label; return its index (also for duplicates)."""
@@ -121,10 +155,18 @@ class csf_wfn:
             self._occupation_snapshot = None
         return self._indices[label]
 
-    def _occupation_basis(self):
-        if self._occupation_snapshot is None:
+    def _occupation_basis(self, symmetry=None):
+        symmetry = check_symmetry(symmetry, self.nbasis)
+        if self.symmetry is not None and symmetry is not None and self.symmetry != symmetry:
+            raise ValueError('wavefunction and Hamiltonian orbital irreps must match')
+        symmetry = self.symmetry if symmetry is None else symmetry
+        if self._occupation_snapshot is None or self._occupation_symmetry != symmetry:
             from . import _csf
-            self._occupation_snapshot = _csf._OccupationBasis(self.nbasis, self.nelec, self.two_s, tuple(self))
+            irreps = () if symmetry is None else symmetry.orbital_irreps
+            target = -1 if self.target_irrep is None else self.target_irrep
+            self._occupation_snapshot = _csf._OccupationBasis(self.nbasis, self.nelec, self.two_s,
+                                                               tuple(self), irreps, target)
+            self._occupation_symmetry = symmetry
         return self._occupation_snapshot
 
     def _append_native(self, labels):
@@ -134,6 +176,7 @@ class csf_wfn:
         configurations = self._configs.copy()
         additions = {}
         for row, label in enumerate(labels, start=len(self)):
+            self._validate_irrep(label)
             additions.setdefault(_configuration(label), []).append(row)
         for occupation, rows in additions.items():
             configurations[occupation] = self._configs.get(occupation, []) + rows
@@ -159,26 +202,66 @@ class csf_wfn:
     def add_configuration(self, occupations):
         """Append all allowed couplings of an occupation; return number added."""
         occ = self._occupations(occupations)
+        self._validate_irrep(occ)
         old = len(self)
         for label in _paths(occ, self.two_s):
             self.add_csf(label)
         return len(self) - old
 
-    def add_all_csfs(self):
-        """Enumerate and append all CSFs in the spin sector; return number added."""
+    def _sector_configurations(self, choices=(0, 1, 2)):
+        orbitals = self.nbasis
+        labels = () if self.symmetry is None else self.symmetry.orbital_irreps
 
-        def configurations(p, left, occ):
-            if p == self.nbasis:
+        @lru_cache(maxsize=None)
+        def reachable(p, left, open_needed, irrep):
+            remaining = orbitals-p
+            if left < 0 or left > 2*remaining or open_needed > min(left, 2*remaining-left):
+                return False
+            if not remaining:
+                return left == irrep == open_needed == 0
+            return (reachable(p+1, left, open_needed, irrep) or
+                    reachable(p+1, left-1, max(0, open_needed-1), irrep ^ labels[p]) or
+                    reachable(p+1, left-2, open_needed, irrep))
+
+        def configurations(p, left, occ, open_needed, irrep):
+            if self.target_irrep is not None and not reachable(p, left, open_needed, irrep):
+                return
+            if p == orbitals:
                 if left == 0:
                     yield occ
                 return
-            for n in (0, 1, 2):
-                if 0 <= left - n <= 2 * (self.nbasis - p - 1):
-                    yield from configurations(p + 1, left - n, occ + (n,))
+            for n in choices:
+                if 0 <= left-n <= 2*(orbitals-p-1):
+                    change = labels[p] if labels and n == 1 else 0
+                    yield from configurations(p+1, left-n, occ+(n,), max(0, open_needed-(n == 1)), irrep^change)
+
+        yield from configurations(0, self.nelec, (), self.two_s, self.target_irrep or 0)
+
+    def add_all_csfs(self):
+        """Enumerate all CSFs in the spin and optional point-group sector."""
         old = len(self)
-        for occ in configurations(0, self.nelec, ()):
+        for occ in self._sector_configurations():
             self.add_configuration(occ)
         return len(self) - old
+
+    def _reference_in_sector(self, occupations):
+        if self.target_irrep is not None and self.symmetry.configuration_irrep(occupations) != self.target_irrep:
+            occupations = next(self._sector_configurations((2, 1, 0)), None)
+            if occupations is None:
+                raise ValueError('target irrep has no spin-compatible configurations')
+        return next(_paths(occupations, self.two_s))
+
+    def _fill_sector_seed(self, size, *, complete=False):
+        for occupation in self._sector_configurations((2, 1, 0)):
+            if len(self) >= size:
+                return
+            if complete:
+                self.add_configuration(occupation)
+            else:
+                for label in _paths(occupation, self.two_s):
+                    self.add_csf(label)
+                    if len(self) >= size:
+                        return
 
     def to_step_array(self):
         """Return a copy of the labels as a (ncsf, nbasis) character array."""
@@ -192,6 +275,8 @@ class csf_wfn:
     def to_file(self, filename):
         """Write the sector and ordered CSF labels as a plain basis file."""
         payload = dict(nbasis=self.nbasis, nelec=self.nelec, two_s=self.two_s, labels=list(self))
+        if self.symmetry is not None:
+            payload.update(version=1, symmetry=self.symmetry._encode(), target_irrep=self.target_irrep)
         with open(filename, 'w', encoding='utf8') as stream:
             json.dump(payload, stream, indent=2)
             stream.write('\n')
@@ -201,9 +286,16 @@ class csf_wfn:
         """Read a basis file containing exactly the sector and ordered labels."""
         with open(filename, encoding='utf8') as stream:
             data = json.load(stream)
-        if not isinstance(data, dict) or set(data) != {'nbasis', 'nelec', 'two_s', 'labels'}:
+        fields = {'nbasis', 'nelec', 'two_s', 'labels'}
+        if not isinstance(data, dict) or set(data) not in (fields, fields | {'version', 'symmetry', 'target_irrep'}):
             raise ValueError('basis file must contain nbasis, nelec, two_s and labels')
-        wfn = cls(data['nbasis'], data['nelec'], data['two_s'])
+        symmetry = None
+        if 'version' in data:
+            if data['version'] != 1:
+                raise ValueError('unsupported basis file version')
+            symmetry = PointGroup._decode(data['symmetry'])
+        wfn = cls(data['nbasis'], data['nelec'], data['two_s'], symmetry=symmetry,
+                  target_irrep=data.get('target_irrep'))
         for label in data['labels']:
             if wfn.index_csf(label) != -1:
                 raise ValueError('duplicate CSF in basis file')
@@ -226,7 +318,7 @@ def _one_electron_inputs(one, wfn, coeffs, nthreads, triplet):
         raise ValueError('one-electron operator and coefficients must be finite numeric arrays')
     return (one, coeffs, threads)
 
-def csf_one_electron_product(one, wfn, coeffs, *, nthreads=None, triplet=False):
+def csf_one_electron_product(one, wfn, coeffs, *, nthreads=None, triplet=False, symmetry=None):
     """Apply sum[p,q] one[p,q] E[p,q] in the selected CSF space.
 
     This spin-scalar (singlet) operator preserves total spin. Orbital matrices
@@ -241,13 +333,14 @@ def csf_one_electron_product(one, wfn, coeffs, *, nthreads=None, triplet=False):
         raise ValueError('coefficients must be a selected-basis prefix vector or column block')
     from scsf import _csf
     block = coeffs[:, None] if vector else coeffs
-    result = _csf.one_electron_product(np.ascontiguousarray(one, dtype=complex), wfn._occupation_basis(),
+    result = _csf.one_electron_product(np.ascontiguousarray(one, dtype=complex), wfn._occupation_basis(symmetry),
                                        np.ascontiguousarray(block, dtype=complex), threads)
     if not np.iscomplexobj(one) and (not np.iscomplexobj(coeffs)):
         result = result.real.copy()
     return result[:, 0] if vector else result
 
-def add_csf_one_electron(one, wfn, coeffs, eps=1e-05, *, nthreads=None, triplet=False, return_stats=False):
+def add_csf_one_electron(one, wfn, coeffs, eps=1e-05, *, nthreads=None, triplet=False,
+                         return_stats=False, symmetry=None):
     """Append missing CSFs with max_J abs(O[I,J]*c[J]) > eps.
 
     Only zero/one-electron transfers can couple. Parents are immutable within
@@ -261,7 +354,7 @@ def add_csf_one_electron(one, wfn, coeffs, eps=1e-05, *, nthreads=None, triplet=
     if not np.isfinite(eps) or eps < 0:
         raise ValueError('eps must be finite and nonnegative')
     from scsf import _csf
-    labels, stats = _csf.select_one_electron(np.ascontiguousarray(one, dtype=complex), wfn._occupation_basis(),
+    labels, stats = _csf.select_one_electron(np.ascontiguousarray(one, dtype=complex), wfn._occupation_basis(symmetry),
                                              np.ascontiguousarray(np.abs(coeffs), dtype=float), eps, threads)
     wfn._append_native(labels)
     return (len(labels), dict(stats)) if return_stats else len(labels)

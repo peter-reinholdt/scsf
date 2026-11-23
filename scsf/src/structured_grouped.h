@@ -54,6 +54,7 @@ class GroupedUGA {
     SpatialERI integrals_;
     bool slot_sweep_;
     std::vector<double> one_,eri_;
+    std::vector<std::uint16_t> packed_pairs_;
     std::vector<Group> groups_;
     std::vector<Slot> slots_;
     std::vector<unsigned char> fingerprints_;
@@ -137,12 +138,24 @@ class GroupedUGA {
 
     double integral(size_t row,size_t col) const {
         if(!eri_.empty())return eri_[row*k2_+col];
+        if(!packed_pairs_.empty())return integrals_.packed(packed_pairs_[row],packed_pairs_[col]);
         return integrals_(row%k_,row/k_,col%k_,col/k_);
+    }
+    std::pair<const Parent *,const Parent *> matching(const Slot &slot,unsigned code) const {
+        const auto *first=parents_.data()+slot.first,*last=first+slot.count;
+        const auto &sym=primary_.native->symmetry();
+        if(!sym.nontrivial())return {first,last};
+        const auto *begin=std::lower_bound(first,last,code,
+            [&](const Parent &parent,unsigned g){return sym[parent.orbital]<g;});
+        const auto *end=std::upper_bound(begin,last,code,
+            [&](unsigned g,const Parent &parent){return g<sym[parent.orbital];});
+        return {begin,end};
     }
 
     void build_plan(unsigned g,Scratch &scratch) const {
         auto &plan=scratch.plan;
         const auto cfg=groups_[g].occ;
+        const auto &sym=primary_.native->symmetry();
         auto &words=plan.words;
         words.clear();
         plan.constant=0.;
@@ -165,8 +178,9 @@ class GroupedUGA {
             residue.remove(bit(q));
             const auto &range=slots_[slot_index(slots_,residue)];
             removed[q]=&range;
-            for(unsigned i=range.first;i<range.first+range.count;++i) {
-                auto [target,p]=parents_[i];
+            auto [first,last]=matching(range,sym[q]);
+            for(;first!=last;++first) {
+                auto [target,p]=*first;
                 if(target<=g || p==q)continue;
                 unsigned pq=q*k_+p;
                 const auto dest=groups_[target].occ;
@@ -206,10 +220,11 @@ class GroupedUGA {
         probes.clear();
         const size_t occupied=__builtin_popcountll(cfg.occupied);
         if(slot_sweep_ && k_*occupied*(occupied+1)<=4096) {
-            generator_groups([&](unsigned,unsigned r,unsigned,Occupations mid,Word holes) {
+            generator_groups([&](unsigned s,unsigned r,unsigned,Occupations mid,Word holes) {
                 while(holes) {
                     const unsigned q=pop(holes);
                     if(q==r)continue;
+                    if(sym.nontrivial() && !sym.masks[sym[q]^sym.transfer(r,s)])continue;
                     auto key=mid;
                     key.remove(bit(q));
                     probes.push_back({key,hash(key),probes.size()});
@@ -230,6 +245,8 @@ class GroupedUGA {
                 words.push_back(0);
                 while(qs) {
                     unsigned q=pop(qs);
+                    const auto creator=sym[q]^sym.transfer(r,s);
+                    if(sym.nontrivial() && !sym.masks[creator])continue;
                     auto residue=intermediate;
                     residue.remove(bit(q));
                     const Slot *range=removed[s];
@@ -238,8 +255,9 @@ class GroupedUGA {
                         if(id==none)continue;
                         range=&slots_[id];
                     }
-                    for(unsigned i=range->first;i<range->first+range->count;++i) {
-                        auto [target,p]=parents_[i];
+                    auto [first,last]=matching(*range,creator);
+                    for(;first!=last;++first) {
+                        auto [target,p]=*first;
                         unsigned pq=q*k_+p;
                         if(target<g || p==q || pq>rs_pair || integral(rs_pair,pq)==0.)continue;
                         words.push_back(pack_term(target,
@@ -432,8 +450,11 @@ public:
                 static_cast<unsigned>(block.size()),block.complete()});
             complete_+=block.complete();
         }
-        const bool dense_table=integrals.format==ERIFormat::dense;
-        fixed_bytes_=groups_.capacity()*sizeof(Group)+(k2_+(dense_table ? k2_*k2_ : 0))*sizeof(double);
+        const auto &sym=primary_.native->symmetry();
+        const bool dense_table=integrals.format==ERIFormat::dense && !sym.nontrivial();
+        const bool packed=integrals.format!=ERIFormat::dense;
+        fixed_bytes_=groups_.capacity()*sizeof(Group)+(k2_+(dense_table ? k2_*k2_ : 0))*sizeof(double)
+            +(packed ? k2_*sizeof(packed_pairs_[0]) : 0);
         if(fixed_bytes_>metadata)throw BudgetError("grouped UGA exceeds metadata budget");
         size_t records=0,keys=0;
         if(!groups_.empty()) {
@@ -467,6 +488,15 @@ public:
                 auto &entry=slots_[slot_index(slots_,key)];
                 parents_[--entry.first]={group,orbital};
             });
+            if(sym.nontrivial())workers_.run(slots_.size(),[&](size_t i,size_t) {
+                const auto &entry=slots_[i];
+                if(entry.count<2)return;
+                auto first=parents_.begin()+entry.first;
+                std::sort(first,first+entry.count,[&](const Parent &a,const Parent &b) {
+                    const auto ag=sym[a.orbital],bg=sym[b.orbital];
+                    return ag!=bg ? ag<bg : a.group>b.group;
+                });
+            },256);
             fixed_bytes_+=parents_.capacity()*sizeof(Parent);
             memory_left(metadata-fixed_bytes_,slots_.size(),"CIH hash fingerprints");
             fingerprints_.resize(slots_.size());
@@ -483,6 +513,11 @@ public:
         // H = K E + sum_(pq<rs) (pq|rs) E_pq E_rs + 1/2 sum_pq (pq|pq) E_pq^2.
         // K includes both normal ordering and the generator commutator.
         one_.resize(k2_);
+        if(packed) {
+            packed_pairs_.resize(k2_);
+            for(size_t q=0;q<k_;++q)for(size_t p0=0;p0<k_;++p0)
+                packed_pairs_[q*k_+p0]=orbital_pair(q,p0);
+        }
         if(dense_table) {
             eri_.resize(k2_*k2_);
             workers_.run(k2_,[&](size_t rs,size_t) {
@@ -491,6 +526,7 @@ public:
             },8);
         }
         for(size_t q=0;q<k_;++q)for(size_t p0=0;p0<k_;++p0) {
+            if(sym.transfer(p0,q))continue;
             double value=h[p0*k_+q];
             for(size_t l=0;l<k_;++l) {
                 const size_t left=l*k_+p0,right=q*k_+l;
@@ -553,7 +589,8 @@ public:
             const auto src=groups_[g].occ;
             if(direct) {
                 for(size_t j=prefix;j<groups_.size();++j)
-                    if(distance(src,groups_[j].occ)<=4)return;
+                    if(primary_.groups[g].block->irrep==primary_.groups[j].block->irrep &&
+                        distance(src,groups_[j].occ)<=4)return;
             } else for(size_t first=0;first<added;first+=tile) {
                 const auto &entry=summary[first/tile];
                 // These bits differ from every occupation in the tile, so
@@ -562,7 +599,8 @@ public:
                 const auto doubled=(src.doubled&~entry.any.doubled)|(entry.all.doubled&~src.doubled);
                 if(__builtin_popcountll(occupied)+__builtin_popcountll(doubled)>4)continue;
                 for(size_t j=first;j<std::min(first+tile,added);++j)
-                    if(distance(src,groups_[prefix+j].occ)<=4)return;
+                    if(primary_.groups[g].block->irrep==primary_.groups[prefix+j].block->irrep &&
+                        distance(src,groups_[prefix+j].occ)<=4)return;
             }
             cache_[g]=plan;
         },64);

@@ -7,6 +7,7 @@ namespace scsf::structured {
 class GeneratorPostings {
     const Primary &primary_;
     OneBank bank_;
+    std::vector<unsigned char> support_;
     size_t allocated_=0,records_=0;
 
     const Matrix &coupling(const Primary::Group &group,int create,int destroy) const {
@@ -19,12 +20,19 @@ class GeneratorPostings {
 
 public:
     struct Channel {size_t source;int create,destroy;};
+    enum class Order {natural,directed,sector};
     std::map<Config,std::vector<Channel>> groups;
 
     GeneratorPostings(const Primary &p,size_t link_bytes,size_t coefficient_bytes,
-                      const double *active=nullptr,const double *other=nullptr,size_t total_bytes=no_row)
+                      const double *active=nullptr,const double *other=nullptr,size_t total_bytes=no_row,
+                      Order order=Order::natural)
         :primary_(p),bank_(cih_template_electrons(p),p.s,std::min(coefficient_bytes,total_bytes)) {
         link_bytes=std::min(link_bytes,memory_left(total_bytes,bank_.bytes(),"generator coefficients"));
+        if(active) {
+            memory_left(link_bytes,p.groups.size(),"generator coefficient support");
+            support_.resize(p.groups.size());
+            allocated_=support_.capacity();
+        }
         auto stash=[&](const Config &cfg,Channel c) {
             auto [it,inserted]=groups.try_emplace(cfg);
             if(inserted)allocated_=checked_add(allocated_,sizeof(decltype(groups)::value_type)
@@ -44,7 +52,9 @@ public:
                     values+=group.block->offset;
                     return std::any_of(values,values+group.size(),[](double c){return c!=0.;});
                 };
-                if(!nonzero(active) && (!other || !nonzero(other)))continue;
+                const bool right=nonzero(active),left=other ? nonzero(other) : right;
+                support_[src]=unsigned(right)+2*unsigned(left);
+                if(!support_[src])continue;
             }
             Config mid=ket;
             for(int q=0;q<p.k;++q)if(ket[q]) {
@@ -59,7 +69,18 @@ public:
                 ++mid[q];
             }
         }
+        if(order==Order::directed)for(auto &[cfg,channels]:groups)
+            std::sort(channels.begin(),channels.end(),[](const Channel &a,const Channel &b) {
+                return std::tie(a.destroy,a.create)<std::tie(b.destroy,b.create);
+            });
+        else if(order==Order::sector && p.native->symmetry().nontrivial())for(auto &[cfg,channels]:groups)
+            std::sort(channels.begin(),channels.end(),[&](const Channel &a,const Channel &b) {
+                return std::tie(p.groups[a.source].block->irrep,a.source,a.destroy,a.create)<
+                    std::tie(p.groups[b.source].block->irrep,b.source,b.destroy,b.create);
+            });
     }
+
+    unsigned support(size_t source) const {return support_.empty() ? 3 : support_[source];}
 
     size_t rows(const Channel &c) const {
         const auto &source=primary_.groups[c.source];

@@ -1,5 +1,6 @@
 /* SCSF; GPL-3.0-or-later. Native occupation blocks and genealogical spin ranks. */
 #pragma once
+#include "point_group.h"
 #include "csf.h"
 #include <algorithm>
 #include <numeric>
@@ -147,6 +148,7 @@ struct Block {
     Occupation key;
     size_t offset=0, dimension=0;
     int open;
+    unsigned irrep=0;
     // Ranks are only present for partial occupations.
     std::vector<size_t> ranks;
     Block(Occupation occupation,int m,size_t dim) : key(std::move(occupation)),dimension(dim),open(m) {}
@@ -163,6 +165,8 @@ public:
     using Additions=std::map<Config,std::vector<size_t>>;
 private:
     int k_, n_, s_;
+    int target_irrep_=-1;
+    std::shared_ptr<const OrbitalSymmetry> symmetry_;
     size_t size_=0, generation_=0;
     std::vector<std::shared_ptr<const SpinRanks>> spins_;
     std::vector<Block> blocks_;
@@ -183,10 +187,14 @@ private:
         if (size_>size_t(std::numeric_limits<pybind11::ssize_t>::max()))
             throw BudgetError("native basis exceeds array index capacity");
     }
-    size_t insert(Occupation key,int open) {
+    size_t insert(Occupation key,const Config &cfg,int open) {
+        const auto irrep=symmetry().configuration(cfg);
+        if(target_irrep_>=0 && irrep!=unsigned(target_irrep_))
+            throw std::invalid_argument("configuration lies outside the target irrep");
         const auto id=blocks_.size();
         directory_.emplace(key.hash(),id);
         blocks_.emplace_back(std::move(key),open,spin(open).size());
+        blocks_.back().irrep=irrep;
         return id;
     }
     void ensure_spin(int open) {
@@ -203,7 +211,12 @@ private:
     }
 public:
     Basis(int k,int n,int s) : k_(k),n_(n),s_(s),spins_(max_open(k,n,s)+1) {}
-    Basis(int k,int n,int s,const std::vector<std::string> &labels) : Basis(k,n,s) {
+    Basis(int k,int n,int s,const std::vector<std::string> &labels,
+            std::vector<unsigned> irreps={},int target=-1) : Basis(k,n,s) {
+        if(!irreps.empty())symmetry_=std::make_shared<const OrbitalSymmetry>(k,std::move(irreps));
+        if(target<-1 || target>=int(OrbitalSymmetry::extent) || (target>0 && k && !symmetry_))
+            throw std::invalid_argument("invalid target irrep");
+        target_irrep_=target;
         std::vector<std::pair<size_t,size_t>> order;
         order.reserve(labels.size());
         for (const auto &label:labels) {
@@ -216,7 +229,7 @@ public:
             auto id=find(key);
             if (id==no_row) {
                 ensure_spin(open);
-                id=insert(std::move(key),open);
+                id=insert(std::move(key),cfg,open);
             }
             const size_t rank=spin(open).rank(label);
             blocks_[id].ranks.push_back(rank);
@@ -241,6 +254,11 @@ public:
     int orbitals() const { return k_; }
     int electrons() const { return n_; }
     int two_s() const { return s_; }
+    int target_irrep() const {return target_irrep_;}
+    const OrbitalSymmetry &symmetry() const {
+        static const OrbitalSymmetry empty;
+        return symmetry_ ? *symmetry_ : empty;
+    }
     size_t size() const { return size_; }
     size_t generation() const { return generation_; }
     int maximum_open() const { return int(spins_.size())-1; }
@@ -273,7 +291,7 @@ public:
             if (id==no_row) {
                 const int open=std::count(cfg.begin(),cfg.end(),1);
                 next->ensure_spin(open);
-                id=next->insert(std::move(key),open);
+                id=next->insert(std::move(key),cfg,open);
                 next->blocks_[id].ranks=ranks;
             } else if (!blocks_[id].complete()) {
                 auto &block=next->blocks_[id];
@@ -325,7 +343,11 @@ public:
         for (const auto &spin:spins_) if (spin) spin_bytes+=sizeof(SpinRanks)+spin->bytes();
         const size_t directory_bytes=directory_.bucket_count()*sizeof(void *)+
             directory_.size()*(sizeof(std::pair<const size_t,size_t>)+2*sizeof(void *));
+        size_t sectors=0,mask=0;
+        for(const auto &block:blocks_)mask|=size_t(1)<<block.irrep;
+        for(;mask;mask&=mask-1)++sectors;
         return {{"basis",size_},{"configurations",blocks_.size()},{"complete_configurations",complete},
+                {"point_group",symmetry().enabled()},{"represented_irreps",sectors},
                 {"rank_map_bytes",ranks},{"public_permutation_bytes",public_rows_.capacity()*sizeof(size_t)},
                 {"occupation_bytes",blocks_.capacity()*sizeof(Block)+wide+directory_bytes},
                 {"wide_mask_bytes",wide},{"spin_rank_bytes",spin_bytes},{"generation",generation_}};

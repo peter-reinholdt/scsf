@@ -1,6 +1,7 @@
 /* This file is part of SCSF, licensed under the GNU GPL version 3 or later.
  * See LICENSE for details. */
 #pragma once
+#include "structured_eri.h"
 
 #include <pybind11/numpy.h>
 #include <array>
@@ -91,17 +92,30 @@ inline size_t memory_left(size_t limit,size_t used,const char *phase) {
 
 class HCITransferBounds {
     Array one_, two_;
+    structured::SpatialERI eri_;
+    OrbitalSymmetry symmetry_;
     std::vector<double> transfer_bounds_,single_bounds_;
+    mutable std::recursive_mutex table_lock_;
     std::once_flag bound_once_, ordered_once_, ordered_singles_once_;
     std::unique_ptr<BoundedTransfer[]> ordered_transfers_;
     size_t ordered_transfer_count_=0;
     std::vector<BoundedTransfer> ordered_singles_;
-    std::vector<size_t> ordered_offsets_;
+    std::vector<size_t> ordered_offsets_,ordered_single_offsets_,single_offsets_;
     int ordered_single_electrons_=0;
     void prepare_single_bounds(int k);
+    size_t single_rows(int k) const;
+    size_t single_row(int p,int q,int k) const;
 public:
     HCITransferBounds(const Array &one, const Array &two);
+    HCITransferBounds(const Array &one,const Array &two,structured::SpatialERI eri,
+                      const OrbitalSymmetry &symmetry);
+    std::unique_lock<std::recursive_mutex> lock_tables() const {
+        return std::unique_lock<std::recursive_mutex>(table_lock_);
+    }
+    bool optional_tables() const {return eri_.format!=structured::ERIFormat::dense || symmetry_.enabled();}
     size_t bytes() const;
+    size_t ordered_double_count() const {return ordered_transfer_count_;}
+    size_t ordered_single_count() const {return ordered_singles_.size();}
     void prepare_transfer_bounds(int k,size_t limit);
     double selection_bound(const Config &source, const std::array<int,2> &holes,
                            const std::array<int,2> &particles, int order, int k) const;
@@ -120,7 +134,7 @@ inline void validate_config(const Config &config) {
 
 double transfer_bound(const Config &ket, const std::array<int, 2> &holes,
                       const std::array<int, 2> &particles, int order,
-                      const double *h, const double *v, int k);
+                      const double *h, const structured::SpatialERI &v, int k);
 double guga_generator(const Path &bra, const Path &ket, int p, int q);
 double guga_two_body(const Path &bra, const Path &ket, int p, int q, int r, int s);
 double guga_element(const Path &bra, const Path &ket, const Connection &connection);

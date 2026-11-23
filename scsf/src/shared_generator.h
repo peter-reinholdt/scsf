@@ -8,7 +8,8 @@ inline Stats shared_generator_product(const Primary &p,const double *h,
         const SpatialERI &eri,const double *x,double *y,
         size_t link_bytes,size_t workspace_bytes,size_t coefficient_bytes) {
     const auto start=Clock::now();
-    const GeneratorPostings postings(p,link_bytes,coefficient_bytes);
+    const GeneratorPostings postings(p,link_bytes,coefficient_bytes,nullptr,nullptr,no_row,
+                                     GeneratorPostings::Order::sector);
     auto stats=postings.info();
     stats["setup_ns"]=ns(start);
     const auto begin_product=Clock::now();
@@ -17,6 +18,7 @@ inline Stats shared_generator_product(const Primary &p,const double *h,
     if(k*k>capacity)throw BudgetError("normal-ordered one-body table exceeds generator workspace");
     std::vector<double> shifted(k*k),work;
     for(size_t q=0;q<k;++q)for(size_t r=0;r<k;++r) {
+        if(p.native->symmetry().transfer(q,r))continue;
         double value=h[r*k+q];
         for(size_t l=0;l<k;++l)value-=.5*eri(r,l,l,q);
         shifted[r*k+q]=value;
@@ -42,11 +44,17 @@ inline Stats shared_generator_product(const Primary &p,const double *h,
                 for(size_t i=0;i<g.size();++i)y[g.row(i)]+=value*amp[g.rank(i)];
             }
         }
-        for(size_t a=0;a<count;++a)for(size_t b=0;b<count;++b) {
-            const auto &left=channels[a],&right=channels[b];
-            // The adjoint of the channel E_qp represents the left E_pq.
-            const double scale=.5*eri(left.destroy,left.create,right.create,right.destroy);
-            for(size_t i=0;i<dim;++i)mixed[a*dim+i]+=scale*forward[b*dim+i];
+        for(size_t first=0;first<count;) {
+            const auto code=p.groups[channels[first].source].block->irrep;
+            size_t end=first+1;
+            while(end<count && p.groups[channels[end].source].block->irrep==code)++end;
+            for(size_t a=first;a<end;++a)for(size_t b=first;b<end;++b) {
+                const auto &left=channels[a],&right=channels[b];
+                // The adjoint of the channel E_qp represents the left E_pq.
+                const double scale=.5*eri(left.destroy,left.create,right.create,right.destroy);
+                for(size_t i=0;i<dim;++i)mixed[a*dim+i]+=scale*forward[b*dim+i];
+            }
+            first=end;
         }
         for(size_t a=0;a<count;++a)postings.contract<true>(channels[a],mixed+a*dim,y);
     }

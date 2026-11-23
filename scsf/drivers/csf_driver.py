@@ -21,7 +21,7 @@ import scsf
 from ..config import default_cli_threads
 from ..csf import _configuration
 from ..integrals import rotate_hamiltonian
-from .molecular import correlated_density, integrals_from_scf, run_scf
+from .molecular import active_mo_symmetry, correlated_density, integrals_from_scf, run_scf
 from .solvers import solve_ci
 
 
@@ -37,42 +37,63 @@ def memory_bytes(value):
     return size
 
 
-def integrals(args, parser):
+def integrals(args, parser, *, packed_output=False):
     if args.integrals:
         if args.natorb in ('mp2', 'ccsd'):
             parser.error(f'--natorb {args.natorb} requires --xyz')
         if args.ncore:
             parser.error('--ncore applies to XYZ input; snapshots must already contain active integrals')
-        with np.load(args.integrals, allow_pickle=False) as data:
-            nelec = args.nelec if args.nelec is not None else int(data['nelec']) if 'nelec' in data else None
-            if nelec is None:
-                parser.error('--nelec is required if the array snapshot has no nelec field')
-            ecore, one = float(data['ecore']), data['one']
-            if 'two' in data:
-                return scsf.Hamiltonian(ecore, one, data['two']), nelec
-            if 'packed_eri' in data:
-                return scsf.PackedHamiltonian(ecore, one, data['packed_eri']), nelec
-            parser.error('snapshot needs two or packed_eri')
+        if args.point_group is not None:
+            parser.error('--point-group applies to XYZ input. Snapshots supply their own orbital irreps')
+        try:
+            ham, nelec = scsf.load_hamiltonian(args.integrals)
+        except (KeyError, TypeError, ValueError) as exc:
+            parser.error(str(exc))
+        nelec = args.nelec if args.nelec is not None else nelec
+        if nelec is None:
+            parser.error('--nelec is required if the array snapshot has no nelec field')
+        return ham, nelec
     if not args.basis:
         parser.error('--basis is required with --xyz')
     if args.nelec is not None:
         parser.error('--nelec applies to array snapshot input; XYZ uses the molecular charge')
-    mf = run_scf(args.xyz, args.basis, args.charge, args.two_s, args.ncore, parser)
+    group = args.point_group if args.target_irrep is None else args.point_group or 'auto'
+    try:
+        mf = run_scf(args.xyz, args.basis, args.charge, args.two_s, args.ncore, parser,
+                     point_group=group)
+    except ValueError as exc:
+        parser.error(str(exc))
     mo_coeff = None
     if args.natorb in ('mp2', 'ccsd'):
         method = args.natorb.upper()
         print(f'Generating natural orbitals from {method}', flush=True)
-        rotation = natural_orbitals(correlated_density(mf, args.ncore, args.natorb), method)
+        symmetry = None if group is None else active_mo_symmetry(mf, args.ncore)
+        rotation = natural_orbitals(correlated_density(mf, args.ncore, args.natorb), method,
+                                    symmetry=symmetry)
         mo_coeff = mf.mo_coeff.copy()
         mo_coeff[:, args.ncore:] = mo_coeff[:, args.ncore:] @ rotation
-    ham, nelec, _ = integrals_from_scf(mf, args.ncore, mo_coeff=mo_coeff)
+    ham, nelec, _ = integrals_from_scf(mf, args.ncore, mo_coeff=mo_coeff, packed=packed_output,
+                                      point_group=group is not None)
     return ham, nelec
 
 
-def natural_orbitals(density, method):
+def natural_orbitals(density, method, *, symmetry=None):
     if not np.all(np.isfinite(density)):
         raise RuntimeError(f'{method} produced a nonfinite 1-RDM')
-    occupations, orbitals = np.linalg.eigh((density + density.T) * .5)
+    symmetric = (density + density.T) * .5
+    if symmetry is None:
+        occupations, orbitals = np.linalg.eigh(symmetric)
+    else:
+        labels = np.asarray(symmetry.orbital_irreps, dtype=np.intp)
+        if np.any(np.abs(symmetric[labels[:, None] != labels]) > 1e-10):
+            raise ValueError(f'{method} 1-RDM mixes orbital irreps')
+        occupations = np.empty(len(labels))
+        orbitals = np.zeros_like(symmetric)
+        for code in range(len(symmetry.names)):
+            ids = np.flatnonzero(labels == code)
+            if len(ids):
+                block = np.ix_(ids, ids)
+                occupations[ids], orbitals[block] = np.linalg.eigh(symmetric[block])
     order = np.argsort(-occupations, kind='stable')
     values = ' '.join(f'{occupation:.8f}' for occupation in occupations[order])
     print(f'{method} natural occupations=[{values}]', flush=True)
@@ -92,6 +113,9 @@ def build_parser():
     space.add_argument('--ncore', type=int, default=0)
     space.add_argument('--nelec', type=int)
     space.add_argument('--two-s', type=int, default=0, help='twice the target total spin')
+    space.add_argument('--point-group', nargs='?', const='auto',
+                       help='enable orbital symmetry for XYZ input, optionally with a subgroup')
+    space.add_argument('--target-irrep', help='restrict the CI to this irrep (name or numeric code)')
     space.add_argument('--reference', help='initial CSF path, right-padded with zeros (e.g. 2222 or 22ud)')
     space.add_argument('--natorb', nargs='?', const='sci', type=str.lower, choices=('sci', 'mp2', 'ccsd'),
                        help='use natural orbitals from a pilot SCI run (sci) or XYZ with PySCF (mp2, ccsd); '
@@ -141,9 +165,13 @@ def configure_driver(args, parser):
 
 def initial_space(args, parser, ham, nelec):
     try:
-        wfn = scsf.csf_wfn(ham.nbasis, nelec, args.two_s)
-        dimension = scsf.csf_dimension(ham.nbasis, nelec, args.two_s)
-    except ValueError as exc:
+        target = args.target_irrep
+        if target is not None and target.isdecimal():
+            target = int(target)
+        wfn = scsf.csf_wfn(ham.nbasis, nelec, args.two_s, symmetry=ham.symmetry, target_irrep=target)
+        dimension = scsf.csf_dimension(ham.nbasis, nelec, args.two_s, symmetry=ham.symmetry,
+                                       target_irrep=target)
+    except (TypeError, ValueError) as exc:
         parser.error(str(exc))
     if args.nroots > dimension:
         parser.error('nroots exceeds the target-spin dimension')
@@ -153,11 +181,15 @@ def initial_space(args, parser, ham, nelec):
         reference = '2' * pairs + 'u' * args.two_s
     reference = reference.ljust(ham.nbasis, '0')
     try:
+        if args.reference is None and wfn.target_irrep is not None:
+            reference = wfn._reference_in_sector(_configuration(reference))
         if args.selection_unit == 'configuration':
             label = wfn._validate(reference)
             wfn.add_configuration(_configuration(label))
         else:
             wfn.add_csf(reference)
+        if wfn.target_irrep is not None and len(wfn) < args.nroots:
+            wfn._fill_sector_seed(args.nroots, complete=args.selection_unit == 'configuration')
     except ValueError as exc:
         parser.error(f'invalid --reference {reference!r} ({exc})')
     return wfn, dimension
@@ -185,14 +217,23 @@ def diagonalize(args, op, c0=None, *, measurements=None, progress=False):
         importance = np.zeros(size) if c0 is None else np.max(np.abs(c0), axis=1)
         rows = np.lexsort((rows, diagonal, -importance))[:args.davidson_block_size]
         basis = op.basis_context
-        subspace = scsf.csf_wfn(basis['nbasis'], basis['nelec'], basis['two_s'])
-        for label in op.native_labels(rows):
-            subspace.add_csf(label)
-        block_op = op.with_basis(subspace, concurrent=True)
-        preconditioner_block = rows, block_op.matmat(np.eye(len(rows)))
-        preconditioner_memory_peak = (op.product_info['tracked_memory_bytes']
-                                      + block_op.product_info['peak_tracked_memory_bytes'])
-        del block_op
+        labels = op.native_labels(rows)
+        sectors = {}
+        for i, label in enumerate(labels):
+            code = None if op.symmetry is None else op.symmetry.configuration_irrep(label)
+            sectors.setdefault(code, []).append(i)
+        matrix = np.zeros((len(rows), len(rows)))
+        for code, indices in sectors.items():
+            subspace = scsf.csf_wfn(basis['nbasis'], basis['nelec'], basis['two_s'],
+                                   symmetry=op.symmetry, target_irrep=code)
+            for i in indices:
+                subspace.add_csf(labels[i])
+            block_op = op.with_basis(subspace, concurrent=True)
+            matrix[np.ix_(indices, indices)] = block_op.matmat(np.eye(len(indices)))
+            preconditioner_memory_peak = max(preconditioner_memory_peak,
+                op.product_info['tracked_memory_bytes'] + block_op.product_info['peak_tracked_memory_bytes'])
+            del block_op
+        preconditioner_block = rows, matrix
     block_seconds = perf_counter()-block_start
     stats = {} if measurements is not None or args.sci_stats or progress else None
     products = {}
@@ -299,7 +340,7 @@ def run_hci(args, parser, started):
     if not args.quiet:
         print(f'Loading integrals from {args.integrals or args.xyz}', flush=True)
     start = perf_counter()
-    ham, nelec = integrals(args, parser)
+    ham, nelec = integrals(args, parser, packed_output=True)
     timing['integrals'] = perf_counter()-start
 
     pilot_peak = 0
@@ -312,7 +353,7 @@ def run_hci(args, parser, started):
             density += op.native_rdm1(vectors[:, root])
         pilot_peak = max(pilot_peak, op.product_info['peak_tracked_memory_bytes'])
         del vectors, op
-        rotation = natural_orbitals(density / args.nroots, 'SCI')
+        rotation = natural_orbitals(density / args.nroots, 'SCI', symmetry=ham.symmetry)
         ham = rotate_hamiltonian(ham, rotation)
         timing['natural_orbitals'] = perf_counter()-start
     if args.natorb is not None:
@@ -340,6 +381,10 @@ def hci_pass(args, parser, ham, nelec, timing, *, started=None):
         print(f'driver_startup_seconds={perf_counter()-started:.6f} cpus={args.worker_cpus}')
     print(f'{op.strategy}, {args.selection_unit} HCI selection, Davidson: '
           f'N={nelec}, 2S={args.two_s}, orbitals={ham.nbasis}, full dimension={dimension}')
+    if ham.symmetry is not None:
+        represented = sorted({ham.symmetry.configuration_irrep(cfg) for cfg in wfn._configs})
+        names = ','.join(ham.symmetry.names[g] for g in represented)
+        print(f'Point group {ham.symmetry.group}, seed irreps {names}')
 
     def solve_step(iteration, added=0, guess=None, *, final=False):
         nonlocal preconditioner_memory_peak

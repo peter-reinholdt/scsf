@@ -39,6 +39,25 @@ std::vector<Path> prepare_paths(const structured::Primary &primary) {
     return paths;
 }
 
+class PropertyTransfers {
+    using Terms=std::array<std::vector<int>,OrbitalSymmetry::extent>;
+    std::vector<Terms> terms_;
+public:
+    PropertyTransfers(const structured::Primary &p,const Complex *one,bool adjoint):terms_(p.k) {
+        const auto &sym=p.native->symmetry();
+        for(int i=0;i<p.k;++i)for(int j=0;j<p.k;++j) {
+            const size_t at=adjoint ? size_t(i)*p.k+j : size_t(j)*p.k+i;
+            if(i!=j && one[at]!=Complex{})terms_[i][sym.transfer(i,j)].push_back(j);
+        }
+    }
+    template<class Visit>void visit(int orbital,unsigned allowed,Visit callback) const {
+        for(;allowed;allowed&=allowed-1) {
+            const unsigned g=__builtin_ctz(allowed);
+            for(int other:terms_[orbital][g])callback(other);
+        }
+    }
+};
+
 // Destination-owned tiles apply each directed E_pq block once. Public row
 // numbers are used at the vector boundary so a coefficient prefix can be
 // read without padding or scattering between occupation tiles.
@@ -61,8 +80,16 @@ ComplexArray one_electron_product(const ComplexArray &one,
     const structured::Primary primary(std::move(basis));
     const size_t k=primary.k;
     const auto paths=prepare_paths(primary);
+    const PropertyTransfers transfers(primary,integrals,true);
     const auto indices=public_indices(*primary.native);
     auto public_row=[&](size_t row) {return indices.empty() ? row : indices[row];};
+    unsigned sectors=0;
+    for(const auto &group:primary.groups) {
+        for(size_t i=0;i<group.size();++i)if(public_row(group.row(i))<source_size) {
+            sectors|=1u<<group.block->irrep;
+            break;
+        }
+    }
     struct Tile {size_t group,begin,end;};
     std::vector<Tile> tiles;
     for (size_t group=0;group<primary.groups.size();++group)
@@ -80,16 +107,19 @@ ComplexArray one_electron_product(const ComplexArray &one,
                 y[row*columns+c]=row<source_size ? diagonal*input[row*columns+c] : Complex{};
         }
         Config source=*bra.cfg;
+        unsigned allowed=0;
+        for(auto remaining=sectors;remaining;remaining&=remaining-1)
+            allowed|=1u<<(bra.block->irrep^unsigned(__builtin_ctz(remaining)));
         for (size_t p=0;p<k;++p) {
             if (!source[p]) continue;
             --source[p];
-            for (size_t q=0;q<k;++q) {
+            transfers.visit(p,allowed,[&](size_t q) {
                 const auto integral=integrals[p*k+q];
-                if (p==q || source[q]==2 || integral==Complex{}) continue;
+                if(source[q]==2)return;
                 ++source[q];
                 const size_t id=primary.native->find(Occupation(source));
                 --source[q];
-                if (id==no_row) continue;
+                if(id==no_row)return;
                 const auto &ket=primary.groups[id];
                 for (size_t i=begin;i<end;++i) {
                     const size_t bra_row=bra.row(i), out=public_row(bra_row)*columns;
@@ -100,7 +130,7 @@ ComplexArray one_electron_product(const ComplexArray &one,
                         for (size_t c=0;c<columns;++c) y[out+c]+=value*input[in*columns+c];
                     }
                 }
-            }
+            });
             ++source[p];
         }
     });
@@ -123,6 +153,7 @@ py::tuple select_one_electron(const ComplexArray &one, std::shared_ptr<const Bas
         const auto paths=prepare_paths(primary);
         const auto indices=public_indices(*primary.native);
         const auto *integrals=one.data();
+        const PropertyTransfers transfers(primary,integrals,false);
         const auto *coefficients=weights.data();
         auto weight=[&](size_t row) {return coefficients[indices.empty() ? row : indices[row]];};
         const size_t count=std::min(nthreads,std::max(size_t(1),primary.groups.size()));
@@ -143,12 +174,15 @@ py::tuple select_one_electron(const ComplexArray &one, std::shared_ptr<const Bas
             auto &local=additions[worker];
             auto &census=counters[worker];
             Config target=*source.cfg;
+            const int target_irrep=primary.native->target_irrep();
+            const unsigned allowed=target_irrep<0 ? (1u<<OrbitalSymmetry::extent)-1
+                : 1u<<(unsigned(target_irrep)^source.block->irrep);
             for (int q=0;q<primary.k;++q) {
                 if (!target[q]) continue;
                 --target[q];
-                for (int p=0;p<primary.k;++p) {
+                transfers.visit(q,allowed,[&](int p) {
                     const auto integral=integrals[p*primary.k+q];
-                    if (p==q || target[p]==2 || integral==Complex{}) continue;
+                    if(target[p]==2)return;
                     ++target[p];
                     ++census["configuration_pairs"];
                     const auto key=Occupation(target);
@@ -177,7 +211,7 @@ py::tuple select_one_electron(const ComplexArray &one, std::shared_ptr<const Bas
                         }
                     }
                     --target[p];
-                }
+                });
                 ++target[q];
             }
         });

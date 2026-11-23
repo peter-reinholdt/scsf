@@ -56,6 +56,8 @@ class ParticleHole {
     std::vector<Config> main_,other_;
     std::vector<unsigned> main_id_,other_id_,parents_;
     std::vector<size_t> parent_ptr_;
+    std::array<size_t,OrbitalSymmetry::extent> sector_{};
+    size_t sector_count_=0;
     using NeighborBuckets=std::array<size_t,6>;
     std::vector<NeighborBuckets> neighbor_ptr_;
     std::vector<std::uint16_t> narrow_neighbors_;
@@ -102,11 +104,17 @@ public:
         main_sample_visits_=cost(main_,main_id_);
         other_sample_visits_=cost(other_,other_id_);
         if(other_sample_visits_<main_sample_visits_) {main_.swap(other_);main_id_.swap(other_id_);}
-        parent_ptr_.assign(main_.size()+1,0);
-        for(unsigned id:main_id_)++parent_ptr_[id+1];
+        std::array<bool,OrbitalSymmetry::extent> present{};
+        for(const auto &group:p.groups)present[group.block->irrep]=true;
+        for(size_t g=0;g<present.size();++g)if(present[g])sector_[g]=sector_count_++;
+        if(main_.size()>=maximum/sizeof(size_t)/sector_count_)
+            throw BudgetError("particle–hole sector postings exceed metadata budget");
+        parent_ptr_.assign(main_.size()*sector_count_+1,0);
+        auto posting=[&](size_t g) {return main_id_[g]*sector_count_+sector_[p.groups[g].block->irrep];};
+        for(size_t g=0;g<p.groups.size();++g)++parent_ptr_[posting(g)+1];
         std::partial_sum(parent_ptr_.begin(),parent_ptr_.end(),parent_ptr_.begin());
         parents_.resize(p.groups.size());auto cursor=parent_ptr_;
-        for(size_t g=0;g<p.groups.size();++g)parents_[cursor[main_id_[g]]++]=g;
+        for(size_t g=0;g<p.groups.size();++g)parents_[cursor[posting(g)]++]=g;
         fixed_bytes_=bytes();
         if(fixed_bytes_>maximum)throw BudgetError("particle/hole strings exceed metadata budget");
         tree_=std::make_unique<OccupationTree>(main_.size(),main_[0].size(),maximum-fixed_bytes_,
@@ -151,12 +159,13 @@ public:
         build_bytes_=bytes();
         tree_.reset();
     }
-    void query(size_t group,std::vector<unsigned> &result) const {
+    void query(size_t group,unsigned irrep,std::vector<unsigned> &result) const {
         result.clear();if(main_.empty())return;
         unsigned a=main_id_[group],b=other_id_[group];
         const auto *distance_row=distances_.empty() ? nullptr : distances_.data()+b*other_.size();
         auto visit=[&](unsigned id,int distance) {
-            for(size_t j=parent_ptr_[id];j<parent_ptr_[id+1];++j) {
+            const size_t posting=id*sector_count_+sector_[irrep];
+            for(size_t j=parent_ptr_[posting];j<parent_ptr_[posting+1];++j) {
                 unsigned g=parents_[j];if(g>group)break;
                 unsigned c=other_id_[g];int d=0;
                 if(distance_row)d=distance_row[c];
@@ -361,7 +370,7 @@ public:
         auto start=Clock::now();
         auto run=[&](size_t a,size_t w) {
             auto &s=scratch_[w];auto out=use_result ? y : partial.data()+w*stride;
-            strings_.query(a,s.neighbors);
+            strings_.query(a,p_.groups[a].block->irrep,s.neighbors);
             for(unsigned b:s.neighbors)pair(a,b,x,cols,out,s);
         };
         workers_.run(p_.groups.size(),run,8);

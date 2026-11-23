@@ -241,6 +241,7 @@ struct Residues {
 // Sort occupation bitsets directly, without allocating keys or decoding residues.
 struct CompactRemovalResidues {
     using Key=Occupation::Limb;
+    using DoubleKey=std::array<Key,2>;
     template<class Word>struct Record {std::array<Word,2> key;unsigned parent;std::uint8_t p,q;};
     template<size_t Limbs>struct MultiRecord {
         std::array<Key,Limbs> key;
@@ -527,8 +528,21 @@ struct RemovalQueries {
 
 struct RemovalLinks {
     struct Family {int spin,m;int weight=1;};
-    struct Parent {unsigned group,matrix,channel;};
-    struct Block {unsigned config,family;size_t begin,end,dim;};
+    // The parallel builders size these arrays before dispatch and assign
+    // every record. Let the worker writing a record first touch its pages.
+    struct Parent {
+        unsigned group,matrix,channel;
+        Parent() noexcept {}
+        Parent(unsigned group,unsigned matrix,unsigned channel) noexcept
+            :group(group),matrix(matrix),channel(channel) {}
+    };
+    struct Block {
+        unsigned config,family;
+        size_t begin,end,dim;
+        Block() noexcept {}
+        Block(unsigned config,unsigned family,size_t begin,size_t end,size_t dim) noexcept
+            :config(config),family(family),begin(begin),end(end),dim(dim) {}
+    };
     std::unique_ptr<Residues> residues;
     std::vector<Family> families;
     std::vector<Block> blocks;
@@ -536,9 +550,14 @@ struct RemovalLinks {
     std::vector<size_t> block_ids,reverse_ptr,offsets;
     std::vector<unsigned> reverse;
     std::vector<CompactRemovalResidues::Key> keys;
+    std::vector<CompactRemovalResidues::DoubleKey> double_keys;
     size_t entries=0,weighted_links=0,residue_count=0,compact_builder_bytes=0;
     Stats construction;
     int compact_singles(const CompactRemovalResidues &compact,size_t residue) const {
+        if(!double_keys.empty()) {
+            const auto &key=double_keys[residue];
+            return __builtin_popcountll(key[0][0]^key[0][1])+__builtin_popcountll(key[1][0]^key[1][1]);
+        }
         if(keys.empty())return compact.singles(residue);
         const auto &key=keys[residue];
         return __builtin_popcountll(key[0]^key[1]);
@@ -716,7 +735,7 @@ struct RemovalLinks {
 
     RemovalLinks(const Primary &primary,RemovalBank &bank,int rank,size_t maximum,
                  bool keep_block_ids,bool keep_reverse,size_t begin=0,Workers *workers=nullptr,
-                 bool parallel_postings=false,size_t reused_groups=0) {
+                 bool parallel_postings=false,size_t reused_groups=0,bool retain_double_keys=false) {
         auto start=Clock::now();
         std::unique_ptr<CompactRemovalResidues> compact;
         if(primary.k<=64 && !keep_block_ids) {
@@ -733,6 +752,13 @@ struct RemovalLinks {
             compact=std::make_unique<CompactRemovalResidues>(primary,rank,maximum,begin,workers);
             residue_count=compact->ptr.size()-1;
             compact_builder_bytes=compact->bytes();
+            if(retain_double_keys && primary.k<=128 &&
+                residue_count<=(maximum-compact_builder_bytes)/sizeof(double_keys[0])) {
+                double_keys.resize(residue_count);
+                auto fill=[&](size_t i,size_t) {double_keys[i]=compact->double_limb[compact->ptr[i]].key;};
+                if(workers)workers->run(residue_count,fill,2048);
+                else for(size_t i=0;i<residue_count;++i)fill(i,0);
+            }
         } else {
             residues=std::make_unique<Residues>(primary.groups.size(),primary.k,rank,maximum,
                 [&](size_t g)->const Config &{return *primary.groups[g].cfg;});
@@ -846,8 +872,11 @@ struct RemovalLinks {
         construction["removal_lookup_sample_ns"]=sampled_hit_ns;
     }
 
+    template<class Key>
     void merge_ranges(const RemovalLinks &old,const RemovalLinks &delta,Workers &workers,
-                      const std::vector<std::pair<int,int>> *old_pairs,int modes,size_t tasks) {
+                      const std::vector<std::pair<int,int>> *old_pairs,int modes,size_t tasks,
+                      const std::vector<Key> &merged_keys,const std::vector<Key> &old_keys,
+                      const std::vector<Key> &delta_keys) {
         // Keep every residue and its spin families within one task. The
         // prefix of merged block counts fixes each destination block range.
         // Parents are never deduplicated, so their source prefixes also give
@@ -857,26 +886,26 @@ struct RemovalLinks {
             size_t block_count=0,block_offset=0,entries=0;
         };
         std::array<Range,256> ranges{};
-        auto boundary=[&](size_t i) {return keys.size()/tasks*i+keys.size()%tasks*i/tasks;};
-        auto lower=[&](const RemovalLinks &source,size_t key) {
-            if(key==keys.size())return source.blocks.size();
-            return size_t(std::lower_bound(source.blocks.begin(),source.blocks.end(),keys[key],
-                [&](const Block &block,const auto &value){return source.keys[block.config]<value;})-source.blocks.begin());
+        auto boundary=[&](size_t i) {return merged_keys.size()/tasks*i+merged_keys.size()%tasks*i/tasks;};
+        auto lower=[&](const RemovalLinks &source,const std::vector<Key> &keys,size_t key) {
+            if(key==merged_keys.size())return source.blocks.size();
+            return size_t(std::lower_bound(source.blocks.begin(),source.blocks.end(),merged_keys[key],
+                [&](const Block &block,const auto &value){return keys[block.config]<value;})-source.blocks.begin());
         };
-        const auto order=[](const RemovalLinks &source,const Block &block) {
-            return std::tie(source.keys[block.config],block.family);
+        const auto order=[](const std::vector<Key> &keys,const Block &block) {
+            return std::tie(keys[block.config],block.family);
         };
         workers.run(tasks,[&](size_t t,size_t) {
             auto &r=ranges[t];
             r.key=boundary(t);
-            r.old_first=lower(old,r.key);
-            r.old_last=lower(old,boundary(t+1));
-            r.delta_first=lower(delta,r.key);
-            r.delta_last=lower(delta,boundary(t+1));
+            r.old_first=lower(old,old_keys,r.key);
+            r.old_last=lower(old,old_keys,boundary(t+1));
+            r.delta_first=lower(delta,delta_keys,r.key);
+            r.delta_last=lower(delta,delta_keys,boundary(t+1));
             r.block_count=r.old_last-r.old_first+r.delta_last-r.delta_first;
             size_t a=r.old_first,b=r.delta_first;
             while(a<r.old_last && b<r.delta_last) {
-                const auto x=order(old,old.blocks[a]),y=order(delta,delta.blocks[b]);
+                const auto x=order(old_keys,old.blocks[a]),y=order(delta_keys,delta.blocks[b]);
                 if(x<y)++a;
                 else if(y<x)++b;
                 else {++a;++b;--r.block_count;}
@@ -900,12 +929,12 @@ struct RemovalLinks {
                 const Block *x=a<r.old_last ? &old.blocks[a] : nullptr;
                 const Block *y=b<r.delta_last ? &delta.blocks[b] : nullptr;
                 if(x && y) {
-                    if(order(old,*x)<order(delta,*y))y=nullptr;
-                    else if(order(delta,*y)<order(old,*x))x=nullptr;
+                    if(order(old_keys,*x)<order(delta_keys,*y))y=nullptr;
+                    else if(order(delta_keys,*y)<order(old_keys,*x))x=nullptr;
                 }
-                const auto &source=x ? old : delta;
+                const auto &keys=x ? old_keys : delta_keys;
                 const auto &item=x ? *x : *y;
-                while(keys[key]!=source.keys[item.config])++key;
+                while(merged_keys[key]!=keys[item.config])++key;
                 const size_t first=next;
                 if(x) {
                     for(size_t j=x->begin;j<x->end;++j) {
@@ -932,6 +961,19 @@ struct RemovalLinks {
         for(size_t t=0;t<tasks;++t)entries=checked_add(entries,ranges[t].entries);
     }
 
+    template<class Key>
+    void merge_keys(const RemovalLinks &old,const RemovalLinks &delta,
+                    const std::vector<std::pair<int,int>> *old_pairs,int modes,Workers &workers,
+                    std::vector<Key> &merged,const std::vector<Key> &old_keys,
+                    const std::vector<Key> &delta_keys) {
+        merged.reserve(checked_add(old_keys.size(),delta_keys.size()));
+        std::set_union(old_keys.begin(),old_keys.end(),delta_keys.begin(),delta_keys.end(),std::back_inserter(merged));
+        residue_count=merged.size();
+        if(!residue_count)return;
+        const size_t tasks=std::max(size_t(1),std::min({workers.count(),residue_count/65536,size_t(256)}));
+        merge_ranges(old,delta,workers,old_pairs,modes,tasks,merged,old_keys,delta_keys);
+    }
+
     // Merge the compiled suffix into a previous append-only N-2 schedule.
     // The same residue/spin family must mix all old and new channels together.
     RemovalLinks(const RemovalLinks &old,const RemovalLinks &delta,size_t group_count,
@@ -943,43 +985,14 @@ struct RemovalLinks {
                 (maximum-retained-old.bytes())/sizeof(size_t)))
             throw BudgetError("incremental removal merge exceeds metadata budget");
         families=old.families;
-        parents.reserve(checked_add(old.parents.size(),delta.parents.size()));
-        blocks.reserve(checked_add(old.blocks.size(),delta.blocks.size()));
-        keys.reserve(checked_add(old.keys.size(),delta.keys.size()));
-        std::set_union(old.keys.begin(),old.keys.end(),delta.keys.begin(),delta.keys.end(),std::back_inserter(keys));
-        residue_count=keys.size();
-        const size_t tasks=std::min({workers.count(),keys.size()/65536,size_t(256)});
-        if(tasks>1)merge_ranges(old,delta,workers,old_pairs,modes,tasks);
-        else {
-            size_t a=0,b=0;
-            for(size_t id=0;id<keys.size();++id) {
-                for(size_t f=0;f<families.size();++f) {
-                    const size_t first=parents.size();
-                    size_t dim=0;
-                    auto append=[&](const RemovalLinks &source,size_t &cursor,bool decode) {
-                        if(cursor==source.blocks.size())return;
-                        const auto &block=source.blocks[cursor];
-                        if(source.keys[block.config]!=keys[id] || block.family!=f)return;
-                        ++cursor;
-                        dim=block.dim;
-                        for(size_t j=block.begin;j<block.end;++j) {
-                            auto posting=source.parents[j];
-                            if(decode) {
-                                const auto [p,q]=(*old_pairs)[posting.channel];
-                                posting.channel=schedule_index(pair_index(p,q,modes));
-                            }
-                            parents.push_back(posting);
-                        }
-                    };
-                    append(old,a,old_pairs!=nullptr);
-                    append(delta,b,false);
-                    if(first==parents.size())continue;
-                    blocks.push_back({schedule_index(id),schedule_index(f),first,parents.size(),dim});
-                    if((parents.size()-first)>(no_row-entries)/dim)
-                        throw BudgetError("removal amplitude size overflow");
-                    entries+=(parents.size()-first)*dim;
-                }
-            }
+        if(!old.double_keys.empty() || !delta.double_keys.empty()) {
+            if(old.double_keys.size()!=old.residue_count || delta.double_keys.size()!=delta.residue_count)
+                throw BudgetError("wide removal keys exceed metadata budget");
+            merge_keys(old,delta,old_pairs,modes,workers,double_keys,old.double_keys,delta.double_keys);
+        } else {
+            if(old.keys.size()!=old.residue_count || delta.keys.size()!=delta.residue_count)
+                throw BudgetError("removal keys exceed metadata budget");
+            merge_keys(old,delta,old_pairs,modes,workers,keys,old.keys,delta.keys);
         }
         weighted_links=checked_add(old.weighted_links,delta.weighted_links);
         if(keep_reverse) {
@@ -1006,7 +1019,8 @@ struct RemovalLinks {
             for(size_t p=0;p<parents.size();++p)reverse[cursor[parents[p].group]++]=schedule_index(p);
     }
         size_t bytes() const {
-        return keys.capacity()*sizeof(keys[0])+(residues ? residues->bytes() : 0)+families.capacity()*sizeof(Family)+blocks.capacity()*sizeof(Block)
+        return keys.capacity()*sizeof(keys[0])+double_keys.capacity()*sizeof(double_keys[0])
+            +(residues ? residues->bytes() : 0)+families.capacity()*sizeof(Family)+blocks.capacity()*sizeof(Block)
             +parents.capacity()*sizeof(Parent)+(block_ids.capacity()+reverse_ptr.capacity()+offsets.capacity())*sizeof(size_t)
             +reverse.capacity()*sizeof(unsigned);
     }

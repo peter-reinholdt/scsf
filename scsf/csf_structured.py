@@ -5,7 +5,8 @@ from time import perf_counter
 import numpy as np
 from .csf import csf_wfn, _integer, _limit
 from .config import get_num_threads
-from .integrals import Hamiltonian, PackedHamiltonian
+from .integrals import BlockPackedHamiltonian, Hamiltonian, PackedHamiltonian
+from .rdm import BlockRDM2
 
 
 class csf_structured_op:
@@ -24,7 +25,7 @@ class csf_structured_op:
 
     def __init__(self, ham, wfn, *, strategy='nminus2', nthreads=None, max_mem=None,
                  worker_cpus=None, pair_accumulation=None, cih_slot_sweep=False,
-                 incremental_removals=True):
+                 incremental_removals=True, ordered_hci=True):
         if not isinstance(wfn, csf_wfn):
             raise TypeError('csf_structured_op requires csf_wfn')
         if strategy not in self.kernels:
@@ -42,6 +43,8 @@ class csf_structured_op:
             raise TypeError('expected dense or packed Hamiltonian integrals')
         if ham.nbasis != wfn.nbasis:
             raise ValueError('Hamiltonian and CSF orbital counts must match')
+        if wfn.symmetry is not None and wfn.symmetry != ham.symmetry:
+            raise ValueError('wavefunction and Hamiltonian orbital irreps must match')
         self.nthreads = get_num_threads() if nthreads is None else _integer(nthreads, 'nthreads')
         if not 1 <= self.nthreads <= 256:
             raise ValueError('nthreads must be between 1 and 256')
@@ -55,30 +58,38 @@ class csf_structured_op:
             raise ValueError('max_mem must be nonnegative')
         self.strategy, self._ham = strategy, ham
         self.pair_accumulation = pair_accumulation
+        self.ordered_hci = bool(ordered_hci)
         self.ecore = ham.ecore
+        self._symmetry = ham.symmetry
+        self._target_irrep = wfn.target_irrep
         self._integrals = (ham.one_mo, ham.packed_eri if compact else ham.two_mo)
-        from . import _csf
-        self._transfer_bounds = None if compact else _csf._HCITransferBounds(
-            ham.one_mo, ham.two_mo)
         self._growth_lock = RLock()
         self._rdm_cache = None
         self._sector = (wfn.nbasis, wfn.nelec, wfn.two_s)
         self._settings = self._config()
         start = perf_counter()
-        self._state = self._construct(wfn._occupation_basis())
+        self._state = self._construct(wfn._occupation_basis(self.symmetry))
         self.setup_seconds = perf_counter()-start
         self.last_product_stats = {}
 
     def _config(self):
         return (self.strategy, self.nthreads, self.max_mem, self.worker_cpus,
-                self.pair_accumulation, self.cih_slot_sweep, self.incremental_removals)
+                self.pair_accumulation, self.cih_slot_sweep, self.incremental_removals, self.ordered_hci)
 
     def _construct(self, basis, previous=None):
         from . import _csf
+        def construct():
+            return _csf._StructuredHamiltonian(*self._integrals, basis, self.kernels.index(self.strategy), self.nthreads,
+                self.max_mem, self.worker_cpus, self.pair_accumulation == 'private', None,
+                previous, self.incremental_removals, self.cih_slot_sweep,
+                isinstance(self._ham, BlockPackedHamiltonian), self.ordered_hci)
         try:
-            native = _csf._StructuredHamiltonian(*self._integrals, basis, self.kernels.index(self.strategy), self.nthreads,
-                self.max_mem, self.worker_cpus, self.pair_accumulation == 'private', self._transfer_bounds,
-                previous, self.incremental_removals, self.cih_slot_sweep)
+            try:
+                native = construct()
+            except _csf.BudgetError:
+                if previous is None or not previous.release_optional_hci_tables():
+                    raise
+                native = construct()
         except _csf.BudgetError as exc:
             raise _csf.BudgetError(f'{self.strategy} setup with max-mem={self.max_mem} bytes: {exc}') from None
         return basis, native, basis.public_rows
@@ -89,11 +100,16 @@ class csf_structured_op:
         return size, size
 
     dtype = np.dtype(float)
+    symmetry = property(lambda self: self._symmetry)
+    target_irrep = property(lambda self: self._target_irrep)
 
     @property
     def basis_context(self):
-        return dict(nbasis=self._sector[0], nelec=self._sector[1], two_s=self._sector[2],
-                    phase_convention='cg-real-alpha-beta-v1', generation=self._state[0].info['generation'])
+        context = dict(nbasis=self._sector[0], nelec=self._sector[1], two_s=self._sector[2],
+                       phase_convention='cg-real-alpha-beta-v1', generation=self._state[0].info['generation'])
+        if self.symmetry is not None:
+            context.update(symmetry=self.symmetry._encode(), target_irrep=self.target_irrep)
+        return context
 
     @property
     def product_info(self):
@@ -119,7 +135,8 @@ class csf_structured_op:
             max_mem -= self.product_info['tracked_memory_bytes']
         return type(self)(self._ham, wfn, strategy=self.strategy, nthreads=self.nthreads,
             worker_cpus=self.worker_cpus, max_mem=max_mem, pair_accumulation=self.pair_accumulation,
-            cih_slot_sweep=self.cih_slot_sweep, incremental_removals=self.incremental_removals)
+            cih_slot_sweep=self.cih_slot_sweep, incremental_removals=self.incremental_removals,
+            ordered_hci=self.ordered_hci)
 
     def to_native_order(self, values):
         """Convert a public-order vector or column block to native order."""
@@ -228,22 +245,45 @@ class csf_structured_op:
         return self._state[1].transition_rdm1(self._rdm_vector(bra), self._rdm_vector(ket))
 
     def native_rdm2(self, coefficients, *, max_output_bytes=256*1024**2,
-                    max_link_bytes=None, max_workspace_bytes=None):
+                    max_link_bytes=None, max_workspace_bytes=None, layout='dense'):
         """Return the spin-free 2-RDM in physicist order for a real native-row vector."""
-        budgets = self._rdm_budgets(max_output_bytes, max_link_bytes, max_workspace_bytes)
-        return self._state[1].rdm2(self._rdm_vector(coefficients), *budgets)
+        x = self._rdm_vector(coefficients)
+        return self.native_transition_rdm2(x, x, max_output_bytes=max_output_bytes,
+                                           max_link_bytes=max_link_bytes,
+                                           max_workspace_bytes=max_workspace_bytes, layout=layout)
 
     def native_transition_rdm2(self, bra, ket, *, max_output_bytes=256*1024**2,
-                               max_link_bytes=None, max_workspace_bytes=None):
+                               max_link_bytes=None, max_workspace_bytes=None, layout='dense'):
         """Return <bra|a†_p a†_r a_s a_q|ket>, spin-summed and indexed [p,r,q,s].
 
         Both coefficient vectors must be real and use the operator's native row order.
         """
         budgets = self._rdm_budgets(max_output_bytes, max_link_bytes, max_workspace_bytes)
-        return self._state[1].transition_rdm2(self._rdm_vector(bra), self._rdm_vector(ket), *budgets)
+        bra, ket = self._rdm_vector(bra), self._rdm_vector(ket)
+        native = self._state[1]
+        if layout == 'dense':
+            return native.transition_rdm2(bra, ket, *budgets)
+        if layout == 'blocks':
+            _, two, stats = native.block_rdms(bra, ket, False, *budgets)
+            return self._block_rdm(two, stats)
+        raise ValueError("density layout must be 'dense' or 'blocks'")
+
+    def _block_rdm(self, values, stats):
+        return BlockRDM2(self._sector[0], self.symmetry, values, stats['transfer_irreps'])
+
+    def native_density_energy(self, coefficients, ket=None, *, include_ecore=False,
+                              max_link_bytes=None, max_workspace_bytes=None, return_stats=False):
+        """Contract a real state or transition density with the Hamiltonian."""
+        bra = self._rdm_vector(coefficients)
+        ket = bra if ket is None else self._rdm_vector(ket)
+        _, links, workspace = self._rdm_budgets(0, max_link_bytes, max_workspace_bytes)
+        energy, stats = self._state[1].density_energy(bra, ket, links, workspace)
+        if include_ecore:
+            energy += self.ecore * np.dot(bra, ket)
+        return (energy, dict(stats)) if return_stats else energy
 
     def native_rdms(self, coefficients, *, max_output_bytes=256*1024**2,
-                    max_link_bytes=None, max_workspace_bytes=None, cache=False):
+                    max_link_bytes=None, max_workspace_bytes=None, cache=False, layout='dense'):
         """Return spin-free 1- and 2-RDMs of a real native-row vector and memory counters.
 
         The 2-RDM uses the same physicist order as the Hamiltonian, so its
@@ -252,20 +292,30 @@ class csf_structured_op:
         With `cache=True` the last request for the current space is retained.
         Returned arrays can be modified independently of the cache.
         """
+        if layout not in ('dense', 'blocks'):
+            raise ValueError("density layout must be 'dense' or 'blocks'")
         x = self._rdm_vector(coefficients)
         budgets = self._rdm_budgets(max_output_bytes, max_link_bytes, max_workspace_bytes)
+        def build(native):
+            return (native.rdms(x, *budgets) if layout == 'dense'
+                    else native.block_rdms(x, x, True, *budgets))
+
+        def result(one, two, stats):
+            return one, self._block_rdm(two, stats) if layout == 'blocks' else two, stats
+
         if not cache:
-            return self._state[1].rdms(x, *budgets)
+            return result(*build(self._state[1]))
         with self._growth_lock:
             native = self._state[1]
             entry = self._rdm_cache
+            limits = (budgets, layout)
             if entry is not None:
-                prior, limits, saved, one, two, stats = entry
-                if prior is native and limits == budgets and np.array_equal(x, saved):
-                    return one.copy(), two.copy(), dict(stats, cache_hit=1)
-            one, two, stats = native.rdms(x, *budgets)
-            self._rdm_cache = native, budgets, x.copy(), one.copy(), two.copy(), stats.copy()
-            return one, two, dict(stats, cache_hit=0)
+                prior, previous_limits, saved, one, two, stats = entry
+                if prior is native and previous_limits == limits and np.array_equal(x, saved):
+                    return result(one.copy(), two.copy(), dict(stats, cache_hit=1))
+            one, two, stats = build(native)
+            self._rdm_cache = native, limits, x.copy(), one.copy(), two.copy(), stats.copy()
+            return result(one, two, dict(stats, cache_hit=0))
 
     def matvec(self, x):
         if np.iscomplexobj(x):
@@ -282,7 +332,9 @@ class csf_structured_op:
             raise TypeError('csf_structured_op requires csf_wfn')
         if self._settings != self._config():
             raise ValueError('rebuild the operator to change structured settings')
-        if ham is not self._ham or (wfn.nbasis, wfn.nelec, wfn.two_s) != self._sector:
+        if (ham is not self._ham or (wfn.nbasis, wfn.nelec, wfn.two_s) != self._sector
+                or wfn.target_irrep != self.target_irrep
+                or (wfn.symmetry is not None and wfn.symmetry != self.symmetry)):
             raise ValueError('updated operator must retain Hamiltonian and CSF sector')
         with self._growth_lock:
             size = self.shape[0]
@@ -291,7 +343,7 @@ class csf_structured_op:
             if len(wfn) == size:
                 return
             start = perf_counter()
-            self._state = self._construct(wfn._occupation_basis(), previous=self._state[1])
+            self._state = self._construct(wfn._occupation_basis(self.symmetry), previous=self._state[1])
             self._rdm_cache = None
             self.setup_seconds = perf_counter()-start
             self.last_product_stats = {}
@@ -299,7 +351,10 @@ class csf_structured_op:
     def append_selected_labels(self, wfn, old_size):
         """Bring the public label container up to date after native selection."""
         basis = self._state[0]
-        if len(wfn) != old_size or old_size > len(basis) or (wfn.nbasis, wfn.nelec, wfn.two_s) != self._sector:
+        if (len(wfn) != old_size or old_size > len(basis) or (wfn.nbasis, wfn.nelec, wfn.two_s) != self._sector
+                or wfn.target_irrep != self.target_irrep
+                or (wfn.symmetry is not None and wfn.symmetry != self.symmetry)):
             raise ValueError('label container does not match the previous occupation space')
         wfn._append_native([basis.public_label(row) for row in range(old_size, len(basis))])
         wfn._occupation_snapshot = basis
+        wfn._occupation_symmetry = self.symmetry

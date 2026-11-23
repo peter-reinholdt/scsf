@@ -16,6 +16,76 @@ class Auxiliary {
         unsigned matrix;
         double scale;
     };
+    class ChannelSectors {
+        using Boundaries=std::array<size_t,OrbitalSymmetry::extent+1>;
+        std::vector<Boundaries> ranges_;
+        std::vector<size_t> directory_;
+        std::vector<unsigned> members_;
+    public:
+        template<class Irrep>
+        void build(const RemovalLinks &links,Irrep irrep,size_t budget) {
+            auto mixed=[&](const RemovalLinks::Block &block) {
+                const auto *first=links.parents.data()+block.begin;
+                const auto code=irrep(*first);
+                return std::any_of(first+1,links.parents.data()+block.end,
+                    [&](const auto &parent){return irrep(parent)!=code;});
+            };
+            size_t blocks=0,members=0;
+            for(const auto &block:links.blocks)if(mixed(block)) {
+                ++blocks;
+                members=checked_add(members,block.end-block.begin);
+            }
+            if(!blocks)return;
+            if(links.blocks.size()>budget/sizeof(size_t))
+                throw BudgetError("removal irrep directory exceeds --max-mem");
+            budget-=links.blocks.size()*sizeof(size_t);
+            if(blocks>budget/sizeof(Boundaries) || members>(budget-blocks*sizeof(Boundaries))/sizeof(unsigned))
+                throw BudgetError("removal irrep postings exceed --max-mem");
+            directory_.assign(links.blocks.size(),none);
+            ranges_.reserve(blocks);
+            members_.resize(members);
+            size_t begin=0;
+            for(size_t b=0;b<links.blocks.size();++b) {
+                const auto &block=links.blocks[b];
+                if(!mixed(block))continue;
+                Boundaries range{};
+                for(size_t j=block.begin;j<block.end;++j)++range[irrep(links.parents[j])+1];
+                range[0]=begin;
+                std::partial_sum(range.begin(),range.end(),range.begin());
+                auto cursor=range;
+                for(size_t j=block.begin;j<block.end;++j)
+                    members_[cursor[irrep(links.parents[j])]++]=schedule_index(j-block.begin);
+                directory_[b]=ranges_.size();
+                ranges_.push_back(range);
+                begin=range.back();
+            }
+        }
+        template<class Irrep,class Visit>
+        void visit(const RemovalLinks &links,const RemovalLinks::Block &block,unsigned code,
+                   Irrep irrep,Visit callback) const {
+            const size_t at=directory_.empty() ? none : directory_[&block-links.blocks.data()];
+            if(at==none) {
+                if(irrep(links.parents[block.begin])!=code)return;
+                for(size_t j=0;j<block.end-block.begin;++j)callback(j);
+            } else {
+                const auto &ranges=ranges_[at];
+                for(size_t i=ranges[code];i<ranges[code+1];++i)callback(members_[i]);
+            }
+        }
+        template<class Irrep>
+        unsigned mask(const RemovalLinks &links,const RemovalLinks::Block &block,Irrep irrep) const {
+            const size_t at=directory_.empty() ? none : directory_[&block-links.blocks.data()];
+            if(at==none)return 1u<<irrep(links.parents[block.begin]);
+            const auto &ranges=ranges_[at];
+            unsigned mask=0;
+            for(unsigned g=0;g<OrbitalSymmetry::extent;++g)if(ranges[g]!=ranges[g+1])mask|=1u<<g;
+            return mask;
+        }
+        size_t bytes() const {
+            return ranges_.capacity()*sizeof(Boundaries)+directory_.capacity()*sizeof(size_t)
+                +members_.capacity()*sizeof(unsigned);
+        }
+    };
     struct Topology {
         RemovalBank bank;
         std::unique_ptr<RemovalLinks> one,two;
@@ -29,6 +99,8 @@ class Auxiliary {
         std::vector<std::pair<int,int>> orbital_pairs;
         std::vector<double> pair_integrals;
         std::vector<size_t> pair_rows,pair_columns;
+        std::vector<unsigned char> pair_irreps;
+        ChannelSectors one_sectors,two_sectors;
         std::vector<FoldedPair> folded_pairs;
         std::vector<size_t> folded_offsets;
         std::vector<unsigned> mixed_pairs;
@@ -40,6 +112,7 @@ class Auxiliary {
     std::vector<std::vector<double>> temporary_,mixed_;
     bool reused_topology_=false;
     bool reused_auxiliary_integrals_=false;
+    bool mixed_irreps_=false;
     size_t incremental_groups_=0,overlap_bytes_=0,reused_classes_=0;
     size_t removal_enumerate_ns_=0,removal_merge_ns_=0,folded_setup_ns_=0;
     size_t pair_channels_ns_=0,pair_integrals_ns_=0;
@@ -53,6 +126,19 @@ class Auxiliary {
     }
     double eri(int p,int q,int r,int s) const {
         return integrals_(p,r,q,s);
+    }
+    unsigned one_irrep(const RemovalLinks::Parent &parent) const {
+        return p_.native->symmetry()[parent.channel];
+    }
+    unsigned two_irrep(const RemovalLinks::Parent &parent) const {
+        return topology_->pair_irreps[parent.channel];
+    }
+    template<class Callback>
+    void one_channels(const RemovalLinks::Block &block,unsigned code,Callback callback) const {
+        const auto &links=*topology_->one;
+        if(mixed_irreps_)
+            topology_->one_sectors.visit(links,block,code,[&](const auto &parent){return one_irrep(parent);},callback);
+        else for(size_t i=0;i<block.end-block.begin;++i)callback(i);
     }
     double pair_value(size_t a,size_t b) const {
         auto x=topology_->orbital_pairs[a],y=topology_->orbital_pairs[b];
@@ -72,19 +158,31 @@ class Auxiliary {
         if(!m)return;
         // Each auxiliary magnetic family conserves the removed spin
         // projection. Cross-sector rows would only store structural zeros.
-        std::array<std::vector<size_t>,3> sectors;
+        std::array<std::vector<size_t>,3*OrbitalSymmetry::extent> sectors;
+        const auto &sym=p_.native->symmetry();
+        if(mixed_irreps_) {
+            memory_left(bytes,m*sizeof(unsigned char),"N−2 pair irreps");
+            topology_->pair_irreps.resize(m);
+            bytes-=topology_->pair_irreps.capacity();
+        }
         for(size_t a=0;a<m;++a) {
             auto [i,j]=topology_->orbital_pairs[a];
-            sectors[i/p_.k+j/p_.k].push_back(a);
+            const auto code=sym.transfer(i%p_.k,j%p_.k);
+            sectors[(i/p_.k+j/p_.k)*OrbitalSymmetry::extent+code].push_back(a);
+            if(mixed_irreps_)topology_->pair_irreps[a]=code;
         }
         size_t elements=0;
+        const bool packed=integrals_.format!=ERIFormat::dense;
         for(auto &sector:sectors) {
-            if(!sector.empty() && sector.size()>(bytes/8-elements)/sector.size())
+            if(!sector.empty() && sector.size()>(bytes/8-elements)/sector.size()) {
+                if(packed)return;
                 throw BudgetError("N−2 pair integral table exceeds --max-mem");
+            }
             elements+=sector.size()*sector.size();
         }
         const size_t table_bytes=elements*8;
         const size_t index_bytes=2*m*sizeof(size_t);
+        if(packed && index_bytes>bytes-table_bytes)return;
         memory_left(bytes-table_bytes,index_bytes,"N−2 pair integral index");
         topology_->pair_integrals.resize(elements);
         topology_->pair_rows.resize(m);
@@ -96,7 +194,11 @@ class Auxiliary {
                 size_t a=sector[local],row=offset+local*width;
                 topology_->pair_rows[a]=row;
                 topology_->pair_columns[a]=local;
-                for(size_t b=0;b<width;++b)topology_->pair_integrals[row+b]=pair_value(a,sector[b]);
+                for(size_t b=0;b<(packed ? local+1 : width);++b) {
+                    const double value=pair_value(a,sector[b]);
+                    topology_->pair_integrals[row+b]=value;
+                    if(packed && b!=local)topology_->pair_integrals[offset+b*width+local]=value;
+                }
             });
             offset+=width*width;
         }
@@ -201,12 +303,17 @@ class Auxiliary {
         workers_.run(topology_->one->blocks.size(),[&](size_t b,size_t) {
             const auto &block=topology_->one->blocks[b];
             std::fill_n(u+topology_->one->offset(block)*cols,(block.end-block.begin)*block.dim*cols,0.);
-            for(size_t a=block.begin;a<block.end;++a)for(size_t r=block.begin;r<block.end;++r) {
-                const auto &pa=topology_->one->parents[a],&pr=topology_->one->parents[r];
-                double value=h_[pa.channel*p_.k+pr.channel];
-                double *target=u+topology_->one->offsets[a]*cols;
-                const double *source=t+topology_->one->offsets[r]*cols;
-                for(size_t i=0;i<block.dim*cols;++i)target[i]+=value*source[i];
+            const auto &links=*topology_->one;
+            const size_t width=block.dim*cols;
+            for(size_t a=block.begin;a<block.end;++a) {
+                const auto &pa=links.parents[a];
+                double *target=u+links.offsets[a]*cols;
+                one_channels(block,one_irrep(pa),[&](size_t r) {
+                    const auto &pr=links.parents[block.begin+r];
+                    const double value=h_[pa.channel*p_.k+pr.channel];
+                    const double *source=t+links.offsets[block.begin+r]*cols;
+                    for(size_t i=0;i<width;++i)target[i]+=value*source[i];
+                });
             }
         },16);
     }
@@ -228,23 +335,37 @@ class Auxiliary {
         const auto &links=*topology_->one;
         const size_t offsets_bytes=links.blocks.size()*sizeof(size_t);
         if(links.blocks.empty())return;
+        const bool packed=integrals_.format!=ERIFormat::dense;
+        if(packed && offsets_bytes>allowance)return;
         const size_t capacity=memory_left(allowance,offsets_bytes,"N−1 local integral offsets")/sizeof(double);
+        auto block_entries=[&](const RemovalLinks::Block &block,size_t maximum) {
+            std::array<size_t,OrbitalSymmetry::extent> sizes{};
+            if(mixed_irreps_) {
+                for(size_t j=block.begin;j<block.end;++j)++sizes[one_irrep(links.parents[j])];
+            } else sizes[0]=block.end-block.begin;
+            size_t total=0;
+            for(size_t n:sizes)if(n) {
+                if(n>(maximum-total)/n)return none;
+                total+=n*n;
+            }
+            return total;
+        };
         size_t entries=0;
         for(const auto &block:links.blocks) {
-            const size_t count=block.end-block.begin;
-            if(count>(capacity-entries)/count)
+            const size_t count=block_entries(block,capacity-entries);
+            if(count==none) {
+                if(packed)return;
                 throw BudgetError("N−1 local integral table exceeds --max-mem");
-            entries+=count*count;
+            }
+            entries+=count;
         }
         auto &offsets=topology_->local_offsets;
         auto &values=topology_->local_integrals;
         offsets.resize(links.blocks.size());
-        size_t start=0;
+        size_t begin=0;
         for(size_t i=0;i<links.blocks.size();++i) {
-            offsets[i]=start;
-            const auto &block=links.blocks[i];
-            const size_t count=block.end-block.begin;
-            start+=count*count;
+            offsets[i]=begin;
+            begin+=block_entries(links.blocks[i],entries-begin);
         }
         values.resize(entries);
         workers_.run(links.blocks.size(),[&](size_t b,size_t) {
@@ -252,8 +373,10 @@ class Auxiliary {
             const size_t count=block.end-block.begin;
             const auto *parents=links.parents.data()+block.begin;
             double *block_values=values.data()+offsets[b];
-            for(size_t i=0;i<count;++i)for(size_t j=0;j<count;++j)
-                block_values[i*count+j]=local_integral(block.config,parents[i].channel,parents[j].channel);
+            for(size_t i=0;i<count;++i)
+                one_channels(block,one_irrep(parents[i]),[&](size_t j) {
+                    *block_values++=local_integral(block.config,parents[i].channel,parents[j].channel);
+                });
         },32);
         topology_->metadata_bytes+=offsets.capacity()*sizeof(size_t)+values.capacity()*sizeof(double);
     }
@@ -270,17 +393,21 @@ class Auxiliary {
         const auto *table=layout ? layout->data() : nullptr;
         const auto *left_parents=links.parents.data()+left.begin;
         const auto &bank=*topology_->family_banks[f];
+        const auto one_code=[&](const RemovalLinks::Parent &parent){return one_irrep(parent);};
+        const auto left_mask=mixed_irreps_ ? topology_->one_sectors.mask(links,left,one_code) : 0;
         const size_t width=left.dim*cols,left_count=left.end-left.begin;
         std::fill_n(result,left_count*width,0.);
         const double *local=read(left);
-        const double *local_values=topology_->local_integrals.data()+topology_->local_offsets[&left-links.blocks.data()];
+        const double *local_values=topology_->local_integrals.empty() ? nullptr
+            : topology_->local_integrals.data()+topology_->local_offsets[&left-links.blocks.data()];
         for(size_t i=0;i<left_count;++i) {
             double *target=result+i*width;
-            for(size_t j=0;j<left_count;++j) {
-                const double value=local_values[i*left_count+j];
+            one_channels(left,one_irrep(left_parents[i]),[&](size_t j) {
+                const double value=local_values ? *local_values++
+                    : local_integral(left.config,left_parents[i].channel,left_parents[j].channel);
                 const double *source=local+j*width;
                 for(size_t v=0;v<width;++v)target[v]+=value*source[v];
-            }
+            });
         }
         const bool identity_directory=links.block_ids.empty();
         for(size_t query=queries.reverse_ptr[a];query<queries.reverse_ptr[a+1];++query) {
@@ -301,6 +428,25 @@ class Auxiliary {
                 const size_t count=right.end-right.begin;
                 const auto *right_parents=links.parents.data()+right.begin;
                 const double *integrals=table ? table+(q*k+s)*kk : nullptr;
+                if(mixed_irreps_) {
+                    const auto change=p_.native->symmetry().transfer(q,s);
+                    for(unsigned g=0;g<OrbitalSymmetry::extent;++g)if(left_mask&(1u<<g))
+                        one_channels(right,g^change,[&](size_t j) {
+                            const int r=right_parents[j].channel;
+                            const double *channel=source+j*right.dim*cols;
+                            transformed.assign(width,0.);
+                            for(size_t row=0;row<left.dim;++row)
+                                for(size_t m=matrix.ptr[row];m<matrix.ptr[row+1];++m)
+                                    for(size_t v=0;v<cols;++v)
+                                        transformed[row*cols+v]+=matrix.data[m]*channel[matrix.indices[m]*cols+v];
+                            one_channels(left,g,[&](size_t i) {
+                                const double scale=.5*eri(left_parents[i].channel,q,r,s);
+                                double *target=result+i*width;
+                                for(size_t v=0;v<cols*left.dim;++v)target[v]+=scale*transformed[v];
+                            });
+                        });
+                    continue;
+                }
                 // With one destination channel the spin transform is consumed
                 // once. Accumulate it directly into the output residue.
                 if constexpr(Columns==1)if(left_count==1) {
@@ -388,12 +534,17 @@ class Auxiliary {
         const auto *table=topology_->pair_integrals.data();
         for(size_t a=0;a<count;++a) {
             const size_t ap=parents[a].channel;
-            const double *row=table+topology_->pair_rows[ap];
-            for(size_t c=0;c<count;++c) {
-                const double value=row[topology_->pair_columns[parents[c].channel]];
-                if(value==0.)continue;
+            const double *row=topology_->pair_integrals.empty() ? nullptr : table+topology_->pair_rows[ap];
+            auto contract=[&](size_t c) {
+                const auto channel=parents[c].channel;
+                const double value=row ? row[topology_->pair_columns[channel]] : pair_value(ap,channel);
+                if(value==0.)return;
                 for(size_t i=0;i<width;++i)target[a*width+i]+=value*t[c*width+i];
-            }
+            };
+            if(mixed_irreps_)
+                topology_->two_sectors.visit(*topology_->two,block,two_irrep(parents[a]),
+                    [&](const auto &parent){return two_irrep(parent);},contract);
+            else for(size_t c=0;c<count;++c)contract(c);
         }
     }
     void pair_middle(const RemovalLinks::Block &block,size_t width,const double *t,
@@ -466,20 +617,38 @@ class Auxiliary {
         }
         return true;
     }
-    void apply_folded_pairs(const double *input,double *output) {
-        auto apply_group=[&](size_t g,size_t) {
-            const auto offset=p_.groups[g].block->offset;
+    template<size_t Columns>
+    void apply_folded_pairs(const double *input,size_t cols,double *output) {
+        if constexpr(Columns)cols=Columns;
+        auto apply_group=[&](size_t g,size_t worker) {
+            const auto offset=p_.groups[g].block->offset*cols;
             const double *x=input+offset;
             double *y=output+offset;
+            auto &projected_block=temporary_[worker];
+            if constexpr(Columns!=1)if(projected_block.size()<cols)projected_block.resize(cols);
             for(size_t i=topology_->folded_offsets[g];i<topology_->folded_offsets[g+1];++i) {
                 const auto &term=topology_->folded_pairs[i];
                 const auto &matrix=topology_->bank.matrices[term.matrix];
                 for(size_t row=0;row<matrix.rows;++row) {
                     const size_t begin=matrix.ptr[row],end=matrix.ptr[row+1];
-                    double projected=0.;
-                    for(size_t j=begin;j<end;++j)projected+=matrix.data[j]*x[matrix.indices[j]];
-                    const double mixed=term.scale*projected;
-                    for(size_t j=begin;j<end;++j)y[matrix.indices[j]]+=matrix.data[j]*mixed;
+                    if constexpr(Columns==1) {
+                        double projected=0.;
+                        for(size_t j=begin;j<end;++j)projected+=matrix.data[j]*x[matrix.indices[j]];
+                        const double mixed=term.scale*projected;
+                        for(size_t j=begin;j<end;++j)y[matrix.indices[j]]+=matrix.data[j]*mixed;
+                    } else {
+                        double *projected=projected_block.data();
+                        std::fill_n(projected,cols,0.);
+                        for(size_t j=begin;j<end;++j) {
+                            const double *source=x+size_t(matrix.indices[j])*cols;
+                            for(size_t v=0;v<cols;++v)projected[v]+=matrix.data[j]*source[v];
+                        }
+                        for(size_t v=0;v<cols;++v)projected[v]*=term.scale;
+                        for(size_t j=begin;j<end;++j) {
+                            double *target=y+size_t(matrix.indices[j])*cols;
+                            for(size_t v=0;v<cols;++v)target[v]+=matrix.data[j]*projected[v];
+                        }
+                    }
                 }
             }
         };
@@ -491,9 +660,9 @@ class Auxiliary {
         const size_t workers=workers_.count(), output_size=p_.size()*cols;
         const bool reduce=workers>1;
         auto start=Clock::now();
-        const bool folded=Columns==1 && !topology_->folded_offsets.empty();
+        const bool folded=!topology_->folded_offsets.empty();
         if(folded) {
-            apply_folded_pairs(input,output);
+            apply_folded_pairs<Columns>(input,cols,output);
             stats["folded_pair_ns"]+=ns(start);
             start=Clock::now();
         }
@@ -534,11 +703,13 @@ class Auxiliary {
                         if(pair)pair_middle(block,width,t.data(),u.data());
                         else {
                             std::fill_n(u.data(),count*width,0.);
-                            for(size_t a=0;a<count;++a)for(size_t r=0;r<count;++r) {
-                                int p=links.parents[block.begin+a].channel;
-                                int q=links.parents[block.begin+r].channel;
-                                double value=h_[p*p_.k+q];
-                                for(size_t i=0;i<width;++i)u[a*width+i]+=value*t[r*width+i];
+                            for(size_t a=0;a<count;++a) {
+                                const auto &parent=links.parents[block.begin+a];
+                                one_channels(block,one_irrep(parent),[&](size_t r) {
+                                    const int q=links.parents[block.begin+r].channel;
+                                    const double value=h_[parent.channel*p_.k+q];
+                                    for(size_t i=0;i<width;++i)u[a*width+i]+=value*t[r*width+i];
+                                });
                             }
                         }
                         block_adjoint<Columns>(links,block,cols,u.data(),local);
@@ -563,10 +734,13 @@ class Auxiliary {
     }
 public:
     Auxiliary(const Primary &p,const double *h,SpatialERI integrals,int mode,Workers &workers,
-              size_t budget,bool private_output,const Auxiliary *previous=nullptr):
+              size_t budget,bool private_output,const Auxiliary *previous=nullptr,bool incremental_reuse=true):
         p_(p),h_(h),integrals_(integrals),mode_(mode),private_output_(private_output),workers_(workers),
         temporary_(workers.count()),mixed_(workers.count()) {
         const bool append=mode==1 && append_prefix(p,previous) && private_output==previous->private_output_;
+        unsigned sectors=0;
+        for(const auto &group:p.groups)sectors|=1u<<group.block->irrep;
+        mixed_irreps_=bool(sectors&(sectors-1));
         const size_t before=append ? previous->p_.groups.size() : 0;
         if(append && before==p.groups.size()) {
             topology_=previous->topology_;
@@ -576,8 +750,11 @@ public:
         const size_t added=p.groups.size()-before;
         // Deltas reduce enumeration for small appends. A fresh build also
         // avoids reserving space for two schedules when the suffix is large.
-        const bool incremental=before && p.k<=64 && added<=before/2;
-        auto construct=[&](bool use_delta) {
+        const bool keep_double_keys=incremental_reuse && private_output && p.k>64 && p.k<=128 &&
+            p.native->symmetry().nontrivial();
+        const bool incremental=before && added<=before/2 &&
+            (p.k<=64 || (keep_double_keys && !previous->topology_->two->double_keys.empty()));
+        auto construct=[&](bool use_delta,bool retain_double_keys) {
             topology_=std::make_shared<Topology>(p,budget);
             if(before) {
                 topology_->bank.copy_classes(previous->topology_->bank);
@@ -591,13 +768,14 @@ public:
                 const bool parallel_postings=mode_==1 && private_output_;
                 if(!use_delta) {
                     auto next=std::make_unique<RemovalLinks>(p_,topology_->bank,rank,allowance,mode_==0,
-                        !private_output_,0,&workers_,parallel_postings,before);
+                        !private_output_,0,&workers_,parallel_postings,before,retain_double_keys);
                     removal_enumerate_ns_+=ns(start);
                     collect(*next);
                     return next;
                 }
                 const auto &old=*previous->topology_;
-                RemovalLinks delta(p_,topology_->bank,rank,allowance,false,false,before,&workers_,parallel_postings);
+                RemovalLinks delta(p_,topology_->bank,rank,allowance,false,false,before,&workers_,parallel_postings,
+                                   0,retain_double_keys);
                 removal_enumerate_ns_+=ns(start);
                 collect(delta);
                 start=Clock::now();
@@ -643,7 +821,7 @@ public:
                     for(const auto &cfg:configs)masks.push_back(Occupation(cfg).first);
                     topology_->metadata_bytes+=masks.capacity()*sizeof(masks[0]);
                 }
-                if(integrals_.format==ERIFormat::dense && p_.k) {
+                if(integrals_.format==ERIFormat::dense && p_.k && !p_.native->symmetry().nontrivial()) {
                     const size_t k=p_.k,kk=k*k;
                     const size_t remaining=metadata-topology_->metadata_bytes;
                     if(kk>remaining/sizeof(double)/kk)throw BudgetError("N−1 ERI layout exceeds --max-mem");
@@ -663,6 +841,11 @@ public:
                     }
                 }
                 topology_->metadata_bytes+=auxiliary_integral_bytes();
+                if(mixed_irreps_) {
+                    topology_->one_sectors.build(*topology_->one,[&](const auto &parent){return one_irrep(parent);},
+                        memory_left(metadata,topology_->metadata_bytes,"N−1 removal metadata"));
+                    topology_->metadata_bytes+=topology_->one_sectors.bytes();
+                }
                 prepare_local_integrals(metadata-topology_->metadata_bytes);
                 topology_->build_bytes=std::max(topology_->build_bytes,topology_->metadata_bytes);
             } else {
@@ -675,6 +858,11 @@ public:
                 topology_->two->residues.reset();
                 topology_->metadata_bytes+=topology_->two->bytes();
                 memory_left(metadata,topology_->metadata_bytes,"N−2 removal schedules");
+                if(mixed_irreps_) {
+                    topology_->one_sectors.build(*topology_->one,[&](const auto &parent){return one_irrep(parent);},
+                        metadata-topology_->metadata_bytes);
+                    topology_->metadata_bytes+=topology_->one_sectors.bytes();
+                }
                 if(topology_->two->parents.empty())return;
                 // Only parent channels enter either end of the pair contraction.
                 // Compact their orbital-pair directory before constructing the
@@ -710,7 +898,13 @@ public:
                 prepare_pair_integrals(metadata-topology_->metadata_bytes);
                 pair_integrals_ns_=ns(start);
                 topology_->metadata_bytes+=topology_->pair_integrals.capacity()*8
-                    +(topology_->pair_rows.capacity()+topology_->pair_columns.capacity())*sizeof(size_t);
+                    +(topology_->pair_rows.capacity()+topology_->pair_columns.capacity())*sizeof(size_t)
+                    +topology_->pair_irreps.capacity();
+                if(mixed_irreps_) {
+                    topology_->two_sectors.build(*topology_->two,[&](const auto &parent){return two_irrep(parent);},
+                        metadata-topology_->metadata_bytes);
+                    topology_->metadata_bytes+=topology_->two_sectors.bytes();
+                }
                 if(private_output_) {
                     start=Clock::now();
                     fold_single_parent_pairs(metadata-topology_->metadata_bytes);
@@ -718,8 +912,17 @@ public:
                 }
             }
         };
-        construct(incremental);
-        if(incremental)incremental_groups_=added;
+        try {
+            construct(incremental,keep_double_keys);
+            if(incremental)incremental_groups_=added;
+        } catch(const BudgetError &) {
+            if(!incremental && !keep_double_keys)throw;
+            topology_.reset();
+            removal_detail_.clear();
+            removal_enumerate_ns_=removal_merge_ns_=folded_setup_ns_=0;
+            pair_channels_ns_=pair_integrals_ns_=0;
+            construct(false,false);
+        }
         overlap_bytes_=previous ? checked_add(previous->topology_->metadata_bytes,topology_->build_bytes) :
             topology_->build_bytes;
         if(reused_auxiliary_integrals_)overlap_bytes_-=auxiliary_integral_bytes();
@@ -737,6 +940,7 @@ public:
     void apply(const double *input,size_t cols,double *output,Stats &stats) {
         if(private_output_) {
             if(cols==1)apply_private<1>(input,cols,output,stats);
+            else if(cols==2)apply_private<2>(input,cols,output,stats);
             else apply_private<0>(input,cols,output,stats);
         } else apply_gather(input,cols,output,stats);
         size_t scratch=0;

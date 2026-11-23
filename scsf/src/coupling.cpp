@@ -5,6 +5,7 @@
 #include "basis.h"
 #include "pair_descriptor.h"
 #include "structured_eri.h"
+#include "configuration_connectivity.h"
 #include <type_traits>
 #include <algorithm>
 
@@ -36,7 +37,7 @@ namespace {
 // Visit spatial orderings once for both the cheap norm bound and the exact
 // term builder. This avoids a second set of spin/integral multiplicity rules.
 template<bool DiagonalERI=false,class ERI,class Callback>
-void spatial_coefficients(int q, int s, int a, int b, ERI v,
+void spatial_coefficients(int q, int s, int a, int b, const ERI &v,
                           int k, Callback callback) {
     for (int hp = 0; hp < (q == s ? 1 : 2); ++hp) {
         int qq = hp == 0 ? q : s, ss = hp == 0 ? s : q;
@@ -86,7 +87,7 @@ struct NormBound {
 
 double transfer_bound(const Config &ket, const std::array<int, 2> &holes,
                       const std::array<int, 2> &particles, int order,
-                      const double *h, const double *v, int k) {
+                      const double *h, const structured::SpatialERI &v, int k) {
     // A coarse external-state norm bound before creating a target key, term
     // list, projected action, or cache entry. Particle and hole sets are
     // disjoint; order is the minimal spatial occupation transfer rank.
@@ -113,45 +114,64 @@ double transfer_bound(const Config &ket, const std::array<int, 2> &holes,
 }
 
 void HCITransferBounds::prepare_single_bounds(int k) {
-    const size_t orbitals=k;
-    std::vector<double> bounds(orbitals*orbitals*(orbitals+1));
-    for(int p=0;p<k;++p) for(int q=0;q<k;++q) if(p!=q) {
-        double *row=bounds.data()+(size_t(p)*k+q)*(k+1);
+    std::vector<double> bounds(single_rows(k)*(size_t(k)+1));
+    if(symmetry_.nontrivial()) {
+        single_offsets_.resize(k);
+        size_t count=0;
+        for(int q=0;q<k;++q) {
+            single_offsets_[q]=count;
+            count+=symmetry_.orbitals[symmetry_[q]].size();
+        }
+    }
+    for(int q=0;q<k;++q)same_irrep_orbitals(symmetry_,k,q,[&](int p) {
+        if(p==q)return;
+        double *row=bounds.data()+single_row(p,q,k)*(k+1);
         row[k]=2*std::abs(one_.data()[size_t(p)*k+q]);
         for(int t=0;t<k;++t) {
             NormBound bound;
             spatial_coefficients(std::min(q,t),std::max(q,t),std::min(p,t),std::max(p,t),
-                two_.data(),k,[&](int i,int j,int a,int b,double value) {
+                eri_,k,[&](int i,int j,int a,int b,double value) {
                     bound.add(value,i==j || a==b ? 2 : 4);
                 });
             row[t]=bound.finish(k);
         }
-    }
+    });
     single_bounds_.swap(bounds);
 }
 
 bool HCITransferBounds::prepare_ordered_singles(int k,int nelec,size_t limit) {
     if(k<2)return false;
     std::call_once(ordered_singles_once_,[&] {
-        const size_t entries=size_t(k)*(k-1);
+        const size_t entries=single_rows(k)-k;
+        if(!entries)return;
+        const size_t offset_bytes=symmetry_.nontrivial() ? (size_t(k)+1)*sizeof(size_t) : 0;
         const size_t available=memory_left(limit,bytes(),"HCI transfer bounds");
+        if(offset_bytes>available || entries>(available-offset_bytes)/sizeof(BoundedTransfer)) {
+            if(optional_tables())return;
+            throw BudgetError("ordered HCI single transfers exceed --max-mem");
+        }
         if (single_bounds_.empty()) {
             // For wide bases, the single-transfer tables are optional. Leave
             // room for the ordered index and preserve the direct bound when
             // the tables do not fit.
-            if (entries>available/sizeof(BoundedTransfer) ||
-                size_t(k)>(available-entries*sizeof(BoundedTransfer))/sizeof(double)/k/(size_t(k)+1))
+            const size_t bytes=available-offset_bytes-entries*sizeof(BoundedTransfer);
+            const size_t index_bytes=symmetry_.nontrivial() ? size_t(k)*sizeof(size_t) : 0;
+            if(index_bytes>bytes || single_rows(k)>(bytes-index_bytes)/sizeof(double)/(size_t(k)+1))
                 return;
             prepare_single_bounds(k);
         }
         const size_t remaining=memory_left(limit,bytes(),"HCI transfer bounds");
-        memory_left(remaining,entries*sizeof(BoundedTransfer),"ordered HCI single transfers");
+        memory_left(remaining,entries*sizeof(BoundedTransfer)+offset_bytes,"ordered HCI single transfers");
         std::vector<BoundedTransfer> ordered;
+        std::vector<size_t> offsets(symmetry_.nontrivial() ? size_t(k)+1 : 0);
         ordered.reserve(entries);
         std::vector<double> spectators(k);
         for(int q=0;q<k;++q) {
-            for(int p=0;p<k;++p) if(p!=q) {
-                const double *row=single_bounds_.data()+(size_t(p)*k+q)*(k+1);
+            const size_t begin=ordered.size();
+            if(!offsets.empty())offsets[q]=begin;
+            same_irrep_orbitals(symmetry_,k,q,[&](int p) {
+                if(p==q)return;
+                const double *row=single_bounds_.data()+single_row(p,q,k)*(k+1);
                 std::copy_n(row,k,spectators.begin());
                 std::sort(spectators.begin(),spectators.end(),std::greater<double>());
                 // The sharper occupation bound sums at most nelec distinct
@@ -162,13 +182,16 @@ bool HCITransferBounds::prepare_ordered_singles(int k,int nelec,size_t limit) {
                 const double bound=total==0. ? 0. : std::nextafter(static_cast<double>(total),
                     std::numeric_limits<double>::infinity());
                 ordered.push_back({bound,p,0});
-            }
-            std::sort(ordered.end()-(k-1),ordered.end(),[](const auto &a,const auto &b) {
+            });
+            std::sort(ordered.begin()+begin,ordered.end(),[](const auto &a,const auto &b) {
                 return a.bound!=b.bound ? a.bound>b.bound : a.p<b.p;
             });
         }
-        memory_left(remaining,ordered.capacity()*sizeof(BoundedTransfer),"ordered HCI single transfers");
+        if(!offsets.empty())offsets.back()=ordered.size();
+        memory_left(remaining,ordered.capacity()*sizeof(BoundedTransfer)+offsets.capacity()*sizeof(size_t),
+                    "ordered HCI single transfers");
         ordered_singles_.swap(ordered);
+        ordered_single_offsets_.swap(offsets);
         ordered_single_electrons_=nelec;
     });
     return !ordered_singles_.empty() && ordered_single_electrons_==nelec;
@@ -176,6 +199,9 @@ bool HCITransferBounds::prepare_ordered_singles(int k,int nelec,size_t limit) {
 
 std::pair<const BoundedTransfer *,const BoundedTransfer *>
 HCITransferBounds::ordered_singles(int q,int k) const {
+    if(!ordered_single_offsets_.empty())
+        return {ordered_singles_.data()+ordered_single_offsets_[q],
+                ordered_singles_.data()+ordered_single_offsets_[q+1]};
     const auto *first=ordered_singles_.data()+size_t(q)*(k-1);
     return {first,first+k-1};
 }
@@ -183,7 +209,7 @@ HCITransferBounds::ordered_singles(int q,int k) const {
 double HCITransferBounds::single_bound(const Config &source,int p,int q,int k,
                                        const Occupation &key) const {
     if(single_bounds_.empty())return selection_bound(source,{q,0},{p,0},1,k);
-    const double *row=single_bounds_.data()+(size_t(p)*k+q)*(k+1);
+    const double *row=single_bounds_.data()+single_row(p,q,k)*(k+1);
     double result=row[k];
     const auto sum_limb=[&](const Occupation::Limb &limb,size_t base) {
         auto occupied=limb[0];
@@ -202,7 +228,7 @@ double HCITransferBounds::single_bound(const Config &source,int p,int q,int k,
 
 namespace {
 template<bool Ranked,bool DiagonalERI=false,class ERI>
-void fill_guga_connection(const PairDescriptor &pair,const double *h,ERI v,
+void fill_guga_connection(const PairDescriptor &pair,const double *h,const ERI &v,
                          bool compute_bounds,Connection &result) {
     const auto &bra=pair.bra,&ket=pair.ket;int k=int(bra.size());
     result.scalar=0.;result.term_bound=0.;

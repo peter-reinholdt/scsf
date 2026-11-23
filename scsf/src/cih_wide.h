@@ -19,6 +19,16 @@ class WideCIH {
     std::vector<Scratch> scratch_;
     size_t metadata_bytes_=0,postings_=0;
 
+    auto matching(const std::vector<Posting> &postings,unsigned code) const {
+        const auto &sym=p_.native->symmetry();
+        if(!sym.nontrivial())return std::make_pair(postings.begin(),postings.end());
+        auto begin=std::lower_bound(postings.begin(),postings.end(),code,
+            [&](const Posting &post,unsigned g){return sym[post.orbital]<g;});
+        auto end=std::upper_bound(begin,postings.end(),code,
+            [&](unsigned g,const Posting &post){return g<sym[post.orbital];});
+        return std::make_pair(begin,end);
+    }
+
     void single(size_t src,size_t dst,const Matrix &m,double value,const double *x,size_t width,double *y) const {
         const auto &ket=p_.groups[src],&bra=p_.groups[dst];
         for(size_t i=0;i<bra.size();++i)
@@ -34,6 +44,7 @@ class WideCIH {
     void source(size_t src,const double *x,size_t width,double *y,Scratch &scratch) const {
         const auto &group=p_.groups[src];
         const auto &ket=*group.cfg;
+        const auto &sym=p_.native->symmetry();
         const int k=p_.k;
         double constant=0.;
         for(int p=0;p<k;++p)if(ket[p]) {
@@ -47,7 +58,8 @@ class WideCIH {
             removed=ket;
             --removed[s];
             const auto &single_targets=skeletons_.at(removed);
-            for(const auto &post:single_targets) {
+            for(auto [post_it,end]=matching(single_targets,sym[s]);post_it!=end;++post_it) {
+                const auto &post=*post_it;
                 if(post.group<=src || post.orbital==s)continue;
                 const int r=post.orbital;
                 const size_t rs=size_t(s)*k+r;
@@ -68,11 +80,14 @@ class WideCIH {
                 bool active=false;
                 const size_t rs=size_t(s)*k+r;
                 for(int q=0;q<=s;++q)if(mid[q]) {
+                    const auto creator=sym[q]^sym.transfer(r,s);
+                    if(sym.nontrivial() && sym.orbitals[creator].empty())continue;
                     residue=mid;
                     --residue[q];
                     const auto match=skeletons_.find(residue);
                     if(match==skeletons_.end())continue;
-                    for(const auto &post:match->second) {
+                    for(auto [post_it,end]=matching(match->second,creator);post_it!=end;++post_it) {
+                        const auto &post=*post_it;
                         const int p=post.orbital;
                         const size_t pq=size_t(q)*k+p;
                         if(post.group<src || p==q || pq>rs)continue;
@@ -116,6 +131,7 @@ public:
             Workers &workers,size_t budget)
         : p_(p),workers_(workers),eri_(eri),bank_(cih_template_electrons(p),p.s,budget,true),scratch_(workers.count()) {
         const size_t k=p.k;
+        const auto &sym=p.native->symmetry();
         const size_t metadata=memory_left(budget,bank_.bytes(),"wide CIH spin coefficients");
         if(k && k>metadata/sizeof(double)/k)throw BudgetError("wide CIH one-electron table exceeds metadata budget");
         one_.resize(k*k);
@@ -136,7 +152,13 @@ public:
                 ++postings_;
             }
         }
+        if(sym.nontrivial())for(auto &[cfg,postings]:skeletons_)
+            std::sort(postings.begin(),postings.end(),[&](const Posting &a,const Posting &b) {
+                const auto ag=sym[a.orbital],bg=sym[b.orbital];
+                return ag!=bg ? ag<bg : a.group<b.group;
+            });
         for(size_t q=0;q<k;++q)for(size_t p0=0;p0<k;++p0) {
+            if(sym.transfer(p0,q))continue;
             double value=h[p0*k+q];
             for(size_t l=0;l<k;++l) {
                 const size_t left=l*k+p0,right=q*k+l;

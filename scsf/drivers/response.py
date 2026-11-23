@@ -68,7 +68,31 @@ def resp(ham, wfn, op, e_vecs, integrals, perturbations, gamma=0.0, triplet=Fals
     for one in integrals.values():
         if one.shape != (ham.nbasis, ham.nbasis) or not np.all(np.isfinite(one)):
             raise ValueError('property integrals must be finite spatial orbital matrices')
-    if not overwrite:
+    symmetry = op.symmetry
+
+    def row_irreps():
+        result = np.empty(len(wfn), dtype=np.int8)
+        for occupation, rows in wfn._configs.items():
+            result[rows] = symmetry.configuration_irrep(occupation)
+        return result
+
+    ci_irrep = op.target_irrep
+    if symmetry is not None and ci_irrep is None:
+        sectors = np.unique(row_irreps())
+        if len(sectors) == 1:
+            ci_irrep = int(sectors[0])
+    expand_sectors = False
+    if wfn.target_irrep is not None and eps_mu is not None:
+        labels = np.asarray(symmetry.orbital_irreps, dtype=np.intp)
+        cross = labels[:, None] != labels
+        expand_sectors = any(np.any(one[cross] != 0.) for one in integrals.values())
+    if expand_sectors:
+        original = wfn
+        wfn = scsf.csf_wfn(original.nbasis, original.nelec, original.two_s, symmetry=symmetry)
+        for label in original:
+            wfn.add_csf(label)
+        op = op.with_basis(wfn, concurrent=True)
+    elif not overwrite:
         wfn = copy(wfn)
         op = op.with_basis(wfn)
     if np.iscomplexobj(e_vecs):
@@ -81,11 +105,33 @@ def resp(ham, wfn, op, e_vecs, integrals, perturbations, gamma=0.0, triplet=Fals
     nroots = max(nroots, state + 1)
     nthreads = op.nthreads
 
+    def sector_problem(rows, code):
+        if len(rows) == len(wfn):
+            return lambda x: wrap_matvec(op, x), op.diagonal()
+        space = scsf.csf_wfn(wfn.nbasis, wfn.nelec, wfn.two_s, symmetry=symmetry, target_irrep=code)
+        for i in rows:
+            space.add_csf(wfn[int(i)])
+        try:
+            block = op.with_basis(space, concurrent=True)
+        except MemoryError:
+            def restricted(x):
+                full = np.zeros((len(wfn),) + x.shape[1:], dtype=x.dtype)
+                full[rows] = x
+                return wrap_matvec(op, full)[rows]
+            return restricted, op.diagonal()[rows]
+        return lambda x: wrap_matvec(block, x), block.diagonal()
+
     def diagonalize():
         nonlocal e_vecs, state
-        energies, e_vecs, ok = solve_ci(lambda x: wrap_matvec(op, x), op.diagonal(), roots=nroots, c0=e_vecs, tol=ci_tol, maxiter=500, reference_state=reference_state)
+        rows = np.arange(len(wfn)) if ci_irrep is None else np.flatnonzero(row_irreps() == ci_irrep)
+        product, diagonal = sector_problem(rows, ci_irrep)
+        reference = None if reference_state is None else zeropad(np.asarray(reference_state), len(wfn))[rows]
+        energies, vectors, ok = solve_ci(product, diagonal, roots=nroots, c0=e_vecs[rows],
+                                         tol=ci_tol, maxiter=500, reference_state=reference)
         if not ok:
             raise RuntimeError('CI Davidson did not converge in the response space')
+        e_vecs = np.zeros((len(wfn), vectors.shape[1]))
+        e_vecs[rows] = vectors
         if reference_state is not None:
             overlaps = np.abs(np.asarray(reference_state).conj() @ e_vecs[:len(reference_state)])
             matched = np.flatnonzero(overlaps > 0.9)
@@ -94,13 +140,15 @@ def resp(ham, wfn, op, e_vecs, integrals, perturbations, gamma=0.0, triplet=Fals
         return energies
 
     def property_product(label, vector):
-        return scsf.csf_one_electron_product(integrals[label], wfn, vector, nthreads=nthreads)
+        return scsf.csf_one_electron_product(integrals[label], wfn, vector,
+                                             nthreads=nthreads, symmetry=symmetry)
     energies = diagonalize()
     if eps_mu is not None and integrals:
         original = e_vecs[:, state].copy()
         added = 0
         for label, one in integrals.items():
-            added += scsf.add_csf_one_electron(one, wfn, zeropad(original, len(wfn)), eps=eps_mu, nthreads=nthreads)
+            added += scsf.add_csf_one_electron(one, wfn, zeropad(original, len(wfn)), eps=eps_mu,
+                                             nthreads=nthreads, symmetry=symmetry)
         e_vecs = zeropad(e_vecs, len(wfn))
         op.update(ham, wfn)
         energies = diagonalize()
@@ -110,29 +158,46 @@ def resp(ham, wfn, op, e_vecs, integrals, perturbations, gamma=0.0, triplet=Fals
 
     def solve_responses(previous=None):
         nonlocal property_vectors, response_vectors
-        c = e_vecs[:, state]
+        reference = e_vecs[:, state]
         e0 = energies[state]
+        property_vectors = {}
+        for label in dict.fromkeys(p[0] for p in perturbations):
+            vector = property_product(label, reference)
+            property_vectors[label] = vector - reference*np.vdot(reference, vector)
+        response_vectors = {key: np.zeros(len(wfn), dtype=complex) for key in perturbations}
+        residuals = dict.fromkeys(perturbations, 0.)
+        if ci_irrep is None:
+            sectors = ((None, np.arange(len(wfn))),)
+        else:
+            codes = row_irreps()
+            sectors = ((int(code), np.flatnonzero(codes == code)) for code in np.unique(codes))
+        for code, rows in sectors:
+            keys = [key for key in perturbations if np.any(property_vectors[key[0]][rows])]
+            if not keys:
+                continue
+            c = reference[rows]
+            product, ci_diagonal = sector_problem(rows, code)
 
-        def project(x):
-            return x - c * np.vdot(c, x)
-        property_vectors = {label: project(property_product(label, c)) for label in dict.fromkeys((p[0] for p in perturbations))}
-        response_vectors = {}
-        ci_diagonal = op.diagonal()
-        for key in perturbations:
-            label, omega, parity = key
-            shift = parity * (omega + 1j * gamma)
+            def project(x):
+                return x - c * np.vdot(c, x)
+            for key in keys:
+                label, omega, parity = key
+                shift = parity * (omega + 1j * gamma)
 
-            def action(x):
-                qx = project(x)
-                return project(wrap_matvec(op, qx) - (e0 + shift) * qx) + c * np.vdot(c, x)
-            diagonal = ci_diagonal - e0 - shift + np.abs(c)**2
-            guess = None if previous is None else project(zeropad(previous[key], len(wfn)))
-            x = davidson_response(action, property_vectors[label], diagonal, tol=response_tol, maxiter=response_maxiter, guess=guess)
-            x = project(x)
-            residual = action(x) - property_vectors[label]
-            if np.linalg.norm(residual) > response_tol * 1.01:
-                raise RuntimeError('projected response residual exceeds tolerance')
-            response_vectors[key] = x
+                def action(x):
+                    qx = project(x)
+                    return project(product(qx) - (e0 + shift) * qx) + c * np.vdot(c, x)
+                diagonal = ci_diagonal - e0 - shift + np.abs(c)**2
+                guess = None if previous is None else project(zeropad(previous[key], len(wfn))[rows])
+                rhs = property_vectors[label][rows]
+                tolerance = response_tol / np.sqrt(len(symmetry.names)) if ci_irrep is not None else response_tol
+                x = project(davidson_response(action, rhs, diagonal, tol=tolerance,
+                                              maxiter=response_maxiter, guess=guess))
+                residuals[key] += np.linalg.norm(action(x) - rhs)**2
+                response_vectors[key][rows] = x
+            del product
+        if any(value > (response_tol*1.01)**2 for value in residuals.values()):
+            raise RuntimeError('projected response residual exceeds tolerance')
     solve_responses()
     if eps_resp is not None and response_vectors:
         while True:
