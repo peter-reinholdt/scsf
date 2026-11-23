@@ -30,7 +30,7 @@ def test_invalid_integral_snapshots(core,one,two,error):
         scsf.hamiltonian(core,one,two)
 
 
-def test_basis_file_and_data_only_export(tmp_path):
+def test_basis_file_round_trip(tmp_path):
     w = scsf.csf_wfn(2,2,0)
     w.add_all_csfs()
     path = tmp_path/'basis.json'
@@ -39,13 +39,6 @@ def test_basis_file_and_data_only_export(tmp_path):
     assert set(payload) == {'nbasis','nelec','two_s','labels'}
     restored = scsf.csf_wfn.from_file(path)
     assert list(restored) == list(w)
-    expansion, u = restored.determinant_transform()
-    npt.assert_allclose((u.T@u).toarray(), np.eye(len(w)), atol=1e-14)
-    assert len(expansion) == u.shape[0]
-    assert not hasattr(expansion, 'add_all_dets')
-    assert not hasattr(scsf, 'fullci_wfn') and not hasattr(scsf, 'sparse_op')
-    from scsf import _csf
-    assert not hasattr(_csf, '_DeterminantSigma')
 
 
 def test_array_snapshot_driver_requires_electron_count(tmp_path):
@@ -68,7 +61,6 @@ def test_basis_files_have_one_schema(tmp_path):
     path.write_text(json.dumps(payload))
     with pytest.raises(ValueError,match='basis file'):
         scsf.csf_wfn.from_file(path)
-    assert not hasattr(w,'to_fullci')
 
 
 def test_dense_integrals_require_physical_symmetry():

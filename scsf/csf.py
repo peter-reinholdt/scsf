@@ -3,17 +3,11 @@
 
 Orbitals are coupled in their supplied order. Steps ``0,u,d,2`` denote empty, spin-up-coupled,
 spin-down-coupled, and doubly occupied orbitals; ``u/d`` are not alpha/beta spins.
-All determinant coefficients use alpha-before-beta creation order and the real
-Clebsch--Gordan convention documented in docs/conventions.md.
 """
-from itertools import combinations
 import json
-from math import comb, sqrt
+from math import comb
 from operator import index
 import numpy as np
-from scipy import sparse
-from .expansion import DeterminantExpansion
-_popcount = int.bit_count
 
 def _integer(value, name):
     try:
@@ -215,79 +209,6 @@ class csf_wfn:
                 raise ValueError('duplicate CSF in basis file')
             wfn.add_csf(label)
         return wfn
-
-    def determinant_transform(self, *, two_ms=None):
-        """Return ``(DeterminantExpansion, U)`` with sparse ``U[det, csf]``.
-
-        Each column contains its complete expansion.
-        The default projection is M=S; a different M changes only conversion.
-        Export convention requires nonnegative M (nalpha >= nbeta).
-        """
-        two_ms = self.two_s if two_ms is None else _integer(two_ms, 'two_ms')
-        if not 0 <= two_ms <= self.two_s or (two_ms - self.two_s) % 2:
-            raise ValueError('two_ms must satisfy 0 <= two_ms <= two_s with matching parity (export requires nalpha >= nbeta)')
-        support = {}
-        rows, cols, values = ([], [], [])
-        for j, label in enumerate(self):
-            for det, value in _expand(label, two_ms).items():
-                rows.append(support.setdefault(det, len(support)))
-                cols.append(j)
-                values.append(value)
-        a, b = ((self.nelec + two_ms) // 2, (self.nelec - two_ms) // 2)
-        wordbits = np.dtype(np.uint64).itemsize * 8
-        nword = (self.nbasis + wordbits - 1) // wordbits
-        array = np.zeros((len(support), 2, nword), dtype=np.uint64)
-        mask = (1 << wordbits) - 1
-        for det, i in support.items():
-            for spin, bits in enumerate((det & (1 << self.nbasis) - 1, det >> self.nbasis)):
-                for w in range(nword):
-                    array[i, spin, w] = bits >> w * wordbits & mask
-        det_wfn = DeterminantExpansion(self.nbasis, a, b, array)
-        return (det_wfn, sparse.csr_matrix((values, (rows, cols)), shape=(len(support), len(self))))
-
-    def to_determinants(self, coeffs, *, two_ms=None):
-        """Export a data-only determinant basis and real coefficients for validation."""
-        if np.iscomplexobj(coeffs):
-            raise TypeError('determinant export requires real coefficients')
-        coeffs = np.asarray(coeffs, dtype=float)
-        if coeffs.shape != (len(self),) or not np.all(np.isfinite(coeffs)):
-            raise ValueError('determinant export requires one finite coefficient per CSF')
-        det_wfn, transform = self.determinant_transform(two_ms=two_ms)
-        return (det_wfn, np.asarray(transform @ coeffs))
-
-def _expand(label, two_ms):
-    """Expand one path; use orbital-major then alpha-before-beta phases."""
-    singles = [p for p, s in enumerate(label) if s in 'ud']
-    doubles = [p for p, s in enumerate(label) if s == '2']
-    nbasis = len(label)
-    base = sum((1 << p | 1 << nbasis + p for p in doubles))
-    result = {}
-    for alpha in combinations(singles, (len(singles) + two_ms) // 2):
-        alpha = set(alpha)
-        spin, projection, amplitude = (0, 0, 1.0)
-        det = base
-        for p in singles:
-            sigma = 1 if p in alpha else -1
-            if label[p] == 'u':
-                factor = (spin + sigma * projection + 2) / (2 * (spin + 1))
-                sign = 1
-                new_spin = spin + 1
-            else:
-                factor = (spin - sigma * projection) / (2 * (spin + 1))
-                sign = -1 if sigma == 1 else 1
-                new_spin = spin - 1
-            if factor <= 0:
-                amplitude = 0.0
-                break
-            amplitude *= sign * sqrt(factor)
-            spin, projection = (new_spin, projection + sigma)
-            det |= 1 << (p if sigma == 1 else nbasis + p)
-        if amplitude:
-            betas = [p for p in range(nbasis) if det & 1 << nbasis + p]
-            alphas = [p for p in range(nbasis) if det & 1 << p]
-            inversions = sum((q > p for p in betas for q in alphas))
-            result[det] = amplitude * (-1 if inversions % 2 else 1)
-    return result
 
 def _one_electron_inputs(one, wfn, coeffs, nthreads, triplet):
     if not isinstance(wfn, csf_wfn):

@@ -24,8 +24,7 @@ the total energies in Hartree are:
 | 2 | -7.69719315103717 | -7.71658823812216 |
 
 RHF gives -7.86186476980865 Hartree. The fixture also exercises HCI selection
-and incremental Hamiltonian updates, native and direct products, and
-conversion of CSF coefficients to determinants.
+and incremental Hamiltonian updates, as well as native and direct products.
 
 ## Dalton H4/STO-3G
 

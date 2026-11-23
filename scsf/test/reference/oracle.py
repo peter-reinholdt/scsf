@@ -1,6 +1,7 @@
 """Independent explicit determinant actions for small signed acceptance checks."""
 from functools import lru_cache
 from itertools import combinations, product
+from math import sqrt
 
 import numpy as np
 import scsf
@@ -17,13 +18,38 @@ def random_hamiltonian(k=4, seed=17):
     g = (g + g.transpose(2, 3, 0, 1)) / 2
     return scsf.hamiltonian(1.2345, h, g.transpose(0, 2, 1, 3))
 
-def determinant_keys(wfn):
-    words = wfn.to_det_array()
-    wordbits = np.dtype(np.uint64).itemsize * 8
-    result = []
-    for row in words:
-        spins = [sum((int(x) << wordbits * i for i, x in enumerate(s))) for s in row]
-        result.append(spins[0] | spins[1] << wfn.nbasis)
+def _expand(label, two_ms):
+    """Expand one path; use orbital-major then alpha-before-beta phases."""
+    singles = [p for p, s in enumerate(label) if s in 'ud']
+    doubles = [p for p, s in enumerate(label) if s == '2']
+    nbasis = len(label)
+    base = sum((1 << p | 1 << nbasis + p for p in doubles))
+    result = {}
+    for alpha in combinations(singles, (len(singles) + two_ms) // 2):
+        alpha = set(alpha)
+        spin, projection, amplitude = (0, 0, 1.0)
+        det = base
+        for p in singles:
+            sigma = 1 if p in alpha else -1
+            if label[p] == 'u':
+                factor = (spin + sigma * projection + 2) / (2 * (spin + 1))
+                sign = 1
+                new_spin = spin + 1
+            else:
+                factor = (spin - sigma * projection) / (2 * (spin + 1))
+                sign = -1 if sigma == 1 else 1
+                new_spin = spin - 1
+            if factor <= 0:
+                amplitude = 0.0
+                break
+            amplitude *= sign * sqrt(factor)
+            spin, projection = (new_spin, projection + sigma)
+            det |= 1 << (p if sigma == 1 else nbasis + p)
+        if amplitude:
+            betas = [p for p in range(nbasis) if det & 1 << nbasis + p]
+            alphas = [p for p in range(nbasis) if det & 1 << p]
+            inversions = sum((q > p for p in betas for q in alphas))
+            result[det] = amplitude * (-1 if inversions % 2 else 1)
     return result
 
 def fock_action(occupied, annihilate, create):
@@ -71,14 +97,16 @@ def fock_reference(ham, nelec, two_ms):
     keys = [sum((1 << p for p in det)) for det in dets]
     return (keys, h, s2)
 
-def transform_in_order(wfn, keys, two_ms):
-    dwfn, u = wfn.determinant_transform(two_ms=two_ms)
-    u = u.toarray()
-    lookup = {key: i for i, key in enumerate(keys)}
-    result = np.zeros((len(keys), len(wfn)))
-    for i, key in enumerate(determinant_keys(dwfn)):
-        result[lookup[key]] = u[i]
+def _reference_columns(columns, keys):
+    lookup = {key: row for row, key in enumerate(keys)}
+    result = np.zeros((len(keys), len(columns)))
+    for col, amplitudes in enumerate(columns):
+        for key, value in amplitudes.items():
+            result[lookup[key], col] = value
     return result
+
+def transform_in_order(wfn, keys, two_ms):
+    return _reference_columns([_expand(label, two_ms) for label in wfn], keys)
 
 def hamiltonian_block(ham, rows, cols, two_s):
     rows, cols = tuple(rows), tuple(cols)
@@ -96,10 +124,11 @@ def hamiltonian_block(ham, rows, cols, two_s):
 
 def fock_operators(wfn):
     """Independent explicit spin-orbital actions in the existing CG convention."""
-    dwfn, transform = wfn.determinant_transform()
-    u = transform.toarray()
+    columns = [_expand(label, wfn.two_s) for label in wfn]
+    keys = sorted({key for column in columns for key in column})
+    u = _reference_columns(columns, keys)
     dets = [tuple(p for p in range(2*wfn.nbasis) if key & (1 << p))
-            for key in determinant_keys(dwfn)]
+            for key in keys]
     lookup = {det: i for i, det in enumerate(dets)}
 
     def matrix(indices):
