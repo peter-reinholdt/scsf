@@ -63,8 +63,9 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
     """Block Davidson for a real symmetric electronic Hamiltonian.
 
     Optional ``stats`` is filled with nonoverlapping wall timings, product
-    widths, iteration and restart counts. Product validation is included in
-    product time; remaining bookkeeping is reported as ``other_ns``.
+    widths, iteration and restart counts, and final ``residual_norms``.
+    Product validation is included in product time. Remaining bookkeeping
+    is reported as ``other_ns``.
 
     ``hvp`` accepts a matrix of trial vectors as columns. Returns electronic
     eigenvalues, column-oriented eigenvectors, and a convergence flag. ``c0``
@@ -80,11 +81,12 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
     through the first state with absolute overlap above 0.9, as in the original
     routine; convergence requires finding that state when tracking is requested.
 
-    ``hvp`` must be linear. Independently validate residuals when using a
-    screened direct operator.
+    ``hvp`` must be linear and symmetric. Independently validate residuals
+    when using a screened direct operator.
     """
     from operator import index
     from time import perf_counter_ns
+    from scipy.linalg.blas import daxpy, dgemv, dnrm2
     started = perf_counter_ns()
     if stats is not None:
         stats.clear()
@@ -102,12 +104,13 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
                     stats[name] += perf_counter_ns() - before
             return measured
         return decorate
-    def finish(values, vectors, converged):
+    def finish(values, vectors, norms, converged):
         if stats is not None:
             stats['total_ns'] = perf_counter_ns() - started
             stats['other_ns'] = stats['total_ns'] - sum(stats[k] for k in
                 ('product_ns', 'orthogonalization_ns', 'ritz_ns', 'restart_ns', 'basis_append_ns'))
             stats['converged'] = converged
+            stats['residual_norms'] = norms.tolist()
         return values, vectors, converged
 
     hdiag = np.asarray(hdiag)
@@ -143,14 +146,17 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
         denominators[small] = np.where(denominators[small]<0., -1e-3, 1e-3)
         return denominators
 
-    def inverse(vector, den, local_den):
-        out = vector/den
+    def precondition(vectors, shifts):
         if preconditioner_block is not None:
-            out[block_rows] = block_vectors@((block_vectors.T@vector[block_rows])/local_den)
-        return out
+            local_den = shifted_denominator(block_values, shifts)
+            block_corrections = block_vectors @ ((block_vectors.T @ vectors[block_rows])/local_den)
+        np.divide(vectors, shifted_denominator(hdiag, shifts), out=vectors)
+        if preconditioner_block is not None:
+            vectors[block_rows] = block_corrections
 
+    default_capacity = 20
     if max_subspace is None:
-        max_subspace = min(dim, max(20, 8*roots))
+        max_subspace = min(dim, max(default_capacity, 8*roots))
     max_subspace = index(max_subspace)
     if not roots <= max_subspace <= dim or (roots < dim and max_subspace == roots):
         raise ValueError('max_subspace must allow roots and at least one correction')
@@ -165,9 +171,9 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
 
     @timed('orthogonalization_ns')
     def orthogonalize(vectors, against):
-        accepted = []
-        for vector in vectors.T:
-            vector = vector.copy()
+        # Compact the private, column-contiguous trial block in place.
+        accepted = 0
+        for column, vector in enumerate(vectors.T):
             scale = np.linalg.norm(vector)
             if scale == 0:
                 continue
@@ -175,13 +181,17 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
             # Two passes matter after zero padding and near convergence.
             for _ in range(2):
                 if against.shape[1]:
-                    vector -= against @ (against.T @ vector)
-                for q in accepted:
-                    vector -= q*np.dot(q, vector)
+                    overlaps = against.T @ vector
+                    dgemv(-1., against, overlaps, beta=1., y=vector, overwrite_y=1)
+                for q in vectors[:, :accepted].T:
+                    daxpy(q, vector, a=-np.dot(q, vector))
             norm = np.linalg.norm(vector)
             if norm > 1e-12:
-                accepted.append(vector/norm)
-        return np.column_stack(accepted) if accepted else np.empty((dim, 0))
+                vector /= norm
+                if accepted != column:
+                    vectors[:, accepted] = vector
+                accepted += 1
+        return vectors[:, :accepted]
 
     @timed('product_ns')
     def apply(vectors):
@@ -200,12 +210,13 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
         return vectors.T @ images
 
     @timed('ritz_ns')
-    def expand_projection(projected, vectors, images, additions, addition_images):
+    def expand_projection(projected, vectors, additions, addition_images):
         # The previous basis columns and images are unchanged on an append.
-        # Calculate both cross blocks before symmetrizing the Ritz matrix.
+        # Symmetry gives the other cross block without rereading the old images.
+        cross = vectors.T @ addition_images
         return np.block([
-            [projected, vectors.T @ addition_images],
-            [additions.T @ images, additions.T @ addition_images],
+            [projected, cross],
+            [cross.T, additions.T @ addition_images],
         ])
 
     basis_vectors = basis_images = None
@@ -216,7 +227,9 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
         last = first + additions.shape[1]
         capacity = 0 if basis_vectors is None else basis_vectors.shape[1]
         if last > capacity:
-            size = min(max_subspace, max(last, 4, 2*capacity))
+            # Reserve the usual subspace width up front. Only appended columns
+            # touch memory, and larger subspaces can still grow geometrically.
+            size = min(max_subspace, max(last, default_capacity, 2*capacity))
             vectors = np.empty((dim, size), dtype=additions.dtype, order='F')
             if first:
                 vectors[:, :first] = basis_vectors[:, :first]
@@ -266,29 +279,41 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
         if (np.iscomplexobj(c0) or c0.ndim != 2 or c0.shape[0] != dim or
                 not np.all(np.isfinite(c0))):
             raise ValueError('c0 must be a finite real vector/block of the full dimension')
-        V = orthogonalize(np.asarray(c0, dtype=float), empty)[:, :max_subspace]
-    diagonal_order = np.argsort(hdiag, kind='stable')
+        V = orthogonalize(np.array(c0, dtype=float, order='F', copy=True), empty)[:, :max_subspace]
+    diagonal_order = None
+
+    def coordinate(row, against):
+        unit = np.zeros((dim, 1))
+        unit[row, 0] = 1.
+        return orthogonalize(unit, against)
 
     def supplement(basis, count):
+        nonlocal diagonal_order
         # Coordinate vectors also recover directions when a diagonal Davidson
         # preconditioner collapses onto the current span.
+        skip = 0
+        if count == 1 and diagonal_order is None:
+            q = coordinate(np.argmin(hdiag), basis)
+            if q.shape[1]:
+                return q
+            skip = 1  # The stable sort starts with the coordinate just tried.
+        if diagonal_order is None:
+            diagonal_order = np.argsort(hdiag, kind='stable')
         extra = []
-        for p in diagonal_order:
-            unit = np.zeros((dim, 1))
-            unit[p, 0] = 1.0
-            current = np.column_stack([basis] + extra) if extra else basis
-            q = orthogonalize(unit, current)
+        for p in diagonal_order[skip:]:
+            current = np.asfortranarray(np.concatenate([basis] + extra, axis=1)) if extra else basis
+            q = coordinate(p, current)
             if q.shape[1]:
                 extra.append(q)
             if len(extra) >= count:
                 break
-        return np.column_stack(extra) if extra else empty
+        return np.concatenate(extra, axis=1) if extra else empty
 
     # Include low-diagonal directions even with supplied guesses. A zero-padded
     # guess can otherwise remain an exact higher state of a disconnected block.
     nseed = min(roots, max_subspace-V.shape[1])
     if nseed:
-        V = np.column_stack((V, supplement(V, nseed)))
+        V = np.concatenate((V, supplement(V, nseed)), axis=1)
     V, AV = store_basis(V, apply(V), 0)
     projected = project_basis(V, AV)
     previous_report = started
@@ -303,9 +328,14 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
             if len(matches):
                 nkeep, found_reference = max(roots, int(matches[0])+1), True
         L, Z = values[:nkeep], rotations[:, :nkeep]
-        X, AX = V @ Z, AV @ Z
-        residual = AX-X*L[None, :]
-        norms = np.linalg.norm(residual, axis=0)
+        # Form contiguous columns so BLAS can update and norm the residual in place.
+        X, residual = (Z.T @ V.T).T, (Z.T @ AV.T).T
+        # A restart can retain the images when the next trial block may not fit.
+        restart_images = residual.copy(order='F') if V.shape[1]+nkeep > max_subspace else None
+        norms = np.empty(nkeep)
+        for root, (vector, image) in enumerate(zip(X.T, residual.T)):
+            daxpy(vector, image, a=-L[root])
+            norms[root] = dnrm2(image)
         if stats is not None: stats['ritz_ns'] += perf_counter_ns() - ritz_start
         if verbose:
             reported = perf_counter_ns()
@@ -319,14 +349,15 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
                 recycle.fill(0.)
                 extra = rotations[:, nkeep:nkeep+recycle.shape[1]]
                 recycle[:, :extra.shape[1]] = V @ extra
-            return finish(L, X, True)
+            return finish(L, X, norms, True)
         if iteration+1 == maxiter:
-            return finish(L, X, False)
+            return finish(L, X, norms, False)
         unconverged = np.flatnonzero(norms >= tol)
-        shifts = L[unconverged]
-        denom = shifted_denominator(hdiag, shifts)
-        local_den = None if preconditioner_block is None else shifted_denominator(block_values, shifts)
-        corrections = inverse(residual[:, unconverged], denom, local_den)
+        if len(unconverged) < nkeep:
+            corrections = np.asfortranarray(residual[:, unconverged])
+        else:
+            corrections = residual.copy(order='F') if jd_iterations else residual
+        precondition(corrections, L[unconverged])
         if jd_iterations:
             for column, root in enumerate(unconverged):
                 corrected = jd_correction(X[:, root], L[root], residual[:, root])
@@ -336,13 +367,13 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
         if not corrections.shape[1] and V.shape[1] < dim:
             corrections = supplement(V, max(1, roots))
         if not corrections.shape[1]:
-            return finish(L, X, False)
+            return finish(L, X, norms, False)
         if V.shape[1]+corrections.shape[1] > max_subspace:
             # Thick restart retains the current Ritz vectors, without applying
             # H a second time to the retained columns.
             if X.shape[1] >= max_subspace:
-                return finish(L, X, False)
-            V, AV = store_basis(X, AX, 0)
+                return finish(L, X, norms, False)
+            V, AV = store_basis(X, restart_images, 0)
             if stats is not None:
                 stats['restarts'] += 1
                 restart_start, orthogonal_before = perf_counter_ns(), stats['orthogonalization_ns']
@@ -352,8 +383,7 @@ def solve_ci(hvp, hdiag, roots, tol=1e-6, maxiter=100, verbose=False, c0=None,
             projected = project_basis(V, AV)
         corrections = corrections[:, :max_subspace-V.shape[1]]
         if not corrections.shape[1]:
-            return finish(L, X, False)
+            return finish(L, X, norms, False)
         correction_images = apply(corrections)
-        projected = expand_projection(projected, V, AV, corrections, correction_images)
+        projected = expand_projection(projected, V, corrections, correction_images)
         V, AV = store_basis(corrections, correction_images, V.shape[1])
-    return finish(L, X, False)

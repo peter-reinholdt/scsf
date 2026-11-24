@@ -235,17 +235,17 @@ def diagonalize(args, op, c0=None, *, measurements=None, progress=False):
             del block_op
         preconditioner_block = rows, matrix
     block_seconds = perf_counter()-block_start
-    stats = {} if measurements is not None or args.sci_stats or progress else None
+    stats = {}
+    measure_products = measurements is not None or args.sci_stats
     products = {}
 
-    def measured_product(vectors, phase='solver'):
+    def measured_product(vectors):
         start = perf_counter()
         result = op.native_matmat(vectors)
         elapsed = perf_counter()-start
         width = vectors.shape[1]
+        phase = 'solver' if products else 'first'
         key = f'{phase}/{width}'
-        if phase == 'solver' and not products:
-            key = f'first/{width}'
         bucket = products.setdefault(key, {'calls': 0, 'seconds': 0., 'native': {}})
         bucket['calls'] += 1
         bucket['seconds'] += elapsed
@@ -255,24 +255,20 @@ def diagonalize(args, op, c0=None, *, measurements=None, progress=False):
                 native[name] = native.get(name, 0) + value
         return result
 
-    product = measured_product if stats is not None else op.native_matmat
+    product = measured_product if measure_products else op.native_matmat
     energies, vectors, converged = solve_ci(product, diagonal, roots=roots, c0=c0,
         tol=args.davidson_tol, maxiter=args.davidson_maxiter, max_subspace=limit, stats=stats, verbose=progress,
         preconditioner_block=preconditioner_block, jd_iterations=args.davidson_jd_iterations)
-    start = perf_counter()
-    image = measured_product(vectors, 'residual') if stats is not None else product(vectors)
-    residual = np.linalg.norm(image-vectors*energies, axis=0)
-    residual_seconds = perf_counter()-start
-    if not converged or not np.all(residual <= args.davidson_tol):
-        raise RuntimeError(f'Davidson did not converge, exact residuals {residual}')
+    residual = np.asarray(stats['residual_norms'])
+    if not converged:
+        raise RuntimeError(f'Davidson did not converge, Ritz residuals {residual}')
     if progress:
         solve_seconds = stats['total_ns']*1e-9
         print(f'  Davidson converged in {solve_seconds:.3f} s, diagonal {diagonal_seconds:.3f} s, '
-              f'preconditioner {block_seconds:.3f} s, verification {residual_seconds:.3f} s, '
-              f'verified max residual={np.max(residual):.3e} Eh', flush=True)
+              f'preconditioner {block_seconds:.3f} s, max Ritz residual={np.max(residual):.3e} Eh', flush=True)
     if measurements is not None:
         measurements.update(solver=stats, products=products, diagonal_seconds=diagonal_seconds,
-                            preconditioner_seconds=block_seconds, residual_seconds=residual_seconds,
+                            preconditioner_seconds=block_seconds,
                             residuals=residual.tolist(), preconditioner_memory_peak=preconditioner_memory_peak)
     if args.sci_stats:
         print(f'cycle setup={op.setup_seconds:.6f} diagonal={diagonal_seconds:.6f} '
@@ -280,7 +276,7 @@ def diagonalize(args, op, c0=None, *, measurements=None, progress=False):
               f'product_calls={stats["product_calls"]} product_columns={stats["product_columns"]} '
               f'jd_product_calls={stats["jd_product_calls"]} '
               f'davidson={(stats["total_ns"]-stats["product_ns"])*1e-9:.6f} '
-              f'verification={residual_seconds:.6f} residuals={residual}')
+              f'residuals={residual}')
         print(f'solver {stats}')
         print(f'products_by_phase_width {products}')
     return energies+op.ecore, vectors
@@ -309,7 +305,6 @@ def print_timings(timing, wall):
         ('Davidson restarts', timing['restart']),
         ('Davidson basis storage', timing['basis_append']),
         ('Other Davidson work', timing['solver_bookkeeping']),
-        ('Independent residual checks', timing['residual']),
         ('HCI selection', timing['selection']),
         ('Basis extension', timing['basis_extend']),
         ('Operator replacement', timing['replacement']),
@@ -394,7 +389,7 @@ def hci_pass(args, parser, ham, nelec, timing, *, started=None):
                   f'(residual tolerance {args.davidson_tol:g} Eh)', flush=True)
         measurements = {}
         energies, vectors = diagonalize(args, op, guess, measurements=measurements, progress=progress)
-        for phase in ('diagonal', 'preconditioner', 'residual'):
+        for phase in ('diagonal', 'preconditioner'):
             timing[phase] += measurements[f'{phase}_seconds']
         solver = measurements['solver']
         preconditioner_memory_peak = max(preconditioner_memory_peak, measurements['preconditioner_memory_peak'])

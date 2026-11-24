@@ -96,6 +96,9 @@ def test_davidson_phase_stats_preserve_solution_and_count_work():
                        maxiter=250, max_subspace=12)
     npt.assert_allclose(measured[0], control[0], atol=1e-12)
     assert measured[2] == control[2]
+    energies, vectors, _ = measured
+    npt.assert_allclose(stats['residual_norms'], np.linalg.norm(matrix @ vectors - vectors * energies, axis=0),
+                        atol=1e-13, rtol=0)
     assert stats['product_calls'] == len(calls)
     assert stats['product_columns'] == sum(calls)
     assert stats['call_widths'] == calls

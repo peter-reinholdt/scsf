@@ -65,6 +65,11 @@ to a distinct allowed logical CPU in the order listed. For example,
 `--nthreads 2 --worker-cpus 4 6` pins workers to CPUs 4 and 6 if both are
 in the process's allowed CPU set.
 
+NumPy and SciPy use their linked BLAS library for Davidson linear algebra.
+Set `OPENBLAS_NUM_THREADS` for pthreads OpenBLAS, `MKL_NUM_THREADS` for MKL,
+or `OMP_NUM_THREADS` for an OpenMP BLAS before launching the driver.
+`--nthreads` controls the native SCSF workers independently.
+
 `--max-mem 4GiB` sets one shared limit for the tracked native allocation
 sizes, including HCI transfer tables, schedules, spin coefficients, caches,
 and the full RHS block's product arrays. The default is unlimited. An
@@ -74,8 +79,8 @@ The Python constructor accepts the same limit as `max_mem` in bytes.
 
 The energy driver prints HCI growth, per-iteration Davidson timings and a
 final phase table by default. Use `--quiet` for summaries and the table, or
-`--sci-stats` for detailed counters. The energy driver also supports an exact leading-block
-preconditioner and Jacobi–Davidson corrections.
+`--sci-stats` for detailed counters. The energy driver also supports an exact
+leading-block preconditioner and Jacobi–Davidson corrections.
 
 ## Python API
 

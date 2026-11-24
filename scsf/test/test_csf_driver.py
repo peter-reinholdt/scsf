@@ -78,6 +78,7 @@ def test_driver_solves_cutoff_batch_and_stops_selection(tmp_path, capsys):
     output = capsys.readouterr().out
     assert 'Final Davidson solve for 2 CSFs' in output
     assert 'Davidson iter' in output and 'wall=' in output
+    assert 'max Ritz residual=' in output
     assert 'Hamiltonian products inside Davidson' in output
     assert output.count('Selecting from') == 1
     assert 'iteration=1 added=1 ncsf=2' in output
@@ -88,6 +89,28 @@ def test_driver_solves_cutoff_batch_and_stops_selection(tmp_path, capsys):
     strict = capsys.readouterr().out
     assert 'iteration=2 added=1 ncsf=3' in strict
     assert 'Davidson iter' not in strict
+
+
+def test_diagonalize_reports_ritz_residuals_without_extra_products(monkeypatch):
+    parser = csf_driver.build_parser()
+    args = parser.parse_args(['--integrals', LIH, '--nthreads', '1', '--nroots', '2'])
+    ham, nelec = csf_driver.integrals(args, parser)
+    wfn, _ = csf_driver.initial_space(args, parser, ham, nelec)
+    wfn.add_all_csfs()
+    op = csf_driver.make_operator(args, ham, wfn)
+    native_matmat = op.native_matmat
+    calls = []
+
+    def record_product(vectors):
+        calls.append(vectors.shape[1])
+        return native_matmat(vectors)
+
+    monkeypatch.setattr(op, 'native_matmat', record_product)
+    measurements = {}
+    energies, vectors = csf_driver.diagonalize(args, op, measurements=measurements)
+    assert calls == measurements['solver']['call_widths']
+    residuals = np.linalg.norm(native_matmat(vectors) - vectors * (energies - op.ecore), axis=0)
+    np.testing.assert_allclose(measurements['residuals'], residuals, atol=1e-13, rtol=0)
 
 
 @pytest.mark.parametrize('unit', ['csf', 'configuration'])
