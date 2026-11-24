@@ -578,6 +578,24 @@ def test_parallel_private_nminus2_postings_match_serial_and_append():
     compare_with_serial()
 
 
+def test_nminus2_reuses_folded_groups_when_singletons_gain_parents():
+    h = random_hamiltonian(8, seed=20)
+    w = wavefunction(8, 4, 0, ['22000000', '00220000', '00002200', '00000022'])
+    op = scsf.csf_structured_op(h, w, nthreads=3)
+    assert op.product_info['folded_pair_terms'] > 0
+
+    w.add_csf('20200000')
+    op.update(h, w)
+    info = op.product_info
+    assert info['incremental_removal_groups'] == 1
+    assert info['folded_reused_groups'] == 2
+    fresh = scsf.csf_structured_op(h, w, nthreads=3)
+    assert 0 < info['folded_staged_terms'] < fresh.product_info['folded_staged_terms']
+    x = np.random.default_rng(19).normal(size=(len(w), 3))
+    for width in (1, 2, 3):
+        np.testing.assert_allclose(op.matmat(x[:, :width]), fresh.matmat(x[:, :width]), atol=1e-12)
+
+
 @pytest.mark.parametrize('k', [32, 33, 64, 65, 138])
 def test_nminus2_removal_classes_at_occupation_boundaries(k):
     rng = np.random.default_rng(104)

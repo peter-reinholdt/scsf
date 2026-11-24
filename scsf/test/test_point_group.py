@@ -255,7 +255,11 @@ def test_wide_cih_and_incremental_nminus2():
     cap = rebuilt.product_info['peak_tracked_memory_bytes']
     limited = scsf.csf_structured_op(ham, growing, nthreads=2, max_mem=cap)
     np.testing.assert_allclose(limited.matmat(x), rebuilt.matmat(x), atol=6e-14, rtol=0)
-    assert limited.product_info['peak_tracked_memory_bytes'] <= cap
+    info = limited.product_info
+    assert info['peak_tracked_memory_bytes'] <= cap
+    assert info['removal_retry_ns'] > 0
+    assert sum(value for name, value in info.items()
+               if name.startswith('removal_retry_') and name != 'removal_retry_ns') == 1
 
 
 @pytest.mark.parametrize('threads', [1, 4])

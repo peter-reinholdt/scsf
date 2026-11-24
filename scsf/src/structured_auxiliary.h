@@ -15,6 +15,8 @@ class Auxiliary {
     struct FoldedPair {
         unsigned matrix;
         double scale;
+        FoldedPair() noexcept {}
+        FoldedPair(unsigned matrix,double scale) noexcept : matrix(matrix),scale(scale) {}
     };
     class ChannelSectors {
         using Boundaries=std::array<size_t,OrbitalSymmetry::extent+1>;
@@ -31,22 +33,24 @@ class Auxiliary {
                     [&](const auto &parent){return irrep(parent)!=code;});
             };
             size_t blocks=0,members=0;
-            for(const auto &block:links.blocks)if(mixed(block)) {
+            for(size_t b=0;b<links.block_count();++b) {
+                const auto block=links.block_at(b);
+                if(!mixed(block))continue;
                 ++blocks;
                 members=checked_add(members,block.end-block.begin);
             }
             if(!blocks)return;
-            if(links.blocks.size()>budget/sizeof(size_t))
+            if(links.block_count()>budget/sizeof(size_t))
                 throw BudgetError("removal irrep directory exceeds --max-mem");
-            budget-=links.blocks.size()*sizeof(size_t);
+            budget-=links.block_count()*sizeof(size_t);
             if(blocks>budget/sizeof(Boundaries) || members>(budget-blocks*sizeof(Boundaries))/sizeof(unsigned))
                 throw BudgetError("removal irrep postings exceed --max-mem");
-            directory_.assign(links.blocks.size(),none);
+            directory_.assign(links.block_count(),none);
             ranges_.reserve(blocks);
             members_.resize(members);
             size_t begin=0;
-            for(size_t b=0;b<links.blocks.size();++b) {
-                const auto &block=links.blocks[b];
+            for(size_t b=0;b<links.block_count();++b) {
+                const auto block=links.block_at(b);
                 if(!mixed(block))continue;
                 Boundaries range{};
                 for(size_t j=block.begin;j<block.end;++j)++range[irrep(links.parents[j])+1];
@@ -61,9 +65,9 @@ class Auxiliary {
             }
         }
         template<class Irrep,class Visit>
-        void visit(const RemovalLinks &links,const RemovalLinks::Block &block,unsigned code,
+        void visit(const RemovalLinks &links,const RemovalLinks::Block &block,size_t index,unsigned code,
                    Irrep irrep,Visit callback) const {
-            const size_t at=directory_.empty() ? none : directory_[&block-links.blocks.data()];
+            const size_t at=directory_.empty() ? none : directory_[index];
             if(at==none) {
                 if(irrep(links.parents[block.begin])!=code)return;
                 for(size_t j=0;j<block.end-block.begin;++j)callback(j);
@@ -73,8 +77,8 @@ class Auxiliary {
             }
         }
         template<class Irrep>
-        unsigned mask(const RemovalLinks &links,const RemovalLinks::Block &block,Irrep irrep) const {
-            const size_t at=directory_.empty() ? none : directory_[&block-links.blocks.data()];
+        unsigned mask(const RemovalLinks &links,const RemovalLinks::Block &block,size_t index,Irrep irrep) const {
+            const size_t at=directory_.empty() ? none : directory_[index];
             if(at==none)return 1u<<irrep(links.parents[block.begin]);
             const auto &ranges=ranges_[at];
             unsigned mask=0;
@@ -134,10 +138,10 @@ class Auxiliary {
         return topology_->pair_irreps[parent.channel];
     }
     template<class Callback>
-    void one_channels(const RemovalLinks::Block &block,unsigned code,Callback callback) const {
+    void one_channels(const RemovalLinks::Block &block,size_t index,unsigned code,Callback callback) const {
         const auto &links=*topology_->one;
         if(mixed_irreps_)
-            topology_->one_sectors.visit(links,block,code,[&](const auto &parent){return one_irrep(parent);},callback);
+            topology_->one_sectors.visit(links,block,index,code,[&](const auto &parent){return one_irrep(parent);},callback);
         else for(size_t i=0;i<block.end-block.begin;++i)callback(i);
     }
     double pair_value(size_t a,size_t b) const {
@@ -203,38 +207,60 @@ class Auxiliary {
             offset+=width*width;
         }
     }
-    void fold_single_parent_pairs(size_t budget) {
+    void fold_single_parent_pairs(size_t budget,const Topology *previous,const std::atomic<bool> *dirty,
+                                  size_t dirty_bytes,const char *&phase) {
         const auto &links=*topology_->two;
-        if(links.blocks.size()>std::numeric_limits<unsigned>::max() ||
-            topology_->pair_integrals.empty() ||
+        const size_t groups=p_.groups.size(),singletons=links.singletons;
+        if(links.block_count()>std::numeric_limits<unsigned>::max() ||
+            singletons<groups || !singletons || topology_->pair_integrals.empty() ||
             !std::all_of(p_.groups.begin(),p_.groups.end(),[](const auto &g){return g.canonical_full();}))
             return;
-        const size_t singletons=std::count_if(links.blocks.begin(),links.blocks.end(),
-            [](const auto &b){return b.end-b.begin==1;});
-        const size_t mixed=links.blocks.size()-singletons, groups=p_.groups.size();
-        if(singletons<groups || !singletons)return;
-        const size_t peak=2*(groups+1)*sizeof(size_t)+mixed*sizeof(unsigned)+2*singletons*sizeof(FoldedPair);
-        memory_left(budget,peak,"N−2 folded pair schedule");
-        auto &offsets=topology_->folded_offsets;
+        const size_t old_groups=previous ? previous->folded_offsets.size()-1 : 0;
+        const auto reuse=[&](size_t g) {return g<old_groups && !dirty[g].load(std::memory_order_relaxed);};
+        const size_t mixed=links.block_count()-singletons;
+        const size_t index_bytes=(groups+1)*sizeof(size_t);
+        const size_t mixed_bytes=mixed*sizeof(unsigned);
+        auto account=[&](size_t bytes) {
+            topology_->build_bytes=std::max(topology_->build_bytes,
+                checked_add(topology_->metadata_bytes,checked_add(bytes,dirty_bytes)));
+        };
+        phase="removal_retry_fold_staging";
+        memory_left(budget,checked_add(index_bytes,mixed_bytes),"N−2 folded pair index");
+        std::vector<size_t> staged_offsets(groups+1);
         auto &mixed_pairs=topology_->mixed_pairs;
-        offsets.assign(groups+1,0);
         mixed_pairs.reserve(mixed);
-        for(size_t i=0;i<links.blocks.size();++i) {
-            const auto &b=links.blocks[i];
-            if(b.end-b.begin==1)++offsets[links.parents[b.begin].group+1];
-            else mixed_pairs.push_back(i);
+        account(index_bytes+mixed_bytes);
+        for(size_t i=0;i<links.block_count();++i) {
+            const auto block=links.block_at(i);
+            if(block.end-block.begin!=1) {
+                mixed_pairs.push_back(i);
+                continue;
+            }
+            const auto g=links.parents[block.begin].group;
+            if(!reuse(g))++staged_offsets[g+1];
         }
-        std::partial_sum(offsets.begin(),offsets.end(),offsets.begin());
-        auto ends=offsets;
-        std::vector<FoldedPair> terms(singletons);
-        for(const auto &b:links.blocks)if(b.end-b.begin==1) {
-            const auto &parent=links.parents[b.begin];
+        std::partial_sum(staged_offsets.begin(),staged_offsets.end(),staged_offsets.begin());
+        const size_t staged=staged_offsets.back();
+        const size_t directories=checked_add(index_bytes,index_bytes);
+        size_t staging_bytes=checked_add(directories,mixed_bytes);
+        if(staged>memory_left(budget,staging_bytes,"N−2 folded pair staging index")/sizeof(FoldedPair))
+            throw BudgetError("N−2 folded pair staging exceeds --max-mem");
+        staging_bytes+=staged*sizeof(FoldedPair);
+        auto ends=staged_offsets;
+        std::vector<FoldedPair> terms(staged);
+        account(staging_bytes);
+        if(staged)for(size_t i=0;i<links.block_count();++i) {
+            const auto block=links.block_at(i);
+            if(block.end-block.begin!=1)continue;
+            const auto &parent=links.parents[block.begin];
+            if(reuse(parent.group))continue;
             const auto c=parent.channel;
             const double scale=topology_->pair_integrals[topology_->pair_rows[c]+topology_->pair_columns[c]];
-            terms[ends[parent.group]++]={parent.matrix,links.families[b.family].weight*scale};
+            terms[ends[parent.group]++]={parent.matrix,links.families[block.family].weight*scale};
         }
         workers_.run(groups,[&](size_t g,size_t) {
-            auto first=terms.begin()+offsets[g],last=terms.begin()+offsets[g+1],next=first;
+            if(reuse(g) || staged_offsets[g]==staged_offsets[g+1])return;
+            auto first=terms.begin()+staged_offsets[g],last=terms.begin()+staged_offsets[g+1],next=first;
             std::sort(first,last,[](const auto &a,const auto &b){return a.matrix<b.matrix;});
             for(auto it=first;it!=last;) {
                 auto term=*it++;
@@ -243,21 +269,37 @@ class Auxiliary {
             }
             ends[g]=next-terms.begin();
         },16);
-        auto &folded=topology_->folded_pairs;
-        size_t count=0;
-        for(size_t g=0;g<groups;++g)count+=ends[g]-offsets[g];
-        folded.reserve(count);
+        const auto size=[&](size_t g) {
+            return reuse(g) ? previous->folded_offsets[g+1]-previous->folded_offsets[g] : ends[g]-staged_offsets[g];
+        };
+        size_t count=0,reused_groups=0;
         for(size_t g=0;g<groups;++g) {
-            const auto first=offsets[g];
-            offsets[g]=folded.size();
-            folded.insert(folded.end(),terms.begin()+first,terms.begin()+ends[g]);
+            count=checked_add(count,size(g));
+            reused_groups+=reuse(g);
         }
-        offsets.back()=folded.size();
+        phase="removal_retry_fold_result";
+        const size_t available=memory_left(budget,staging_bytes,"N−2 folded pair staging");
+        if(count>memory_left(available,index_bytes,"N−2 folded pair result index")/sizeof(FoldedPair))
+            throw BudgetError("N−2 folded pair result exceeds --max-mem");
+        auto &offsets=topology_->folded_offsets;
+        offsets.resize(groups+1);
+        for(size_t g=0;g<groups;++g)offsets[g+1]=offsets[g]+size(g);
+        auto &folded=topology_->folded_pairs;
+        folded.resize(count);
+        workers_.run(groups,[&](size_t g,size_t) {
+            const size_t n=offsets[g+1]-offsets[g];
+            if(!n)return;
+            const FoldedPair *source=reuse(g) ? previous->folded_pairs.data()+previous->folded_offsets[g]
+                : terms.data()+staged_offsets[g];
+            std::copy_n(source,n,folded.data()+offsets[g]);
+        },32);
         const size_t bytes=offsets.capacity()*sizeof(size_t)+mixed_pairs.capacity()*sizeof(unsigned)+
             folded.capacity()*sizeof(FoldedPair);
-        topology_->build_bytes=std::max(topology_->build_bytes,topology_->metadata_bytes+bytes+
-            ends.capacity()*sizeof(size_t)+terms.capacity()*sizeof(FoldedPair));
+        account(bytes+staged_offsets.capacity()*sizeof(size_t)+ends.capacity()*sizeof(size_t)+
+            terms.capacity()*sizeof(FoldedPair));
         topology_->metadata_bytes+=bytes;
+        removal_detail_["folded_reused_groups"]=reused_groups;
+        removal_detail_["folded_staged_terms"]=staged;
     }
     template<size_t Columns=0>
     void forward_block(const RemovalLinks &links,const RemovalLinks::Block &block,
@@ -308,7 +350,7 @@ class Auxiliary {
             for(size_t a=block.begin;a<block.end;++a) {
                 const auto &pa=links.parents[a];
                 double *target=u+links.offsets[a]*cols;
-                one_channels(block,one_irrep(pa),[&](size_t r) {
+                one_channels(block,b,one_irrep(pa),[&](size_t r) {
                     const auto &pr=links.parents[block.begin+r];
                     const double value=h_[pa.channel*p_.k+pr.channel];
                     const double *source=t+links.offsets[block.begin+r]*cols;
@@ -374,7 +416,7 @@ class Auxiliary {
             const auto *parents=links.parents.data()+block.begin;
             double *block_values=values.data()+offsets[b];
             for(size_t i=0;i<count;++i)
-                one_channels(block,one_irrep(parents[i]),[&](size_t j) {
+                one_channels(block,b,one_irrep(parents[i]),[&](size_t j) {
                     *block_values++=local_integral(block.config,parents[i].channel,parents[j].channel);
                 });
         },32);
@@ -383,7 +425,7 @@ class Auxiliary {
     // Contract one destination residue family. Source blocks are either
     // borrowed from the global forward array or regenerated on demand.
     template<size_t Columns,class Read>
-    void nminus1_destination(size_t a,size_t f,const RemovalLinks::Block &left,
+    void nminus1_destination(size_t a,size_t f,size_t index,const RemovalLinks::Block &left,
                              size_t cols,Read read,double *result,std::vector<double> &transformed) {
         if constexpr(Columns)cols=Columns;
         const auto &links=*topology_->one;
@@ -394,15 +436,15 @@ class Auxiliary {
         const auto *left_parents=links.parents.data()+left.begin;
         const auto &bank=*topology_->family_banks[f];
         const auto one_code=[&](const RemovalLinks::Parent &parent){return one_irrep(parent);};
-        const auto left_mask=mixed_irreps_ ? topology_->one_sectors.mask(links,left,one_code) : 0;
+        const auto left_mask=mixed_irreps_ ? topology_->one_sectors.mask(links,left,index,one_code) : 0;
         const size_t width=left.dim*cols,left_count=left.end-left.begin;
         std::fill_n(result,left_count*width,0.);
         const double *local=read(left);
         const double *local_values=topology_->local_integrals.empty() ? nullptr
-            : topology_->local_integrals.data()+topology_->local_offsets[&left-links.blocks.data()];
+            : topology_->local_integrals.data()+topology_->local_offsets[index];
         for(size_t i=0;i<left_count;++i) {
             double *target=result+i*width;
-            one_channels(left,one_irrep(left_parents[i]),[&](size_t j) {
+            one_channels(left,index,one_irrep(left_parents[i]),[&](size_t j) {
                 const double value=local_values ? *local_values++
                     : local_integral(left.config,left_parents[i].channel,left_parents[j].channel);
                 const double *source=local+j*width;
@@ -431,7 +473,7 @@ class Auxiliary {
                 if(mixed_irreps_) {
                     const auto change=p_.native->symmetry().transfer(q,s);
                     for(unsigned g=0;g<OrbitalSymmetry::extent;++g)if(left_mask&(1u<<g))
-                        one_channels(right,g^change,[&](size_t j) {
+                        one_channels(right,bi,g^change,[&](size_t j) {
                             const int r=right_parents[j].channel;
                             const double *channel=source+j*right.dim*cols;
                             transformed.assign(width,0.);
@@ -439,7 +481,7 @@ class Auxiliary {
                                 for(size_t m=matrix.ptr[row];m<matrix.ptr[row+1];++m)
                                     for(size_t v=0;v<cols;++v)
                                         transformed[row*cols+v]+=matrix.data[m]*channel[matrix.indices[m]*cols+v];
-                            one_channels(left,g,[&](size_t i) {
+                            one_channels(left,index,g,[&](size_t i) {
                                 const double scale=.5*eri(left_parents[i].channel,q,r,s);
                                 double *target=result+i*width;
                                 for(size_t v=0;v<cols*left.dim;++v)target[v]+=scale*transformed[v];
@@ -522,12 +564,12 @@ class Auxiliary {
             const auto &block=links.blocks[b];
             auto read=[&](const RemovalLinks::Block &source) {return t+links.offset(source)*cols;};
             double *out=u+links.offset(block)*cols;
-            if(cols==1)nminus1_destination<1>(block.config,block.family,block,cols,read,out,temporary_[worker]);
-            else nminus1_destination<0>(block.config,block.family,block,cols,read,out,temporary_[worker]);
+            if(cols==1)nminus1_destination<1>(block.config,block.family,b,block,cols,read,out,temporary_[worker]);
+            else nminus1_destination<0>(block.config,block.family,b,block,cols,read,out,temporary_[worker]);
         },32);
     }
     template<size_t Width>
-    void pair_contract(const RemovalLinks::Block &block,size_t width,const double *t,double *target) const {
+    void pair_contract(const RemovalLinks::Block &block,size_t index,size_t width,const double *t,double *target) const {
         if constexpr(Width)width=Width;
         const size_t count=block.end-block.begin;
         const auto *parents=topology_->two->parents.data()+block.begin;
@@ -542,22 +584,22 @@ class Auxiliary {
                 for(size_t i=0;i<width;++i)target[a*width+i]+=value*t[c*width+i];
             };
             if(mixed_irreps_)
-                topology_->two_sectors.visit(*topology_->two,block,two_irrep(parents[a]),
+                topology_->two_sectors.visit(*topology_->two,block,index,two_irrep(parents[a]),
                     [&](const auto &parent){return two_irrep(parent);},contract);
             else for(size_t c=0;c<count;++c)contract(c);
         }
     }
-    void pair_middle(const RemovalLinks::Block &block,size_t width,const double *t,
+    void pair_middle(const RemovalLinks::Block &block,size_t index,size_t width,const double *t,
                      double *target) {
         const size_t count=block.end-block.begin;
         std::fill_n(target,count*width,0.);
         switch(width) {
-            case 1: return pair_contract<1>(block,width,t,target);
-            case 2: return pair_contract<2>(block,width,t,target);
-            case 3: return pair_contract<3>(block,width,t,target);
-            case 5: return pair_contract<5>(block,width,t,target);
-            case 9: return pair_contract<9>(block,width,t,target);
-            default: return pair_contract<0>(block,width,t,target);
+            case 1: return pair_contract<1>(block,index,width,t,target);
+            case 2: return pair_contract<2>(block,index,width,t,target);
+            case 3: return pair_contract<3>(block,index,width,t,target);
+            case 5: return pair_contract<5>(block,index,width,t,target);
+            case 9: return pair_contract<9>(block,index,width,t,target);
+            default: return pair_contract<0>(block,index,width,t,target);
         }
     }
     void pair_forward_middle(const double *input,size_t cols,double *u) {
@@ -567,7 +609,7 @@ class Auxiliary {
             auto &t=temporary_[worker];
             if(t.size()<block_size)t.resize(block_size);
             forward_block(*topology_->two,block,input,cols,t.data());
-            pair_middle(block,width,t.data(),u+topology_->two->offset(block)*cols);
+            pair_middle(block,b,width,t.data(),u+topology_->two->offset(block)*cols);
         },4);
     }
     template<size_t Columns=0>
@@ -684,7 +726,7 @@ class Auxiliary {
             auto &t=temporary_[worker],&u=mixed_[worker];
             auto process=[&](const RemovalLinks &links,bool pair,std::atomic<size_t> &next) {
                 const bool compact=pair && folded;
-                const size_t limit=compact ? topology_->mixed_pairs.size() : links.blocks.size();
+                const size_t limit=compact ? topology_->mixed_pairs.size() : links.block_count();
                 // Claim contiguous chunks so faster workers can take more
                 // blocks while keeping the schedule reads sequential.
                 constexpr size_t chunk=128;
@@ -692,7 +734,8 @@ class Auxiliary {
                 for(size_t first=reduce ? claim() : 0;first<limit;
                     first=reduce ? claim() : first+chunk) {
                     for(size_t b=first;b<std::min(first+chunk,limit);++b) {
-                        const auto &block=links.blocks[compact ? topology_->mixed_pairs[b] : b];
+                        const size_t index=compact ? topology_->mixed_pairs[b] : b;
+                        const auto block=links.block_at(index);
                         size_t width=block.dim*cols,count=block.end-block.begin;
                         if constexpr(Columns==1)
                             if(pair && count==1 && !topology_->pair_integrals.empty() &&
@@ -700,12 +743,12 @@ class Auxiliary {
                         if(t.size()<count*width)t.resize(count*width);
                         if(u.size()<count*width)u.resize(count*width);
                         forward_block<Columns>(links,block,input,cols,t.data());
-                        if(pair)pair_middle(block,width,t.data(),u.data());
+                        if(pair)pair_middle(block,index,width,t.data(),u.data());
                         else {
                             std::fill_n(u.data(),count*width,0.);
                             for(size_t a=0;a<count;++a) {
                                 const auto &parent=links.parents[block.begin+a];
-                                one_channels(block,one_irrep(parent),[&](size_t r) {
+                                one_channels(block,index,one_irrep(parent),[&](size_t r) {
                                     const int q=links.parents[block.begin+r].channel;
                                     const double value=h_[parent.channel*p_.k+q];
                                     for(size_t i=0;i<width;++i)u[a*width+i]+=value*t[r*width+i];
@@ -754,7 +797,9 @@ public:
             p.native->symmetry().nontrivial();
         const bool incremental=before && added<=before/2 &&
             (p.k<=64 || (keep_double_keys && !previous->topology_->two->double_keys.empty()));
+        const char *phase="removal_retry_coefficients";
         auto construct=[&](bool use_delta,bool retain_double_keys) {
+            phase="removal_retry_coefficients";
             topology_=std::make_shared<Topology>(p,budget);
             if(before) {
                 topology_->bank.copy_classes(previous->topology_->bank);
@@ -763,33 +808,39 @@ public:
             auto collect=[&](const RemovalLinks &schedule) {
                 for(const auto &[name,value]:schedule.construction)removal_detail_[name]+=value;
             };
-            auto links=[&](int rank,size_t allowance) -> std::unique_ptr<RemovalLinks> {
+            size_t links_peak=0;
+            auto links=[&](int rank,size_t allowance,std::atomic<bool> *dirty=nullptr) -> std::unique_ptr<RemovalLinks> {
                 auto start=Clock::now();
+                phase=rank==1 ? "removal_retry_one_removal" : "removal_retry_two_removal";
                 const bool parallel_postings=mode_==1 && private_output_;
                 if(!use_delta) {
                     auto next=std::make_unique<RemovalLinks>(p_,topology_->bank,rank,allowance,mode_==0,
                         !private_output_,0,&workers_,parallel_postings,before,retain_double_keys);
                     removal_enumerate_ns_+=ns(start);
                     collect(*next);
+                    links_peak=checked_add(next->bytes(),next->compact_builder_bytes);
                     return next;
                 }
                 const auto &old=*previous->topology_;
+                const size_t coefficients=topology_->bank.bytes();
                 RemovalLinks delta(p_,topology_->bank,rank,allowance,false,false,before,&workers_,parallel_postings,
                                    0,retain_double_keys);
                 removal_enumerate_ns_+=ns(start);
                 collect(delta);
                 start=Clock::now();
+                phase=rank==1 ? "removal_retry_one_merge" : "removal_retry_two_merge";
+                allowance=memory_left(allowance,topology_->bank.bytes()-coefficients,"appended removal classes");
                 auto next=std::make_unique<RemovalLinks>(rank==1 ? *old.one : *old.two,delta,
-                    p_.groups.size(),allowance,!private_output_,rank==1 ? nullptr : &old.orbital_pairs,2*p_.k,workers_);
+                    p_.groups.size(),allowance,!private_output_,rank==1 ? nullptr : &old.orbital_pairs,2*p_.k,workers_,dirty);
                 removal_merge_ns_+=ns(start);
-                next->compact_builder_bytes=std::max(next->compact_builder_bytes,
+                links_peak=std::max(checked_add(next->bytes(),next->compact_builder_bytes),
                     checked_add(delta.bytes(),delta.compact_builder_bytes));
                 return next;
             };
             topology_->one=links(1,memory_left(budget,topology_->bank.bytes(),"removal coefficients"));
             size_t metadata=memory_left(budget,topology_->bank.bytes(),"removal coefficients");
             topology_->metadata_bytes=topology_->one->bytes();
-            topology_->build_bytes=topology_->metadata_bytes+topology_->one->compact_builder_bytes;
+            topology_->build_bytes=links_peak;
             topology_->one_configs=topology_->one->residue_count;
             if(mode_==0) {
                 std::vector<Residues::Record>().swap(topology_->one->residues->records);
@@ -851,12 +902,22 @@ public:
             } else {
                 topology_->one->residues.reset();
                 topology_->metadata_bytes=topology_->one->bytes();
-                topology_->two=links(2,memory_left(metadata,topology_->metadata_bytes,"N−2 one-removal schedule"));
-                metadata=memory_left(budget,topology_->bank.bytes(),"removal coefficients");
-                topology_->build_bytes=std::max(topology_->build_bytes,topology_->metadata_bytes+topology_->two->bytes()+topology_->two->compact_builder_bytes);
+                const auto *old_fold=use_delta && !previous->topology_->folded_offsets.empty() ? previous->topology_.get() : nullptr;
+                const size_t dirty_bytes=old_fold ? before*sizeof(std::atomic<bool>) : 0;
+                phase="removal_retry_fold_tracking";
+                auto two_budget=memory_left(metadata,checked_add(topology_->metadata_bytes,dirty_bytes),"N−2 two-removal schedule");
+                std::unique_ptr<std::atomic<bool>[]> dirty;
+                if(old_fold) {
+                    dirty.reset(new std::atomic<bool>[before]);
+                    for(size_t g=0;g<before;++g)dirty[g].store(false,std::memory_order_relaxed);
+                }
+                topology_->two=links(2,two_budget,dirty.get());
+                metadata=memory_left(budget,checked_add(topology_->bank.bytes(),dirty_bytes),"removal coefficients and fold tracking");
+                topology_->build_bytes=std::max(topology_->build_bytes,topology_->metadata_bytes+links_peak+dirty_bytes);
                 topology_->two_configs=topology_->two->residue_count;
                 topology_->two->residues.reset();
                 topology_->metadata_bytes+=topology_->two->bytes();
+                phase="removal_retry_one_sectors";
                 memory_left(metadata,topology_->metadata_bytes,"N−2 removal schedules");
                 if(mixed_irreps_) {
                     topology_->one_sectors.build(*topology_->one,[&](const auto &parent){return one_irrep(parent);},
@@ -867,11 +928,12 @@ public:
                 // Only parent channels enter either end of the pair contraction.
                 // Compact their orbital-pair directory before constructing the
                 // integral table (important for sparse, wide orbital sets).
+                phase="removal_retry_pair_channels";
                 auto start=Clock::now();
                 size_t modes=2*size_t(p_.k),all_pairs=modes*(modes-1)/2;
                 if(all_pairs>(metadata-topology_->metadata_bytes)/sizeof(size_t))
                     throw BudgetError("pair channel directory exceeds metadata budget");
-                topology_->build_bytes=std::max(topology_->build_bytes,topology_->metadata_bytes+all_pairs*sizeof(size_t));
+                topology_->build_bytes=std::max(topology_->build_bytes,topology_->metadata_bytes+all_pairs*sizeof(size_t)+dirty_bytes);
                 std::vector<size_t> channel_ids(all_pairs,none);
                 for(auto &parent:topology_->two->parents)channel_ids[parent.channel]=0;
                 size_t channel=0;
@@ -895,33 +957,42 @@ public:
                 std::vector<size_t>().swap(channel_ids);
                 pair_channels_ns_=ns(start);
                 start=Clock::now();
+                phase="removal_retry_pair_integrals";
                 prepare_pair_integrals(metadata-topology_->metadata_bytes);
                 pair_integrals_ns_=ns(start);
                 topology_->metadata_bytes+=topology_->pair_integrals.capacity()*8
                     +(topology_->pair_rows.capacity()+topology_->pair_columns.capacity())*sizeof(size_t)
                     +topology_->pair_irreps.capacity();
                 if(mixed_irreps_) {
+                    phase="removal_retry_two_sectors";
                     topology_->two_sectors.build(*topology_->two,[&](const auto &parent){return two_irrep(parent);},
                         metadata-topology_->metadata_bytes);
                     topology_->metadata_bytes+=topology_->two_sectors.bytes();
                 }
                 if(private_output_) {
                     start=Clock::now();
-                    fold_single_parent_pairs(metadata-topology_->metadata_bytes);
+                    fold_single_parent_pairs(metadata-topology_->metadata_bytes,old_fold,dirty.get(),dirty_bytes,phase);
                     folded_setup_ns_+=ns(start);
                 }
             }
         };
+        const auto attempt=Clock::now();
         try {
             construct(incremental,keep_double_keys);
             if(incremental)incremental_groups_=added;
         } catch(const BudgetError &) {
             if(!incremental && !keep_double_keys)throw;
+            const size_t retry_ns=ns(attempt);
+            const char *retry_phase=phase;
+            const size_t failed_peak=topology_ ? topology_->build_bytes : 0;
             topology_.reset();
             removal_detail_.clear();
             removal_enumerate_ns_=removal_merge_ns_=folded_setup_ns_=0;
             pair_channels_ns_=pair_integrals_ns_=0;
             construct(false,false);
+            topology_->build_bytes=std::max(topology_->build_bytes,failed_peak);
+            removal_detail_[retry_phase]=1;
+            removal_detail_["removal_retry_ns"]=retry_ns;
         }
         overlap_bytes_=previous ? checked_add(previous->topology_->metadata_bytes,topology_->build_bytes) :
             topology_->build_bytes;
@@ -971,7 +1042,7 @@ public:
             {"reused_removal_classes",reused_classes_},
             {"singlet_magnetic_reduction",p_.s==0},
             {"removal_classes",topology_->bank.matrices.size()},{"one_auxiliary_configurations",topology_->one_configs},
-            {"one_auxiliary_blocks",topology_->one->blocks.size()},{"one_parent_channels",topology_->one->parents.size()},
+            {"one_auxiliary_blocks",topology_->one->block_count()},{"one_parent_channels",topology_->one->parents.size()},
             {"one_weighted_links",topology_->one->weighted_links},{"one_intermediate_entries",topology_->one->entries},
             {"product_array_bytes_per_rhs",entries()*8},{"pair_integral_bytes",topology_->pair_integrals.capacity()*8},
             {"private_residue_output",private_output_}};
@@ -986,7 +1057,7 @@ public:
         if(topology_->two) {
             s["pair_channels_ns"]=pair_channels_ns_;
             s["pair_integrals_ns"]=pair_integrals_ns_;
-            s["two_auxiliary_configurations"]=topology_->two_configs;s["two_auxiliary_blocks"]=topology_->two->blocks.size();
+            s["two_auxiliary_configurations"]=topology_->two_configs;s["two_auxiliary_blocks"]=topology_->two->block_count();
             s["two_parent_channels"]=topology_->two->parents.size();s["two_weighted_links"]=topology_->two->weighted_links;s["two_intermediate_entries"]=topology_->two->entries;
             s["folded_pair_terms"]=topology_->folded_pairs.size();
             s["mixed_pair_blocks"]=topology_->mixed_pairs.size();
