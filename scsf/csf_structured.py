@@ -1,4 +1,5 @@
 """Exact structured CSF products with explicit operator-link factorizations."""
+from dataclasses import dataclass
 import os
 from threading import RLock
 from time import perf_counter
@@ -7,6 +8,21 @@ from .csf import csf_wfn, _integer, _limit
 from .config import get_num_threads
 from .integrals import BlockPackedHamiltonian, Hamiltonian, PackedHamiltonian
 from .rdm import BlockRDM2
+
+
+@dataclass(frozen=True)
+class ENPT2Result:
+    """State-specific energy corrections and denominator diagnostics in hartree."""
+
+    variational_energies: np.ndarray
+    corrections: np.ndarray
+    corrected_energies: np.ndarray
+    minimum_abs_denominators: np.ndarray
+    positive_denominator_counts: np.ndarray
+    contributing_csfs: np.ndarray
+    eps: float
+    denominator_tol: float
+    stats: dict
 
 
 class csf_structured_op:
@@ -182,6 +198,51 @@ class csf_structured_op:
 
     def native_matmat(self, x):
         return self._matmat(x, canonical=True)
+
+    def _enpt2(self, energies, coefficients, eps, denominator_tol, screening, *, canonical):
+        if np.iscomplexobj(coefficients) or np.iscomplexobj(energies):
+            raise TypeError('ENPT2 requires real energies and coefficients')
+        if screening not in ('strict', 'block'):
+            raise ValueError("ENPT2 screening must be 'strict' or 'block'")
+        energies = np.asarray(energies, dtype=float, order='C')
+        coefficients = np.asarray(coefficients, dtype=float, order='C')
+        if energies.ndim == 0:
+            energies = energies.reshape(1)
+        if coefficients.ndim == 1:
+            coefficients = coefficients[:, None]
+        eps, denominator_tol = float(eps), float(denominator_tol)
+        with self._growth_lock:
+            if self._settings != self._config():
+                raise ValueError('rebuild the operator to change structured settings')
+            basis, native, rows = self._state
+            if (energies.ndim != 1 or not energies.size or
+                    coefficients.shape != (len(basis), energies.size)):
+                raise ValueError('expected one energy per coefficient column and one row per CSF')
+            if not canonical and rows.size:
+                permuted = np.empty_like(coefficients)
+                permuted[rows] = coefficients
+                coefficients = permuted
+            corrections, minimum, positive, counts, stats = native.enpt2(
+                energies, coefficients, self.ecore, eps, denominator_tol, screening == 'block')
+        return ENPT2Result(energies.copy(), corrections, energies+corrections, minimum,
+                           positive, counts, eps, denominator_tol, dict(stats))
+
+    def enpt2(self, energies, coefficients, *, eps=0., denominator_tol=1e-10, screening='block'):
+        """Compute deterministic ENPT2 from normalized Ritz vectors in public CSF order.
+
+        Pass total variational energies including ecore. Coefficients can be a
+        vector or a block with one root per column. The independent heat-bath
+        cutoff admits occupation pairs and includes all their signed
+        contributions by default. With strict screening it applies to each
+        signed CSF-pair contribution.
+        A contributing denominator within denominator_tol raises ValueError.
+        A root with no contributing external CSFs has an infinite minimum.
+        """
+        return self._enpt2(energies, coefficients, eps, denominator_tol, screening, canonical=False)
+
+    def native_enpt2(self, energies, coefficients, *, eps=0., denominator_tol=1e-10, screening='block'):
+        """Compute ENPT2 with coefficient rows in native occupation-block order."""
+        return self._enpt2(energies, coefficients, eps, denominator_tol, screening, canonical=True)
 
     def select_hci(self, weights, eps, *, selection_unit='csf', stop_growth_fraction=0.):
         """Grow with strict HCI using absolute native-row weights.

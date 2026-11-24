@@ -1,6 +1,7 @@
 /* SCSF; GPL-3.0-or-later. Shared exact operator-link infrastructure. */
 #pragma once
 #include "structured_spin.h"
+#include "structured_eri.h"
 #include "parallel.h"
 #include "pair_descriptor.h"
 #include "basis.h"
@@ -50,6 +51,24 @@ public:
         team_.apply_workers(active ? active : count_,std::move(callback));
     }
 };
+
+inline std::vector<double> coulomb_exchange_tables(const SpatialERI &eri,Workers &workers) {
+    const size_t k=eri.k,kk=k*k;
+    std::vector<double> tables(2*kk);
+    workers.run(k,[&](size_t p,size_t) {
+        const bool packed=eri.format!=ERIFormat::dense;
+        for(size_t r=0;r<(packed ? p+1 : k);++r) {
+            const double coulomb=eri(p,p,r,r),exchange=eri(p,r,p,r);
+            tables[p*k+r]=coulomb;
+            tables[kk+p*k+r]=exchange;
+            if(packed && p!=r) {
+                tables[r*k+p]=coulomb;
+                tables[kk+r*k+p]=exchange;
+            }
+        }
+    });
+    return tables;
+}
 
 struct Primary {
     struct Group {

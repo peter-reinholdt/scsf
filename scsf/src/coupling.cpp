@@ -145,8 +145,10 @@ bool HCITransferBounds::prepare_ordered_singles(int k,int nelec,size_t limit) {
         const size_t entries=single_rows(k)-k;
         if(!entries)return;
         const size_t offset_bytes=symmetry_.nontrivial() ? (size_t(k)+1)*sizeof(size_t) : 0;
+        const size_t scratch_bytes=size_t(k)*sizeof(double);
+        const size_t overhead=offset_bytes+scratch_bytes;
         const size_t available=memory_left(limit,bytes(),"HCI transfer bounds");
-        if(offset_bytes>available || entries>(available-offset_bytes)/sizeof(BoundedTransfer)) {
+        if(overhead>available || entries>(available-overhead)/sizeof(BoundedTransfer)) {
             if(optional_tables())return;
             throw BudgetError("ordered HCI single transfers exceed --max-mem");
         }
@@ -154,14 +156,14 @@ bool HCITransferBounds::prepare_ordered_singles(int k,int nelec,size_t limit) {
             // For wide bases, the single-transfer tables are optional. Leave
             // room for the ordered index and preserve the direct bound when
             // the tables do not fit.
-            const size_t bytes=available-offset_bytes-entries*sizeof(BoundedTransfer);
+            const size_t bytes=available-overhead-entries*sizeof(BoundedTransfer);
             const size_t index_bytes=symmetry_.nontrivial() ? size_t(k)*sizeof(size_t) : 0;
             if(index_bytes>bytes || single_rows(k)>(bytes-index_bytes)/sizeof(double)/(size_t(k)+1))
                 return;
             prepare_single_bounds(k);
         }
         const size_t remaining=memory_left(limit,bytes(),"HCI transfer bounds");
-        memory_left(remaining,entries*sizeof(BoundedTransfer)+offset_bytes,"ordered HCI single transfers");
+        memory_left(remaining,entries*sizeof(BoundedTransfer)+overhead,"ordered HCI single transfers");
         std::vector<BoundedTransfer> ordered;
         std::vector<size_t> offsets(symmetry_.nontrivial() ? size_t(k)+1 : 0);
         ordered.reserve(entries);
@@ -188,7 +190,7 @@ bool HCITransferBounds::prepare_ordered_singles(int k,int nelec,size_t limit) {
             });
         }
         if(!offsets.empty())offsets.back()=ordered.size();
-        memory_left(remaining,ordered.capacity()*sizeof(BoundedTransfer)+offsets.capacity()*sizeof(size_t),
+        memory_left(remaining,ordered.capacity()*sizeof(BoundedTransfer)+offsets.capacity()*sizeof(size_t)+scratch_bytes,
                     "ordered HCI single transfers");
         ordered_singles_.swap(ordered);
         ordered_single_offsets_.swap(offsets);
@@ -334,7 +336,12 @@ Connection guga_diagonal_connection(const Config &cfg,const double *h,const doub
     return result;
 }
 
-static void ranked_dense_connection(const PairDescriptor &pair,const double *h,const double *v,
+void guga_diagonal_connection(const Config &cfg,const double *h,const double *coulomb_exchange,Connection &result) {
+    fill_guga_connection<true,true>(PairDescriptor(cfg,cfg),h,coulomb_exchange,false,result);
+}
+
+template<class ERI>
+static void ranked_spatial_connection(const PairDescriptor &pair,const double *h,const ERI &v,
                                     bool compute_bounds,Connection &result) {
     if (!pair.connected()) { result=Connection{};return; }
     if (pair.transfer_rank!=2 || compute_bounds) {
@@ -362,11 +369,10 @@ static void ranked_dense_connection(const PairDescriptor &pair,const double *h,c
 void ranked_connection(const PairDescriptor &pair,const double *h,const structured::SpatialERI &v,
                        bool compute_bounds,Connection &result) {
     if(v.format==structured::ERIFormat::dense) {
-        ranked_dense_connection(pair,h,v.data,compute_bounds,result);
+        ranked_spatial_connection(pair,h,v.data,compute_bounds,result);
         return;
     }
-    if(!pair.connected()) {result=Connection{};return;}
-    fill_guga_connection<true>(pair,h,v,compute_bounds,result);
+    ranked_spatial_connection(pair,h,v,compute_bounds,result);
 }
 
 } // namespace scsf

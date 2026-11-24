@@ -188,20 +188,27 @@ class OneBank {
     }
 public:
     static constexpr int mask_electron_limit=60;
-    OneBank(int n,int spin,size_t maximum,bool norms=false):n_(n),side_(n+3),spin_(spin),maximum_(maximum),
+    OneBank(int n,int spin,size_t maximum,bool norms=false,bool truncated=false,int compact_input_open=-1)
+        :n_(n),side_(n+3),spin_(spin),maximum_(maximum),
         tables_(directory_count(n,maximum)) {
         bytes_=tables_.capacity()*sizeof(tables_[0]);
         if(bytes_>maximum_)throw BudgetError("one-electron matrix directory exceeds coefficient budget");
-        for(int m=spin;m<=n;m+=2)for(int type=0;type<4;++type) {
-            if(type!=0 && m+2>n && type!=2)continue;
+        const int input_open=compact_input_open<0 ? n : std::min(n,compact_input_open);
+        for(int m=spin;m<=input_open;m+=2)for(int type=0;type<4;++type) {
+            // A bank capped by open shells can still have a doubly occupied
+            // orbital in its highest class. A closed-to-open move preserves m.
+            if(m+2>n && (type==3 || (type==1 && !truncated)))continue;
             int length=m+(type==2 ? 0 : type==3 ? 2 : 1);
             for(int p=0;p<length;++p)for(int q=0;q<length;++q)if(p!=q) {
                 Config ket(length,1);ket[p]=(type==0 || type==3) ? 0 : 1;ket[q]=(type==1 || type==3) ? 2 : 1;
                 if(std::count(ket.begin(),ket.end(),1)!=m)continue;
                 auto matrix=std::make_unique<Matrix>(one_body(ket,p,q,spin_,maximum_/8));
                 if(norms)matrix->make_squared_columns();
-                if(matrix->bytes()>maximum_-bytes_)throw BudgetError("one-electron matrices exceed coefficient budget");
-                bytes_+=matrix->bytes();tables_[address(m,type,p,q)]=std::move(matrix);
+                // ENPT2 uses row-sparse products except for its smallest factors.
+                if(compact_input_open>=0 && matrix->cols>4)std::vector<double>().swap(matrix->values);
+                const size_t bytes=matrix->bytes()+(compact_input_open>=0 ? sizeof(Matrix) : 0);
+                if(bytes>maximum_-bytes_)throw BudgetError("one-electron matrices exceed coefficient budget");
+                bytes_+=bytes;tables_[address(m,type,p,q)]=std::move(matrix);
             }
         }
     }

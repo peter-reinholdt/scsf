@@ -42,8 +42,9 @@ void HCITransferBounds::prepare_transfer_bounds(int k,size_t limit) {
         constexpr size_t max_entries = 1000000;
         if (k < 2) return;
         if(k<=64 && single_bounds_.empty()) {
-            memory_left(limit,single_rows(k)*(k+1)*sizeof(double)
-                +(symmetry_.nontrivial() ? size_t(k)*sizeof(size_t) : 0),"HCI single transfer bounds");
+            const size_t single_bytes=single_rows(k)*(k+1)*sizeof(double)
+                +(symmetry_.nontrivial() ? size_t(k)*sizeof(size_t) : 0);
+            memory_left(memory_left(limit,bytes(),"retained HCI tables"),single_bytes,"HCI single transfer bounds");
             prepare_single_bounds(k);
         }
         if(optional_tables())return;

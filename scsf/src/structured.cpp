@@ -5,6 +5,7 @@
 #include "cih_wide.h"
 #include "rdm.h"
 #include "selection.h"
+#include "enpt2.h"
 #include "shared_generator.h"
 #include <tuple>
 #include <pybind11/stl.h>
@@ -274,6 +275,57 @@ public:
         std::copy(remap.begin(),remap.end(),indices.mutable_data());
         return pybind11::make_tuple(next,indices,stats);
     }
+    pybind11::tuple enpt2(const Array &energies,const Array &coefficients,double offset,double eps,double tolerance,
+                         bool block_screening) {
+        if(energies.ndim()!=1 || energies.size()==0 || coefficients.ndim()!=2 ||
+           size_t(coefficients.shape(0))!=primary_.size() || coefficients.shape(1)!=energies.size() ||
+           !std::isfinite(eps) || eps<0. || !std::isfinite(tolerance) || tolerance<0.)
+            throw std::invalid_argument("invalid ENPT2 eigenpair shapes or thresholds");
+        for(size_t r=0;r<size_t(energies.size());++r)
+            if(!std::isfinite(energies.data()[r]-offset))throw std::invalid_argument("ENPT2 energies must be finite");
+        structured::ENPT2 result;
+        {
+            pybind11::gil_scoped_release release;
+            std::lock_guard<std::mutex> lock(mutex_);
+            drop_workspace();
+            if(ordered_hci_ && eps>0. && !bounds_)
+                bounds_=std::make_shared<HCITransferBounds>(one_,two_,integrals_,primary_.native->symmetry());
+            const auto current=kernel_info();
+            const auto storage=checked_add(checked_add(integral_index_bytes(),diagonal_.capacity()*sizeof(double)),
+                checked_add(current.at("metadata_bytes"),current.at("coefficient_bytes")));
+            const size_t staging=checked_add(coefficients.nbytes(),energies.nbytes());
+            auto run=[&](HCITransferBounds *table) {
+                const auto table_lock=table ? table->lock_tables() : std::unique_lock<std::recursive_mutex>();
+                const size_t retained=checked_add(storage,bound_bytes());
+                result=structured::enpt2(primary_,workers_,one_.data(),integrals_,coefficients.data(),energies.data(),
+                    energies.size(),offset,eps,tolerance,table,memory_left(memory_limit_,retained,"ENPT2 retained storage"),
+                    staging,block_screening);
+                const size_t peak=checked_add(retained,result.stats.at("workspace_bytes"));
+                record_peak(peak,"ENPT2 workspace");
+                result.stats["peak_tracked_memory_bytes"]=peak;
+                result.stats["minimum_tracked_memory_bytes"]=
+                    checked_add(retained,result.stats.at("minimum_workspace_bytes"));
+                result.stats["hci_table_bytes"]=bound_bytes();
+            };
+            try {
+                run(bounds_.get());
+            } catch(const BudgetError &) {
+                if(!bound_bytes())throw;
+                bounds_.reset();
+                run(nullptr);
+            }
+        }
+        Array corrections(energies.size()),minimum(energies.size());
+        pybind11::array_t<size_t> positive(energies.size()),contributing(energies.size());
+        for(size_t r=0;r<result.roots.size();++r) {
+            const auto &root=result.roots[r];
+            corrections.mutable_data()[r]=root.energy.total();
+            minimum.mutable_data()[r]=root.minimum;
+            positive.mutable_data()[r]=root.positive;
+            contributing.mutable_data()[r]=root.contributing;
+        }
+        return pybind11::make_tuple(corrections,minimum,positive,contributing,result.stats);
+    }
     pybind11::tuple generator_probe(const Array &x,size_t link_bytes,size_t workspace_bytes,
                                   size_t coefficient_bytes) const {
         if(x.ndim()!=1 || size_t(x.size())!=primary_.size())
@@ -377,23 +429,7 @@ public:
             pybind11::gil_scoped_release release;
             std::lock_guard<std::mutex> lock(mutex_);
             if(!diagonal_ready_) {
-                std::vector<double> coulomb_exchange;
-                {
-                    size_t k=primary_.k,kk=k*k;
-                    coulomb_exchange.resize(2*kk);
-                    workers_.run(k,[&](size_t p,size_t) {
-                        const bool packed=integrals_.format!=structured::ERIFormat::dense;
-                        for(size_t r=0;r<(packed ? p+1 : k);++r) {
-                            const double coulomb=integrals_(p,p,r,r),exchange=integrals_(p,r,p,r);
-                            coulomb_exchange[p*k+r]=coulomb;
-                            coulomb_exchange[kk+p*k+r]=exchange;
-                            if(packed && p!=r) {
-                                coulomb_exchange[r*k+p]=coulomb;
-                                coulomb_exchange[kk+r*k+p]=exchange;
-                            }
-                        }
-                    });
-                }
+                const auto coulomb_exchange=structured::coulomb_exchange_tables(integrals_,workers_);
                 diagonal_.resize(n,std::numeric_limits<double>::quiet_NaN());
                 workers_.run(primary_.groups.size(),[&](size_t g,size_t) {
                     const auto &group=primary_.groups[g];
@@ -502,6 +538,7 @@ void bind_structured(pybind11::module_ &m) {
            py::arg("block_packed")=false,py::arg("ordered_hci")=false)
         .def("select_hci",&StructuredHamiltonian::select_hci,pybind11::arg("weights"),
              pybind11::arg("eps"),pybind11::arg("complete"),pybind11::arg("stop_growth_fraction")=0.)
+        .def("enpt2",&StructuredHamiltonian::enpt2)
         .def("rdm1",&StructuredHamiltonian::rdm1)
         .def("rdm2",&StructuredHamiltonian::rdm2)
         .def("transition_rdm1",&StructuredHamiltonian::transition_rdm1)

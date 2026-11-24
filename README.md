@@ -82,6 +82,17 @@ final phase table by default. Use `--quiet` for summaries and the table, or
 `--sci-stats` for detailed counters. The energy driver also supports an exact
 leading-block preconditioner and Jacobi–Davidson corrections.
 
+Use `--enpt2` to compute a state-specific Epstein–Nesbet correction after
+the final Davidson solve. The default cutoff of zero includes every nonzero
+CSF coupling. At a positive `--enpt2-eps`, ENPT2 screens occupation pairs and
+includes all signed contributions within each admitted pair. Use
+`--enpt2-screening strict` to apply the cutoff to each CSF-pair contribution.
+Tighten the cutoff on the same reference to assess convergence. The driver reports the
+variational energy, correction, corrected total and denominator diagnostics
+for every root. `--enpt2-denominator-tol` controls the absolute denominator
+at or below which a nonzero external coupling raises an error. Its default
+is `1e-10` hartree.
+
 ## Python API
 
 ```python
@@ -102,6 +113,17 @@ y = op.matvec(np.ones(len(wfn)))
 `native_*` methods and the HCI selector use occupation-block order.
 The driver remaps the previous Davidson vectors when selected rows move.
 [HCI example](examples/hci.py).
+
+`op.enpt2(energies, coefficients)` uses submitted CSF order.
+`op.native_enpt2(energies, coefficients)` uses occupation-block order.
+Pass total variational energies including `ecore` and the matching signed,
+normalized Ritz vectors. Both methods accept keyword arguments `eps` and
+`denominator_tol` and return an `ENPT2Result` with one correction per root
+and native timing and memory statistics. The default `screening='block'`
+screens occupation pairs and sums all signed contributions within each
+admitted pair. Use `screening='strict'` for per-CSF screening. Compare cutoff sweeps when choosing an `eps` for block
+screening. ENPT2 uses the same `max_mem` budget as the operator and works
+within the supplied active orbital space.
 
 Use `op.native_rdm1(c)` and `op.native_rdm2(c)` for spin-summed density
 matrices. For transition densities, use `op.native_transition_rdm1(bra, ket)`
@@ -140,8 +162,6 @@ Use `scsf.save_hamiltonian` and `scsf.load_hamiltonian` for integral snapshots.
 Snapshots store `ecore`, `one`, optional `nelec`, and one ERI payload
 (`two`, `packed_eri`, or `block_packed_eri`). Labeled snapshots also
 store the subgroup and active orbital irreps.
-
-[Water growth and fixed-space timings](docs/scsf-v2-million-solves-2026-11-20.md).
 
 ## Development
 

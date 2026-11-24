@@ -105,6 +105,14 @@ def build_parser():
     selection = parser.add_argument_group('Selection and growth')
     products = parser.add_argument_group('Hamiltonian products')
     davidson = parser.add_argument_group('Davidson solver')
+    perturbation = parser.add_argument_group('Epstein–Nesbet perturbation theory')
+    perturbation.add_argument('--enpt2', action='store_true', help='compute ENPT2 after the final Davidson solve')
+    perturbation.add_argument('--enpt2-eps', type=float, default=0.,
+                              help='ENPT2 contribution cutoff in hartree (default: 0)')
+    perturbation.add_argument('--enpt2-screening', choices=('strict', 'block'), default='block',
+                              help='screen whole occupation pairs or individual CSF pairs (default: block)')
+    perturbation.add_argument('--enpt2-denominator-tol', type=float, default=1e-10,
+                              help='minimum absolute denominator guard in hartree (default: 1e-10)')
     source = space.add_mutually_exclusive_group(required=True)
     source.add_argument('--integrals')
     source.add_argument('--xyz')
@@ -161,6 +169,8 @@ def configure_driver(args, parser):
         parser.error('--stop-growth-fraction must be in [0, 1]')
     if min(args.davidson_block_size, args.davidson_jd_iterations) < 0:
         parser.error('Davidson block size and JD iterations must be nonnegative')
+    if any(not np.isfinite(value) or value < 0 for value in (args.enpt2_eps, args.enpt2_denominator_tol)):
+        parser.error('ENPT2 thresholds must be finite and nonnegative')
 
 
 def initial_space(args, parser, ham, nelec):
@@ -311,6 +321,8 @@ def print_timings(timing, wall):
         ('Diagonal reuse', timing['diagonal_reuse']),
         ('Selection bookkeeping and guess remap', timing['selection_overhead'] + timing['guess_remap']),
     ]
+    if 'enpt2' in timing:
+        rows.append(('Epstein–Nesbet PT2', timing['enpt2']))
     rows += [('Other driver overhead', max(0., wall-sum(seconds for _, seconds in rows))),
              ('Total', wall)]
     width = max(len(label) for label, _ in rows)
@@ -353,10 +365,28 @@ def run_hci(args, parser, started):
         timing['natural_orbitals'] = perf_counter()-start
     if args.natorb is not None:
         print('HCI run in natural orbitals', flush=True)
-    energies, _, _, peak_memory = hci_pass(
+    energies, vectors, op, peak_memory = hci_pass(
         args, parser, ham, nelec, timing, started=None if args.natorb == 'sci' else started)
     for root, energy in enumerate(energies):
         print(f'root={root} energy={energy:.12f} hartree')
+    if args.enpt2:
+        start = perf_counter()
+        try:
+            correction = op.native_enpt2(energies, vectors, eps=args.enpt2_eps,
+                                         denominator_tol=args.enpt2_denominator_tol, screening=args.enpt2_screening)
+        except ValueError as exc:
+            parser.exit(1, f'{parser.prog}: {exc}\n')
+        timing['enpt2'] = perf_counter()-start
+        for root, delta in enumerate(correction.corrections):
+            print(f'root={root} enpt2={delta:.12f} corrected_energy={correction.corrected_energies[root]:.12f} '
+                  f'hartree positive_denominators={correction.positive_denominator_counts[root]} '
+                  f'min_abs_denominator={correction.minimum_abs_denominators[root]:.6g}')
+        peak = correction.stats['peak_tracked_memory_bytes']
+        peak_memory = max(peak_memory, peak)
+        print(f'ENPT2 cutoff={correction.eps:g} hartree, screening={args.enpt2_screening}, '
+              f'tracked peak memory {peak/1024**2:.2f} MiB')
+        if args.sci_stats:
+            print(f'enpt2_stats {correction.stats}')
     wall = perf_counter()-started
     print_timings(timing, wall)
     print(f'Tracked native peak memory {max(peak_memory, pilot_peak)/1024**2:.2f} MiB')

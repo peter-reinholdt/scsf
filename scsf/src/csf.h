@@ -30,13 +30,22 @@ struct Path {
     int electrons = 0;
     int guga_mode = 0; // 0 analytic reference, 1 factor table, 2 spectator runs
     std::vector<int> next_single, closed_prefix;
+    std::uint64_t up_mask=0,down_mask=0,closed_mask=0;
 
-    Path(const std::string &steps, int k, int two_s, int factor_mode) : label(steps), guga_mode(factor_mode) {
-        if (steps.size() != static_cast<size_t>(k))
+    Path() = default;
+    Path(const std::string &steps, int k, int two_s, int factor_mode) : label(steps) {
+        prepare(k,two_s,factor_mode);
+    }
+    void prepare(int k, int two_s, int factor_mode) {
+        if (label.size() != static_cast<size_t>(k))
             throw std::invalid_argument("CSF label length differs from orbital count");
-        spins.reserve(steps.size()+1);
+        guga_mode=factor_mode;
+        phase=1;
+        electrons=0;
+        spins.clear();
+        spins.reserve(label.size()+1);
         spins.push_back(0);
-        for (char step : steps) {
+        for (char step : label) {
             if (step != '0' && step != 'u' && step != 'd' && step != '2')
                 throw std::invalid_argument("CSF symbols must be 0,u,d,2");
             int spin = spins.back()+(step == 'u')-(step == 'd');
@@ -47,11 +56,24 @@ struct Path {
         }
         if (spins.back() != two_s) throw std::invalid_argument("CSF final spin differs from two_s");
         if (guga_mode == 2) {
-            next_single.resize(steps.size()+1,k);
-            closed_prefix.resize(steps.size()+1,0);
-            for (int p = k-1; p >= 0; --p)
-                next_single[p] = steps[p] == 'u' || steps[p] == 'd' ? p : next_single[p+1];
-            for (int p = 0; p < k; ++p) closed_prefix[p+1] = closed_prefix[p]+(steps[p] == '2');
+            next_single.resize(label.size()+1);
+            closed_prefix.resize(label.size()+1);
+            next_single[k]=k;
+            closed_prefix[0]=0;
+            up_mask=down_mask=closed_mask=0;
+            if(k<=64) {
+                for(int p=k-1;p>=0;--p) {
+                    const bool up=label[p]=='u',down=label[p]=='d';
+                    next_single[p]=up || down ? p : next_single[p+1];
+                    up_mask=(up_mask<<1)|up;
+                    down_mask=(down_mask<<1)|down;
+                    closed_mask=(closed_mask<<1)|(label[p]=='2');
+                }
+            } else {
+                for (int p = k-1; p >= 0; --p)
+                    next_single[p] = label[p] == 'u' || label[p] == 'd' ? p : next_single[p+1];
+            }
+            for (int p = 0; p < k; ++p) closed_prefix[p+1] = closed_prefix[p]+(label[p] == '2');
         }
     }
 };

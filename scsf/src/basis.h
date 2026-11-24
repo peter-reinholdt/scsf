@@ -52,9 +52,9 @@ public:
         if (left || spin!=s_ || result>=size()) throw std::invalid_argument("spin path sector mismatch");
         return result;
     }
-    std::string label(const Config &occupation, size_t rank) const {
+    void label(const Config &occupation, size_t rank, std::string &result) const {
         if (rank>=size()) throw std::out_of_range("spin rank exceeds class dimension");
-        std::string result(occupation.size(),'0');
+        result.assign(occupation.size(),'0');
         int left=m_,spin=0;
         for (size_t p=0; p<occupation.size(); ++p) {
             if (occupation[p]==2) result[p]='2';
@@ -69,6 +69,10 @@ public:
                 --spin;
             }
         }
+    }
+    std::string label(const Config &occupation, size_t rank) const {
+        std::string result;
+        label(occupation,rank,result);
         return result;
     }
 };

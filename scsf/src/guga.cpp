@@ -65,10 +65,131 @@ double segment(int da, int db, int a, int b, int p, int q, int site, int mode = 
     return 0.0;
 }
 
+struct SegmentTable {
+    static constexpr int max_spin=16;
+    double values[4][max_spin+1][3][4][4]{};
+    SegmentTable() {
+        // Endpoints 1 and 3 give one representative site for each region.
+        for(int region=0;region<4;++region)
+            for(int b=0;b<=max_spin;++b)
+                for(int d=-1;d<=1;++d) {
+                    const int a=b+d;
+                    if(a<0)continue;
+                    for(int da=0;da<4;++da)
+                        for(int db=0;db<4;++db)
+                            values[region][b][d+1][da][db]=segment(da,db,a,b,1,3,region,2);
+                }
+    }
+};
+
+const SegmentTable &compact_segments() {
+    static const SegmentTable table;
+    return table;
+}
+
+struct Interval {
+    int first,last;
+    bool reverse;
+    std::uint64_t ends,inside,span;
+    Interval(int p,int q):first(std::min(p,q)),last(std::max(p,q)),reverse(p>q) {
+        const auto left=std::uint64_t(1)<<first,right=std::uint64_t(1)<<last;
+        ends=left|right;
+        inside=right-left-left;
+        span=inside|ends;
+    }
+    unsigned region(int i) const {
+        return i<first || i>last ? 0 : i==first ? 1 : i==last ? 3 : 2;
+    }
+    double factor(int da,int db,int a,int b,unsigned region,const SegmentTable &table) const {
+        if(reverse) {std::swap(a,b);std::swap(da,db);}
+        const unsigned delta=a-b+1;
+        if(delta>2)return 0.;
+        if(b<=SegmentTable::max_spin)return table.values[region][b][delta][da][db];
+        return segment(da,db,a,b,1,3,region,2);
+    }
+};
+
+bool compact_paths(const Path &bra,const Path &ket) {
+    return bra.guga_mode==2 && ket.guga_mode==2 && bra.label.size()<=64;
+}
+
+double compact_generator(const Path &bra,const Path &ket,int p,int q) {
+    const Interval interval(p,q);
+    const auto bra_open=bra.up_mask|bra.down_mask,ket_open=ket.up_mask|ket.down_mask;
+    const auto closed_difference=bra.closed_mask^ket.closed_mask;
+    const auto step_difference=(bra.up_mask^ket.up_mask)|(bra.down_mask^ket.down_mask)|closed_difference;
+    if(step_difference&~interval.span)return 0.;
+    if(((bra_open^ket_open)|closed_difference)&~interval.ends)return 0.;
+    if(bra.spins[q+1]!=ket.spins[q+1])return 0.;
+    const bool negative=__builtin_parityll(ket.closed_mask&interval.inside);
+    auto sites=interval.ends|((bra_open|ket_open)&interval.inside);
+    const auto &table=compact_segments();
+    double value=1.;
+    while(sites) {
+        const int i=__builtin_ctzll(sites);
+        sites&=sites-1;
+        value*=interval.factor(step(bra.label[i]),step(ket.label[i]),bra.spins[i+1],ket.spins[i+1],
+                              interval.region(i),table);
+        if(!value)return 0.;
+    }
+    return negative ? -value : value;
+}
+
+double compact_product(const Path &bra,const Path &ket,int p,int q,int r,int s) {
+    const Interval left(p,q),right(r,s);
+    const auto endpoints=left.ends|right.ends;
+    const auto bra_open=bra.up_mask|bra.down_mask,ket_open=ket.up_mask|ket.down_mask;
+    const auto closed_difference=bra.closed_mask^ket.closed_mask;
+    const auto step_difference=(bra.up_mask^ket.up_mask)|(bra.down_mask^ket.down_mask)|closed_difference;
+    // A generator is the identity outside its interval. A common empty
+    // spectator is an identity inside it too. Unchanged closed spectators
+    // supply one minus sign for each generator crossing them.
+    if(step_difference&~(left.span|right.span))return 0.;
+    if(((bra_open^ket_open)|closed_difference)&~endpoints)return 0.;
+    const int last=std::max(left.last,right.last);
+    if(bra.spins[last+1]!=ket.spins[last+1])return 0.;
+    const bool negative=__builtin_parityll(ket.closed_mask&~endpoints&(left.inside^right.inside));
+    auto sites=endpoints|((bra_open|ket_open)&(left.inside|right.inside));
+    const auto &table=compact_segments();
+    std::array<double,2> weights{1.,0.};
+    while(sites) {
+        const int i=__builtin_ctzll(sites);
+        sites&=sites-1;
+        // Recover the intermediate spin on each side of this site from
+        // the ket prefix and its offset, even across a skipped run.
+        const int b=ket.spins[i+1],before=ket.spins[i],a=bra.spins[i+1];
+        const bool inside=i>=right.first && i<right.last;
+        const bool was_inside=i>right.first && i<=right.last;
+        const auto left_region=left.region(i),right_region=right.region(i);
+        const int da=step(bra.label[i]),db=step(ket.label[i]);
+        const int n=occupation(db)+(i==r)-(i==s);
+        std::array<double,2> next{0.,0.};
+        for(int j=0;j<(inside ? 2 : 1);++j) {
+            const int after=b+(inside ? 2*j-1 : 0);
+            if(after<0)continue;
+            const auto lw=[&](int d){return left.factor(da,d,a,after,left_region,table);};
+            for(int t=0;t<(was_inside ? 2 : 1);++t) {
+                if(weights[t]==0.)continue;
+                const int change=after-(before+(was_inside ? 2*t-1 : 0));
+                int d;
+                if(n==1 && std::abs(change)==1)d=change==1 ? 1 : 2;
+                else if(n!=1 && !change)d=n==2 ? 3 : 0;
+                else continue;
+                const double rw=right.factor(d,db,after,b,right_region,table);
+                if(rw!=0.)next[j]+=weights[t]*rw*lw(d);
+            }
+        }
+        weights=next;
+        if(weights[0]==0. && weights[1]==0.)return 0.;
+    }
+    return negative ? -weights[0] : weights[0];
+}
+
 // Segment-table convention; the outer CSF phase conversion is applied once.
 double generator(const Path &bra, const Path &ket, int p, int q) {
     if (p > q) return generator(ket, bra, q, p);
     if (p == q) return bra.label == ket.label ? occupation(ket.label[p]) : 0.0;
+    if(compact_paths(bra,ket))return compact_generator(bra,ket,p,q);
     if (bra.label.compare(0, p, ket.label, 0, p) ||
         bra.label.compare(q+1, std::string::npos, ket.label, q+1, std::string::npos) ||
         bra.spins[q+1] != ket.spins[q+1]) return 0.0;
@@ -93,6 +214,8 @@ double product(const Path &bra, const Path &ket, int p, int q, int r, int s) {
     if (r == s) return occupation(ket.label[s])*generator(bra, ket, p, q);
     if (p == q) return occupation(bra.label[p])*generator(bra, ket, r, s);
     if (!occupation(ket.label[s]) || occupation(ket.label[r]) == 2) return 0.0;
+    if(compact_paths(bra,ket))
+        return compact_product(bra,ket,p,q,r,s);
     int begin = std::min({p,q,r,s}), end = std::max({p,q,r,s});
     // Outside both generators the two outer walks and the intermediate must
     // coincide. Reject once, then omit their exact identity transfers.
@@ -104,6 +227,20 @@ double product(const Path &bra, const Path &ket, int p, int q, int r, int s) {
     int count = 1;
     int lo = std::min(r, s), hi = std::max(r, s);
     for (int i = begin; i <= end; ++i) {
+        // Between endpoints, common empty or doubly occupied sites leave
+        // all three walks' spins unchanged. Their only effect on the
+        // surviving intermediate weights is the closed-shell parity.
+        if (bra.guga_mode == 2 && i != p && i != q && i != r && i != s &&
+            bra.next_single[i] > i && ket.next_single[i] > i) {
+            int stop = std::min({end+1,bra.next_single[i],ket.next_single[i]});
+            for (int endpoint : {p,q,r,s}) if (endpoint > i) stop = std::min(stop,endpoint);
+            if (bra.label.compare(i,stop-i,ket.label,i,stop-i)) return 0.0;
+            int active = (std::min(p,q) < i && i < std::max(p,q))+(lo < i && i < hi);
+            if (active%2 && (ket.closed_prefix[stop]-ket.closed_prefix[i])%2)
+                for (double &weight : weights) weight = -weight;
+            i = stop-1;
+            continue;
+        }
         int b = ket.spins[i+1];
         bool inside = static_cast<int>(i) >= lo && static_cast<int>(i) < hi;
         std::array<int, 2> after{inside ? b-1 : b, inside ? b+1 : -1};
@@ -127,17 +264,6 @@ double product(const Path &bra, const Path &ket, int p, int q, int r, int s) {
         spins = after;
         weights = next;
         if (weights[0] == 0.0 && weights[1] == 0.0) return 0.0;
-        if (bra.guga_mode == 2 && i != p && i != q && i != r && i != s &&
-            bra.next_single[i] > i && ket.next_single[i] > i) {
-            int stop = std::min({end+1,bra.next_single[i],ket.next_single[i]});
-            for (int endpoint : {p,q,r,s}) if (endpoint > i) stop = std::min(stop,endpoint);
-            if (bra.label.compare(i,stop-i,ket.label,i,stop-i)) return 0.0;
-            int active = (std::min(p,q) < i && i < std::max(p,q))+
-                         (std::min(r,s) < i && i < std::max(r,s));
-            if (active%2 && (ket.closed_prefix[stop]-ket.closed_prefix[i+1])%2)
-                for (double &weight : weights) weight = -weight;
-            i = stop-1;
-        }
     }
     return weights[0];
 }

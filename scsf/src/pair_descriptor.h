@@ -96,6 +96,7 @@ namespace structured { struct SpatialERI; }
 void ranked_connection(const PairDescriptor &,const double *,const structured::SpatialERI &,bool,Connection &);
 // Same-occupation terms only require (pp|rr) and (pr|rp), stored as two k-by-k arrays.
 Connection guga_diagonal_connection(const Config &,const double *,const double *);
+void guga_diagonal_connection(const Config &,const double *,const double *,Connection &);
 
 // Contraction is explicitly separate from the descriptor's lifetime/identity.
 Connection connection(const PairDescriptor &, const double *h, const double *v,
